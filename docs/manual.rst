@@ -1471,8 +1471,7 @@ use_interface()
 
 ``use_interface()`` sets the network interface this torrent will use when it opens outgoing
 connections. By default, it uses the same interface as the session_ uses to listen on. The
-parameter must be a string containing an ip-address (either an IPv4 or IPv6 address). If
-the string does not conform to this format and exception is thrown.
+parameter can be a string containing an ip-address or a hostname.
 
 
 info_hash()
@@ -2615,7 +2614,7 @@ It contains ``url`` to the HTTP seed that failed along with an error message.
 
 	struct url_seed_alert: torrent_alert
 	{
-		url_seed_alert(torrent_handle const& h, std::string const& url
+		url_seed_alert(torrent_handle const& h, std::string const& h
 			, const std::string& msg);
 		virtual std::auto_ptr<alert> clone() const;
 

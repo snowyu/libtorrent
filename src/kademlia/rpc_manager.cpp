@@ -322,11 +322,8 @@ void rpc_manager::invoke(int message_id, udp::endpoint target_addr
 		m_send(m);
 		new_transaction_id(o);
 	}
-	catch (std::exception& e)
+	catch (std::exception&)
 	{
-#ifndef NDEBUG
-		std::cerr << e.what() << "\n";
-#endif
 		assert(false);
 	}
 }

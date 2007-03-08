@@ -120,7 +120,7 @@ namespace libtorrent { namespace detail
 					// if the job queue is empty and
 					// we shouldn't abort
 					// wait for a signal
-					while (m_torrents.empty() && !m_abort && !processing)
+					if (m_torrents.empty() && !m_abort && !processing)
 						m_cond.wait(l);
 
 					if (m_abort)
