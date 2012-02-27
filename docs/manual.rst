@@ -203,7 +203,6 @@ The ``session`` class has the following synopsis::
 		ip_filter get_ip_filter() const;
 
 		session_status status() const;
-		cache_status get_cache_status() const;
 
 		bool is_listening() const;
 		unsigned short listen_port() const;
@@ -904,94 +903,17 @@ by the DHT.
 
 ``utp_stats`` contains statistics on the uTP sockets.
 
-get_cache_status()
-------------------
-
-	::
-
-		cache_status get_cache_status() const;
-
-Returns status of the disk cache for this session.
-
-	::
-
-		struct cache_status
-		{
-			size_type blocks_written;
-			size_type writes;
-			size_type blocks_read;
-			size_type blocks_read_hit;
-			size_type reads;
-			int cache_size;
-			int read_cache_size;
-			int total_used_buffers;
-			int average_queue_time;
-			int average_read_time;
-			int average_write_time;
-			int average_hash_time;
-			int average_cache_time;
-			int job_queue_length;
-		};
-
-``blocks_written`` is the total number of 16 KiB blocks written to disk
-since this session was started.
-
-``writes`` is the total number of write operations performed since this
-session was started.
-
-The ratio (``blocks_written`` - ``writes``) / ``blocks_written`` represents
-the number of saved write operations per total write operations. i.e. a kind
-of cache hit ratio for the write cahe.
-
-``blocks_read`` is the number of blocks that were requested from the
-bittorrent engine (from peers), that were served from disk or cache.
-
-``blocks_read_hit`` is the number of blocks that were served from cache.
-
-The ratio ``blocks_read_hit`` / ``blocks_read`` is the cache hit ratio
-for the read cache.
-
-``cache_size`` is the number of 16 KiB blocks currently in the disk cache.
-This includes both read and write cache.
-
-``read_cache_size`` is the number of 16KiB blocks in the read cache.
-
-``total_used_buffers`` is the total number of buffers currently in use.
-This includes the read/write disk cache as well as send and receive buffers
-used in peer connections.
-
-``average_queue_time`` is the number of microseconds an average disk I/O job
-has to wait in the job queue before it get processed.
-
-``average_read_time`` is the time read jobs takes on average to complete
-(not including the time in the queue), in microseconds. This only measures
-read cache misses. 
-
-``average_write_time`` is the time write jobs takes to complete, on average,
-in microseconds. This does not include the time the job sits in the disk job
-queue or in the write cache, only blocks that are flushed to disk.
-
-``average_hash_time`` is the time hash jobs takes to complete on average, in
-microseconds. Hash jobs include running SHA-1 on the data (which for the most
-part is done incrementally) and sometimes reading back parts of the piece. It
-also includes checking files without valid resume data.
-
-``average_cache_time`` is the average amuount of time spent evicting cached
-blocks that have expired from the disk cache.
-
-``job_queue_length`` is the number of jobs in the job queue.
-
 get_cache_info()
 ----------------
 
 	::
 
-		void get_cache_info(sha1_hash const& ih
-			, std::vector<cached_piece_info>& ret) const;
+		enum { disk_cache_no_pieces = 1 };
+		void get_cache_info(sha1_hash const& ih, cache_status* ret, int flags) const;
 
-``get_cache_info()`` fills out the supplied vector with information for
-each piece that is currently in the disk cache for the torrent with the
-specified info-hash (``ih``).
+Fills in the cache_status struct with information about the given info-hash (``ih``).
+If ``flags`` is ``session::disk_cache_no_pieces`` the ``cache_status::pieces`` field
+will not be set. This may significantly reduce the cost of this call.
 
 	::
 
@@ -1013,6 +935,131 @@ the data for that block being in the disk cache and ``false`` means it's not.
 a piece is, the more likely it is to be flushed to disk.
 		
 ``kind`` specifies if this piece is part of the read cache or the write cache.
+
+	::
+
+		struct cache_status
+		{
+			std::vector<cached_piece_info> pieces;
+			size_type blocks_written;
+			size_type writes;
+			size_type blocks_read;
+			size_type blocks_read_hit;
+			size_type reads;
+			size_type queued_bytes;
+			int write_cache_size;
+			int read_cache_size;
+			int pinned_blocks;
+			int total_used_buffers;
+			int average_queue_time;
+			int average_read_time;
+			int average_write_time;
+			int average_hash_time;
+			int average_cache_time;
+			int average_job_time;
+			int average_sort_time;
+			int average_issue_time;
+			int total_read_back;
+			int read_queue_size;
+			int blocked_jobs;
+			int queued_jobs;
+			int peak_queued;
+			int pending_jobs;
+			int peak_pending;
+			int num_aiocb;
+			int peak_aiocb;
+			size_type cumulative_completed_aiocbs;
+		};
+
+``blocks_written`` is the total number of 16 KiB blocks written to disk
+since this session was started.
+
+``writes`` is the total number of write operations performed since this
+session was started.
+
+The ratio (``blocks_written`` - ``writes``) / ``blocks_written`` represents
+the number of saved write operations per total write operations. i.e. a kind
+of cache hit ratio for the write cahe.
+
+``blocks_read`` is the number of blocks that were requested from the
+bittorrent engine (from peers), that were served from disk or cache.
+
+``blocks_read_hit`` is the number of blocks that were served from cache.
+
+The ratio ``blocks_read_hit`` / ``blocks_read`` is the cache hit ratio
+for the read cache.
+
+``reads`` is the total number of read operations called this session.
+
+``queued_bytes`` is the total number of bytes queued for writing, including
+bytes passed on to the operating system but have not yet completed.
+
+``write_cache_size`` is the number of 16 KiB blocks currently in the disk
+write cache.
+
+``read_cache_size`` is the number of 16KiB blocks in the read cache.
+
+``pinned_blocks`` is the number of blocks that have more than 0 references
+to them, forcing them to stay in RAM.
+
+``total_used_buffers`` is the total number of buffers currently in use.
+This includes the read/write disk cache as well as send and receive buffers
+used in peer connections. It only counts disk buffers.
+
+``average_queue_time`` is the number of microseconds an average disk I/O job
+has to wait in the job queue before it get processed.
+
+``average_read_time`` is the time read jobs takes on average to complete
+(not including the time in the queue), in microseconds. This only measures
+read cache misses. 
+
+``average_write_time`` is the time write jobs takes to complete, on average,
+in microseconds. This does not include the time the job sits in the disk job
+queue or in the write cache, only blocks that are flushed to disk.
+
+``average_hash_time`` is the time hash jobs takes to complete on average, in
+microseconds. Hash jobs include running SHA-1 on the data (which for the most
+part is done incrementally) and sometimes reading back parts of the piece. It
+also includes checking files without valid resume data.
+
+``average_job_time`` is the average time it takes for any disk job to complete,
+in microseconds.
+
+``average_sort_time`` is the time spent sorting disk jobs, when using synchronous
+I/O.
+
+``average_issue_time`` is the time spent actually issuing the jobs to the OS. If
+this is high, it might indicate a problem with the asynchronous disk API, not being
+very asynchronous.
+
+``cumulative_job_time``, ``cumulative_read_time``, ``cumulative_write_time``,
+``cumulative_hash_time``, ``cumulative_sort_time``, ``cumulative_issue_time``
+are the cumulative time, in microseconds, spent in each category of disk I/O
+function.
+
+``total_read_back`` is the total number of (16 kiB) blocks read this session.
+
+``read_queue_size`` is the number of read jobs in the disk job queue.
+
+``blocked_jobs`` is the number of jobs blocked because of one or more jobs that
+need exclusive access to the file storage. For instance renaming files or closing
+files.
+
+``queued_jobs`` is the total number of jobs in the queue.
+
+``pending_jobs`` is the number of jobs that have been issued to the OS, but have not
+yet completed.
+
+``num_aiocb`` is the number of async. disk I/O request objects currently in use.
+
+``peak_aiocb`` is the peak number of aiocb's that's ever been in use this session.
+
+``cumulative_completed_aiocbs`` is the total number of low-level AIO jobs that has
+completed. This can be used as an accurate job completion rate counter, by comparing
+consecutive values. Keep in mind that one low level job is typically 16 kiB, however,
+some back-ends support vector I/O, in which case a job may represent a lot more than
+that.
+
 
 is_listening() listen_port() listen_on()
 ----------------------------------------
@@ -2265,6 +2312,7 @@ Its declaration looks like this::
 
 		torrent_status status(boost::uint32_t flags = 0xffffffff);
 		void file_progress(std::vector<size_type>& fp, int flags = 0);
+		void file_status(std::vector<pool_file_status>& status);
 		void get_download_queue(std::vector<partial_piece_info>& queue) const;
 		void get_peer_info(std::vector<peer_info>& v) const;
 		torrent_info const& get_torrent_info() const;
@@ -2530,6 +2578,53 @@ fully downloaded and passed the hash check count. When specifying piece granular
 the operation is a lot cheaper, since libtorrent already keeps track of this internally
 and no calculation is required.
 
+file_status()
+-------------
+
+	::
+
+		void file_status(std::vector<pool_file_status>& status);
+
+This function fills in the passed in vector with status about files that are open
+for this torrent. Any file that is not open in this torrent, will not be reported
+in the vector, i.e. it's possible that the vector is empty when returning, if none
+of the files in the torrent are currently open.
+
+The ``pool_file_status`` is defined as::
+
+	struct pool_file_status
+	{
+		int file_index;
+		ptime last_use;
+		int open_mode;
+	};
+
+``file_index`` is the index of the file this entry refers to into the ``file_storage``
+file list of this torrent. This starts indexing at 0.
+
+``last_use`` is a (high precision) timestamp of when the file was last used.
+
+``open_mode`` is a bitmask of the file flags this file is currently opened with. These
+are the flags used in the ``file::open()`` function. This enum is defined as a member
+of the ``file`` class.
+
+::
+
+	enum
+	{
+		read_only = 0,
+		write_only = 1,
+		read_write = 2,
+		rw_mask = 3,
+		no_buffer = 4,
+		sparse = 8,
+		no_atime = 16,
+		random_access = 32,
+		lock_file = 64,
+	};
+
+Note that the read/write mode is not a bitmask. The two least significant bits are used
+to represent the read/write mode. Those bits can be masked out using the ``rw_mask`` constant.
 
 save_path()
 -----------
@@ -3381,7 +3476,7 @@ It contains the following fields::
 	{
 		enum state_t
 		{
-			queued_for_checking,
+			queued_for_checking, // deprecated
 			checking_files,
 			downloading_metadata,
 			downloading,
@@ -3515,7 +3610,12 @@ The torrent's current task is in the ``state`` member, it will be one of the fol
 |                          |completed in a fraction of a second, but if you add a     |
 |                          |large number of torrents at once, they will queue up.     |
 +--------------------------+----------------------------------------------------------+
-|``queued_for_checking``   |The torrent is in the queue for being checked. But there  |
+|``queued_for_checking``   |**THIS STATE IS DEPRECATED**                              |
+|                          |A torrent that is queued for checking is now in the       |
+|                          |``checking_files`` state, and paused and auto-managed.    |
+|                          |                                                          |
+|                          |The previous semantic for this state was:                 |
+|                          |The torrent is in the queue for being checked. But there  |
 |                          |currently is another torrent that are being checked.      |
 |                          |This torrent will wait for its turn.                      |
 +--------------------------+----------------------------------------------------------+
@@ -3856,8 +3956,6 @@ It contains the following fields::
 		std::string inet_as_name;
 		int inet_as;
 
-		size_type load_balancing;
-
 		int requests_in_buffer;
 		int download_queue_length;
 		int upload_queue_length;
@@ -4072,12 +4170,6 @@ an empty string if there is no name in the geo ip database.
 
 ``inet_as`` is the AS number the peer is located in.
 
-``load_balancing`` is a measurement of the balancing of free download (that we get)
-and free upload that we give. Every peer gets a certain amount of free upload, but
-this member says how much *extra* free upload this peer has got. If it is a negative
-number it means that this was a peer from which we have got this amount of free
-download.
-
 ``requests_in_buffer`` is the number of requests messages that are currently in the
 send buffer waiting to be sent.
 
@@ -4124,8 +4216,7 @@ string.
 bytes per second.
 
 ``pending_disk_bytes`` is the number of bytes this peer has pending in the
-disk-io thread. Downloaded and waiting to be written to disk. This is what
-is capped by ``session_settings::max_queued_disk_bytes``.
+disk-io thread. Downloaded and waiting to be written to disk.
 
 ``send_quota`` and ``receive_quota`` are the number of bytes this peer has been
 assigned to be allowed to send and receive until it has to request more quota
@@ -4544,6 +4635,11 @@ session_settings
 		int read_job_every;
 		bool use_disk_read_ahead;
 		bool lock_files;
+		int hashing_threads;
+		int contiguous_recv_buffer;
+		int network_threads;
+
+		std::string mmap_cache;
 
 		int ssl_listen;
 	};
@@ -4816,8 +4912,10 @@ RAM cannot be determined, it's set to 1024 (= 16 MiB).
 
 Disk buffers are allocated using a pool allocator, the number of blocks that
 are allocated at a time when the pool needs to grow can be specified in
-``cache_buffer_chunk_size``. This defaults to 16 blocks. Lower numbers
-saves memory at the expense of more heap allocations. It must be at least 1.
+``cache_buffer_chunk_size``. Lower numbers saves memory at the expense of more
+heap allocations. If it is set to 0, the effective chunk size is proportional
+to the total cache size, attempting to strike a good balance between performance
+and memory usage. It defaults to 0.
 
 ``cache_expiry`` is the number of seconds from the last cached write to a piece
 in the write cache, to when it's forcefully flushed to disk. Default is 60 second.
@@ -5413,6 +5511,48 @@ in the disk job queue. This gives a significant performance boost for seeding.
 to or seeding from. This is implemented using ``fcntl(F_SETLK)`` on unix systems and
 by not passing in ``SHARE_READ`` and ``SHARE_WRITE`` on windows. This might prevent
 3rd party processes from corrupting the files under libtorrent's feet.
+
+``hashing_threads`` is the number of threads to use for piece hash verification. It
+defaults to 1. For very high download rates, on machines with multiple cores, this
+could be incremented. Setting it higher than the number of CPU cores would presumably
+not provide any benefit of setting it to the number of cores. If it's set to 0,
+hashing is done in the disk thread.
+
+``contiguous_recv_buffer`` determines whether or not libtorrent should receive
+data from peers into a contiguous intermediate buffer, to then copy blocks into
+disk buffers from, or to make many smaller calls to ``read()``, each time passing
+in the specific buffer the data belongs in. When downloading at high rates, the latter
+may save some time copying data. When seeding at high rates, all incoming traffic
+consists of a very large number of tiny packets, and enabling ``contiguous_recv_buffer``
+will provide higher performance. When this is enabled, it will only be used when
+seeding to peers, since that's when it provides performance improvements.
+
+``network_threads`` is the number of threads to use to call ``async_write_some``
+(i.e. send) on peer connection sockets. When seeding at extremely high rates,
+this may become a bottleneck, and setting this to 2 or more may parallelize
+that cost. When using SSL torrents, all encryption for outgoing traffic is
+done withint the socket send functions, and this will help parallelizing the
+cost of SSL encryption as well.
+
+``mmap_cache`` may be set to a filename where the disk cache will be mmapped
+to. This could be useful, for instance, to map the disk cache from regular
+rotating hard drives onto an SSD drive. Doing that effectively introduces
+a second layer of caching, allowing the disk cache to be as big as can
+fit on an SSD drive (probably about one order of magnitude more than the
+available RAM). The intention of this setting is to set it up once at the
+start up and not change it while running. The setting may not be changed
+as long as there are any disk buffers in use. This default to the empty
+string, which means use regular RAM allocations for the disk cache. The file
+specified will be created and truncated to the disk cache size (``cache_size``).
+Any existing file with the same name will be replaced.
+
+Since this setting sets a hard upper limit on cache usage, it cannot be combined
+with ``session_settings::contiguous_recv_buffer``, since that feature treats the
+``cache_size`` setting as a soft (but still pretty hard) limit. The result of combining
+the two is peers being disconnected after failing to allocate more disk buffers.
+
+This feature requires the ``mmap`` system call, on systems that don't have ``mmap``
+this setting is ignored.
 
 ``ssl_listen`` sets the listen port for SSL connections. If this is set to 0,
 no SSL listen port is opened. Otherwise a socket is opened on this port. This
@@ -6442,6 +6582,9 @@ generated and the torrent is paused.
 
 ``error`` is the error code describing the error.
 
+``operation`` is a NULL-terminated string of the low-level operation that failed, or NULL if
+there was no low level disk operation.
+
 ::
 
 	struct file_error_alert: torrent_alert
@@ -6449,6 +6592,7 @@ generated and the torrent is paused.
 		// ...
 		std::string file;
 		error_code error;
+		char const* operation;
 	};
 
 torrent_error_alert
@@ -7096,12 +7240,18 @@ This alert is generated when a fastresume file has been passed to ``add_torrent`
 files on disk did not match the fastresume file. The ``error_code`` explains the reason why the
 resume file was rejected.
 
+If the error happend to a specific file, ``file`` is the path to it. If the error happened
+in a disk operation, ``operation`` is a NULL-terminated string of the name of that operation.
+``operation`` is NULL otherwise.
+
 ::
 
 	struct fastresume_rejected_alert: torrent_alert
 	{
 		// ...
 		error_code error;
+		std::string file;
+		char const* operation;
 	};
 
 
@@ -7143,12 +7293,18 @@ storage_moved_failed_alert
 The ``storage_moved_failed_alert`` is generated when an attempt to move the storage
 (via torrent_handle::move_storage()) fails.
 
+If the error happened for a speific file, ``file`` is its path. If the error
+happened in a specific disk operation, ``operation`` is a NULL terminated string
+naming which one, otherwise it's NULL.
+
 ::
 
 	struct storage_moved_failed_alert: torrent_alert
 	{
 		// ...
 		error_code error;
+		std::string file;
+		char const* operation;
 	};
 
 
@@ -8094,57 +8250,68 @@ The interface looks like this::
 
 	struct storage_interface
 	{
-		virtual bool initialize(bool allocate_files) = 0;
-		virtual bool has_any_file() = 0;
+		virtual void initialize(bool allocate_files, storage_error& ec) = 0;
+		virtual bool has_any_file(storage_error& ec) = 0;
 		virtual void hint_read(int slot, int offset, int len);
-		virtual int readv(file::iovec_t const* bufs, int slot, int offset, int num_bufs) = 0;
-		virtual int writev(file::iovec_t const* bufs, int slot, int offset, int num_bufs) = 0;
 		virtual int sparse_end(int start) const;
-		virtual bool move_storage(fs::path save_path) = 0;
-		virtual bool verify_resume_data(lazy_entry const& rd, error_code& error) = 0;
-		virtual bool write_resume_data(entry& rd) const = 0;
-		virtual bool move_slot(int src_slot, int dst_slot) = 0;
-		virtual bool swap_slots(int slot1, int slot2) = 0;
-		virtual bool swap_slots3(int slot1, int slot2, int slot3) = 0;
-		virtual bool rename_file(int file, std::string const& new_name) = 0;
-		virtual bool release_files() = 0;
-		virtual bool delete_files() = 0;
-		virtual void finalize_file(int index) {}
+		virtual void move_storage(std::string const& save_path, storage_error& ec) = 0;
+		virtual bool verify_resume_data(lazy_entry const& rd, storage_error& error) = 0;
+		virtual bool write_resume_data(entry& rd, storage_error& ec) const = 0;
+		virtual void rename_file(int file, std::string const& new_name, storage_error& ec) = 0;
+		virtual void release_files(storage_error& ec) = 0;
+		virtual void delete_files(storage_error& ec) = 0;
+		virtual void finalize_file(int index, storage_error& ec) {}
 		virtual ~storage_interface() {}
+
+		virtual file::aiocb_t* async_readv(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, async_handler* a) = 0;
+		virtual file::aiocb_t* async_writev(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, async_handler* a) = 0;
+
+		virtual void readv_done(file::iovec_t const* bufs, int num_bufs, int piece, int offset);
 
 		// non virtual functions
 
 		disk_buffer_pool* disk_pool();
-		void set_error(boost::filesystem::path const& file, error_code const& ec) const;
-		error_code const& error() const;
-		std::string const& error_file() const;
-		void clear_error();
 	};
 
+	struct storage_error
+	{
+		// the actual error code
+		error_code ec;
+		// the index of the file the error occurred on
+		int file;
+		// the operation that failed
+		// this must be a string literal, it
+		// should never be freed
+		char const* operation;
+	};
 
 initialize()
 ------------
 
 	::
 
-		bool initialize(bool allocate_files) = 0;
+		virtual void initialize(bool allocate_files, storage_error& ec) = 0;
 
 This function is called when the storage is to be initialized. The default storage
 will create directories and empty files at this point. If ``allocate_files`` is true,
 it will also ``ftruncate`` all files to their target size.
 
-Returning ``true`` indicates an error occurred.
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 has_any_file()
 --------------
 
 	::
 
-		virtual bool has_any_file() = 0;
+		virtual bool has_any_file(storage_error& ec) = 0;
 
 This function is called when first checking (or re-checking) the storage for a torrent.
 It should return true if any of the files that is used in this storage exists on disk.
 If so, the storage will be checked for existing pieces before starting the download.
+
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 hint_read()
 -----------
@@ -8157,17 +8324,20 @@ This function is called when a read job is queued. It gives the storage wrapper 
 opportunity to hint the operating system about this coming read. For instance, the
 storage may call ``posix_fadvise(POSIX_FADV_WILLNEED)`` or ``fcntl(F_RDADVISE)``.
 
-readv() writev()
-----------------
+async_readv() async_writev()
+----------------------------
 
 	::
 
-		int readv(file::iovec_t const* buf, int slot, int offset, int num_bufs) = 0;
-		int write(const char* buf, int slot, int offset, int size) = 0;
+		virtual file::aiocb_t* async_readv(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, async_handler* a) = 0;
+		virtual file::aiocb_t* async_writev(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, async_handler* a) = 0;
 
-These functions should read or write the data in or to the given ``slot`` at the given ``offset``.
-It should read or write ``num_bufs`` buffers sequentially, where the size of each buffer
-is specified in the buffer array ``bufs``. The file::iovec_t type has the following members::
+These functions should produce I/O jobs (``aiocb_t``) to read or write the data in
+or to the given ``piece`` at the given ``offset``. It should read or write ``num_bufs``
+buffers sequentially, where the size of each buffer is specified in the buffer array
+``bufs``. The file::iovec_t type has the following members::
 
 	struct iovec_t
 	{
@@ -8175,8 +8345,28 @@ is specified in the buffer array ``bufs``. The file::iovec_t type has the follow
 		size_t iov_len;
 	};
 
-The return value is the number of bytes actually read or written, or -1 on failure. If
-it returns -1, the error code is expected to be set to
+The return value is a *chain* (linked list) of ``aiocb_t`` objects representing all jobs
+required to satisfy the read or write request. The ``aiocb_t`` objects are produced by
+the async. operations of the ``file`` class.
+
+Each ``aiocb`` object that is returned, must also have its handler set to the
+passed in ``async_handler`` object. The ``async_handler`` object, must in turn
+have its references member incremented for each ``aiocb_t`` object that references it.
+
+The ``file::async_handler`` class has the following definition::
+
+	struct async_handler
+	{
+		async_handler(ptime now);
+		boost::function<void(async_handler*)> handler;
+		storage_error error;
+		size_t transferred;
+		int references;
+		ptime started;
+
+		void done(storage_error const& ec, size_t bytes_transferred
+			, file::aiocb_t const* aio, aiocb_pool* pool);
+	};
 
 Every buffer in ``bufs`` can be assumed to be page aligned and be of a page aligned size,
 except for the last buffer of the torrent. The allocated buffer can be assumed to fit a
@@ -8185,8 +8375,26 @@ last piece of a file in unbuffered mode.
 
 The ``offset`` is aligned to 16 kiB boundries  *most of the time*, but there are rare
 exceptions when it's not. Specifically if the read cache is disabled/or full and a
-client requests unaligned data, or the file itself is not aligned in the torrent.
-Most clients request aligned data.
+client requests unaligned data. Most clients request aligned data.
+
+If the function returns NULL, no disk operation is assumed to  be required, and the
+completion handler is called immediately. This is a special case that can be used by
+storage implementations that stores the data in RAM for instance.
+
+readv_done()
+------------
+
+	::
+
+		void readv_done(file::iovec_t const* bufs, int num_bufs, int piece, int offset);
+
+This function is called when all asynchronous disk operations complete from a previous
+call to ``async_readv()``. It is not called for ``async_readv`` invocations that don't
+return any async disk jobs. It passes in the same buffers that were passed in to the read
+call.
+
+The intention of this hook is to allow the storage to do any post processing on the data
+that was just read from disk.
 
 sparse_end()
 ------------
@@ -8205,7 +8413,7 @@ move_storage()
 
 	::
 
-		bool move_storage(fs::path save_path) = 0;
+		void move_storage(fs::path save_path, storage_error& ec) = 0;
 
 This function should move all the files belonging to the storage to the new save_path.
 The default storage moves the single file or the directory of the torrent.
@@ -8213,7 +8421,7 @@ The default storage moves the single file or the directory of the torrent.
 Before moving the files, any open file handles may have to be closed, like
 ``release_files()``.
 
-Returning ``false`` indicates an error occurred.
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 
 verify_resume_data()
@@ -8221,7 +8429,7 @@ verify_resume_data()
 
 	::
 
-		bool verify_resume_data(lazy_entry const& rd, error_code& error) = 0;
+		bool verify_resume_data(lazy_entry const& rd, storage_error& error) = 0;
 
 This function should verify the resume data ``rd`` with the files
 on disk. If the resume data seems to be up-to-date, return true. If
@@ -8229,7 +8437,7 @@ not, set ``error`` to a description of what mismatched and return false.
 
 The default storage may compare file sizes and time stamps of the files.
 
-Returning ``false`` indicates an error occurred.
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 
 write_resume_data()
@@ -8237,7 +8445,7 @@ write_resume_data()
 
 	::
 
-		bool write_resume_data(entry& rd) const = 0;
+		bool write_resume_data(entry& rd, storage_error& ec) const = 0;
 
 This function should fill in resume data, the current state of the
 storage, in ``rd``. The default storage adds file timestamps and
@@ -8245,53 +8453,7 @@ sizes.
 
 Returning ``true`` indicates an error occurred.
 
-
-move_slot()
------------
-
-	::
-
-		bool move_slot(int src_slot, int dst_slot) = 0;
-
-This function should copy or move the data in slot ``src_slot`` to
-the slot ``dst_slot``. This is only used in compact mode.
-
-If the storage caches slots, this could be implemented more
-efficient than reading and writing the data.
-
-Returning ``true`` indicates an error occurred.
-
-
-swap_slots()
-------------
-
-	::
-
-		bool swap_slots(int slot1, int slot2) = 0;
-
-This function should swap the data in ``slot1`` and ``slot2``. The default
-storage uses a scratch buffer to read the data into, then moving the other
-slot and finally writing back the temporary slot's data
-
-This is only used in compact mode.
-
-Returning ``true`` indicates an error occurred.
-
-
-swap_slots3()
--------------
-
-	::
-
-		bool swap_slots3(int slot1, int slot2, int slot3) = 0;
-
-This function should do a 3-way swap, or shift of the slots. ``slot1``
-should move to ``slot2``, which should be moved to ``slot3`` which in turn
-should be moved to ``slot1``.
-
-This is only used in compact mode.
-
-Returning ``true`` indicates an error occurred.
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 
 rename_file()
@@ -8299,24 +8461,24 @@ rename_file()
 
 	::
 
-		bool rename_file(int file, std::string const& new_name) = 0;
+		void rename_file(int file, std::string const& new_name, storage_error& ec) = 0;
 
-Rename file with index ``file`` to the thame ``new_name``. If there is an error,
-``true`` should be returned.
+Rename file with index ``file`` to the thame ``new_name``.
 
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 release_files()
 ---------------
 
 	::
 
-		bool release_files() = 0;
+		void release_files(storage_error& ec) = 0;
 
 This function should release all the file handles that it keeps open to files
 belonging to this storage. The default implementation just calls
 ``file_pool::release_files(this)``.
 
-Returning ``true`` indicates an error occurred.
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 
 delete_files()
@@ -8324,11 +8486,11 @@ delete_files()
 
 	::
 
-		bool delete_files() = 0;
+		void delete_files(storage_error& ec) = 0;
 
 This function should delete all files and directories belonging to this storage.
 
-Returning ``true`` indicates an error occurred.
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 The ``disk_buffer_pool`` is used to allocate and free disk buffers. It has the
 following members::
@@ -8351,7 +8513,7 @@ finalize_file()
 
 	::
 
-		virtual void finalize_file(int index);
+		virtual void finalize_file(int index, storage_error& ec);
 
 This function is called each time a file is completely downloaded. The
 storage implementation can perform last operations on a file. The file will
@@ -8361,6 +8523,8 @@ not be opened for writing after this.
 
 On windows the default storage implementation clears the sparse file flag
 on the specified file.
+
+If an error occurs, ``storage_error`` should be set to reflect it.
 
 example
 -------
@@ -8396,11 +8560,8 @@ basics of implementing a custom storage.
 		virtual bool rename_file(int file, std::string const& new_name)
 		{ assert(false); return false; }
 		virtual bool move_storage(std::string const& save_path) { return false; }
-		virtual bool verify_resume_data(lazy_entry const& rd, error_code& error) { return false; }
+		virtual bool verify_resume_data(lazy_entry const& rd, storage_error& error) { return false; }
 		virtual bool write_resume_data(entry& rd) const { return false; }
-		virtual bool move_slot(int src_slot, int dst_slot) { assert(false); return false; }
-		virtual bool swap_slots(int slot1, int slot2) { assert(false); return false; }
-		virtual bool swap_slots3(int slot1, int slot2, int slot3) { assert(false); return false; }
 		virtual size_type physical_offset(int slot, int offset)
 		{ return slot * m_files.piece_length() + offset; };
 		virtual sha1_hash hash_for_slot(int slot, partial_hash& ph, int piece_size)
@@ -9051,6 +9212,34 @@ This threshold is controlled by ``session_settings::whole_pieces_threshold``.
 
 *TODO: piece affinity by speed category*
 *TODO: piece priorities*
+
+predictive piece announce
+=========================
+
+In order to improve performance, libtorrent supports a feature called
+``predictive piece announce``. When enabled, it will make libtorrent announce
+that we have pieces to peers, before we truly have them. The most important
+case is to announce a piece as soon as it has been downloaded and passed
+the hash check, but not yet been written to disk. In this case, there is
+a risk the piece will fail to be written to disk, in which case we won't have
+the piece anymore, even though we announced it to peers.
+
+The other case is when we're very close to completing the download of a piece
+and assume it will pass the hash check, we can announce it to peers to make
+it available one round-trip sooner than otherwise. This lets libtorrent start
+uploading the piece to interested peers immediately when the piece complete, instead
+of waiting one round-trip for the peers to request it.
+
+This makes for the implementation slightly more complicated, since piece will have
+more states and more complicated transitions. For instance, a piece could be:
+
+1. hashed but not fully written to disk
+2. fully written to disk but not hashed
+3. not fully downloaded
+4. downloaded and hash checked
+
+Once a piece is fully downloaded, the hash check could complete before any of
+the write operations or it could complete after all write operations are complete.
 
 SSL torrents
 ============

@@ -246,10 +246,18 @@ namespace libtorrent
 		bool is_paused() const;
 
 		session_status status() const;
-		cache_status get_cache_status() const;
 
+#ifndef TORRENT_NO_DEPRECATE
+		// deprecated in aio branch
+		TORRENT_DEPRECATED_PREFIX
 		void get_cache_info(sha1_hash const& ih
-			, std::vector<cached_piece_info>& ret) const;
+			, std::vector<cached_piece_info>& ret) const TORRENT_DEPRECATED;
+		TORRENT_DEPRECATED_PREFIX
+		cache_status get_cache_status() const TORRENT_DEPRECATED;
+#endif
+		enum { disk_cache_no_pieces = 1 };
+		void get_cache_info(sha1_hash const& ih
+			, cache_status* ret, int flags = 0) const;
 
 		feed_handle add_feed(feed_settings const& feed);
 		void remove_feed(feed_handle h);

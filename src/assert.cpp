@@ -194,7 +194,7 @@ void print_backtrace(char* out, int len)
 
 #else
 
-void print_backtrace(char* out, int len) {}
+void print_backtrace(char* out, int len) { out[0] = 0; }
 
 #endif
 

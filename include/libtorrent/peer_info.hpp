@@ -106,8 +106,10 @@ namespace libtorrent
 		size_type total_upload;
 		peer_id pid;
 		bitfield pieces;
+#ifndef TORRENT_NO_DEPRECATE
 		int upload_limit;
 		int download_limit;
+#endif
 
 		// time since last request
 		time_duration last_request;
@@ -149,7 +151,9 @@ namespace libtorrent
 		int inet_as;
 #endif
 
+#ifndef TORRENT_NO_DEPRECATE
 		size_type load_balancing;
+#endif
 
 		// this is the number of requests
 		// we have sent to this peer
@@ -210,6 +214,9 @@ namespace libtorrent
 		// number of bytes this peer has in
 		// the disk write queue
 		int pending_disk_bytes;
+		// number of outstanding bytes to read
+		// from disk
+		int pending_disk_read_bytes;
 
 		// numbers used for bandwidth limiting
 		int send_quota;

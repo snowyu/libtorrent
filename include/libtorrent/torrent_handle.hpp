@@ -41,6 +41,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #endif
 
 #include <boost/assert.hpp>
+#include <boost/weak_ptr.hpp>
 #include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/weak_ptr.hpp>
@@ -58,6 +59,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/address.hpp"
 #include "libtorrent/bitfield.hpp"
 #include "libtorrent/socket.hpp" // tcp::endpoint
+#include "libtorrent/file_pool.hpp"
 
 namespace libtorrent
 {
@@ -70,6 +72,7 @@ namespace libtorrent
 	struct peer_info;
 	struct peer_list_entry;
 	struct torrent_status;
+	struct torrent_handle;
 
 	TORRENT_EXPORT std::size_t hash_value(torrent_status const& ts);
 
@@ -151,6 +154,9 @@ namespace libtorrent
 		state_t piece_state;
 	};
 
+	// for boost::hash (and to support using this type in unordered_map etc.)
+	std::size_t hash_value(torrent_handle const& h);
+
 	struct TORRENT_EXPORT torrent_handle
 	{
 		friend class invariant_access;
@@ -160,6 +166,9 @@ namespace libtorrent
 		friend std::size_t hash_value(torrent_handle const& th);
 
 		torrent_handle() {}
+
+		torrent_handle(torrent_handle const& t)
+		{ if (!t.m_torrent.expired()) m_torrent = t.m_torrent; }
 
 		enum flags_t { overwrite_existing = 1 };
 		void add_piece(int piece, char const* data, int flags = 0) const;
@@ -204,6 +213,7 @@ namespace libtorrent
 		};
 
 		void file_progress(std::vector<size_type>& progress, int flags = 0) const;
+		void file_status(std::vector<pool_file_status>& status) const;
 
 		void clear_error() const;
 
@@ -419,8 +429,7 @@ namespace libtorrent
 	private:
 
 		torrent_handle(boost::weak_ptr<torrent> const& t)
-			: m_torrent(t)
-		{}
+		{ if (!t.expired()) m_torrent = t; }
 
 #ifdef TORRENT_DEBUG
 		void check_invariant() const;
@@ -469,6 +478,7 @@ namespace libtorrent
 			, block_size(0)
 			, num_uploads(0)
 			, num_connections(0)
+			, num_undead_peers(0)
 			, uploads_limit(0)
 			, connections_limit(0)
 			, storage_mode(storage_mode_sparse)
@@ -507,7 +517,11 @@ namespace libtorrent
 
 		enum state_t
 		{
+#ifndef TORRENT_NO_DEPRECATE
 			queued_for_checking,
+#else
+			unused_enum_for_backwards_compatibility,
+#endif
 			checking_files,
 			downloading_metadata,
 			downloading,
@@ -643,6 +657,7 @@ namespace libtorrent
 
 		int num_uploads;
 		int num_connections;
+		int num_undead_peers;
 		int uploads_limit;
 		int connections_limit;
 

@@ -35,35 +35,42 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "libtorrent/config.hpp"
 #include "libtorrent/assert.hpp"
+#include "libtorrent/disk_io_job.hpp"
 #include <algorithm>
 
 namespace libtorrent
 {
 
 	namespace aux { struct session_impl; }
-	struct disk_buffer_pool;
+	struct disk_io_thread;
 
 	struct TORRENT_EXPORT disk_buffer_holder
 	{
 		disk_buffer_holder(aux::session_impl& ses, char* buf);
-		disk_buffer_holder(disk_buffer_pool& disk_pool, char* buf);
+		disk_buffer_holder(aux::session_impl& ses, disk_io_job const& j);
+		disk_buffer_holder(disk_io_thread& disk_pool, disk_io_job const& j);
 		~disk_buffer_holder();
 		char* release();
 		char* get() const { return m_buf; }
+		void reset(disk_io_job const& j);
 		void reset(char* buf = 0);
 		void swap(disk_buffer_holder& h)
 		{
-			TORRENT_ASSERT(&h.m_disk_pool == &m_disk_pool);
+			TORRENT_ASSERT(&h.m_disk_thread == &m_disk_thread);
 			std::swap(h.m_buf, m_buf);
+			std::swap(h.m_ref, m_ref);
 		}
+
+		block_cache_reference ref() const { return m_ref; }
 
 		typedef char* (disk_buffer_holder::*unspecified_bool_type)();
 		operator unspecified_bool_type() const
 		{ return m_buf == 0? 0: &disk_buffer_holder::release; }
 
 	private:
-		disk_buffer_pool& m_disk_pool;
+		disk_io_thread& m_disk_thread;
 		char* m_buf;
+		block_cache_reference m_ref;
 	};
 
 }

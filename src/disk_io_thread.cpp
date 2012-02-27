@@ -30,10 +30,6 @@ POSSIBILITY OF SUCH DAMAGE.
 
 */
 
-/*
-	Disk queue elevator patch by Morten Husveit
-*/
-
 #include "libtorrent/storage.hpp"
 #include "libtorrent/disk_io_thread.hpp"
 #include "libtorrent/disk_buffer_holder.hpp"
@@ -44,11 +40,25 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/file_pool.hpp"
 #include <boost/scoped_array.hpp>
 #include <boost/bind.hpp>
+#include <boost/tuple/tuple.hpp>
+#include <set>
+#include <vector>
 
 #include "libtorrent/time.hpp"
+#include "libtorrent/disk_buffer_pool.hpp"
+#include "libtorrent/disk_io_job.hpp"
+#include "libtorrent/alert_types.hpp"
 
-#if TORRENT_USE_MLOCK && !defined TORRENT_WINDOWS
-#include <sys/mman.h>
+#if TORRENT_USE_AIO_SIGNALFD
+#include <sys/signalfd.h>
+#endif
+
+#if TORRENT_USE_AIO_PORTS
+#include <port.h>
+#endif
+
+#if TORRENT_USE_AIO_KQUEUE
+#include <sys/event.h>
 #endif
 
 #ifdef TORRENT_BSD
@@ -63,68 +73,1870 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <linux/unistd.h>
 #endif
 
+#if TORRENT_USE_AIO
+#include <signal.h>
+#endif
+
+#if TORRENT_USE_IOSUBMIT
+#include <libaio.h>
+#endif
+
+
+#define DEBUG_STORAGE 0
+
+#define DLOG if (DEBUG_STORAGE) fprintf
+
 namespace libtorrent
 {
-	bool should_cancel_on_abort(disk_io_job const& j);
-	bool is_read_operation(disk_io_job const& j);
-	bool operation_has_buffer(disk_io_job const& j);
+	struct async_handler;
+
+	bool same_sign(size_type a, size_type b) { return ((a < 0) == (b < 0)) || (a == 0) || (b == 0); }
+
+	bool between(size_type v, size_type b1, size_type b2)
+	{
+		return (b2 <= b1 && v <= b1 && v >= b2)
+			|| (b2 >= b1 && v >= b1 && v <= b2);
+	}
+
+	bool is_ahead_of(size_type head, size_type v, int elevator)
+	{
+		return (v > head && elevator == 1) || (v < head && elevator == -1);
+	}
+
+	bool elevator_ordered(size_type v, size_type next, size_type prev, int elevator)
+	{
+		// if the point is in between prev and next, we should always sort it in
+		// between them, i.e. we're in the right place.
+		if (between(v, prev, next)) return true;
+
+		// if the point is in the elevator direction from prev (and not
+		// in between prev and next) and the next point is not in the
+		// elevator direction, we've found the right spot as well
+		if (same_sign(v - prev, elevator) && !same_sign(next - prev, elevator)) return true;
+
+		// otherwise we need to keep iterating forward looking for the
+		// right insertion point
+		return false;
+	}
+
+	// free function to prepend a chain of aios to a list
+	void prepend_aios(file::aiocb_t*& list, file::aiocb_t* aios)
+	{
+		if (aios == 0) return;
+		if (list)
+		{
+			file::aiocb_t* last = aios;
+			while (last->next)
+			{
+				TORRENT_ASSERT(last->next == 0 || last->next->prev == last);
+				last = last->next;
+			}
+			last->next = list;
+			list->prev = last;
+		}
+		list = aios;
+		return;
+	}
+
+#ifdef TORRENT_DEBUG
+	file::aiocb_t* find_aiocb(file::aiocb_t* haystack, file::aiocb_t const* needle)
+	{
+		while (haystack)
+		{
+			if (haystack->file_ptr == needle->file_ptr
+				&& aio_offset(haystack) == aio_offset(needle))
+			{
+				TORRENT_ASSERT(aio_op(haystack) == aio_op(needle));
+				return haystack;
+			}
+			haystack = haystack->next;
+		}
+		return 0;
+	}
+#endif
+
+	// free function to append a chain of aios to a list
+	// elevator direction determines how the new items are sorted
+	// if it's 0, they are just prepended without any insertion sort
+	// if it's -1, the direction from the first element is going down
+	// towards lower offsets. If the element being inserted is higher,
+	// it's inserted close to the end where the elevator has turned back.
+	// if it's lower it's inserted early, as the offset would pass it.
+	// a positive elevator direction has the same semantics but oposite order
+	// returns the number of items in the aios chain
+	TORRENT_EXPORT int append_aios(file::aiocb_t*& list_start, file::aiocb_t*& list_end
+		, file::aiocb_t* aios, int elevator_direction, disk_io_thread* io)
+	{
+		int ret = 0;
+		if (aios == 0) return 0;
+		if (list_start == 0)
+		{
+			TORRENT_ASSERT(list_end == 0);
+			list_start = aios;
+			++ret;
+			// find the last item in the list chain
+			file::aiocb_t* last = list_start;
+			while (last->next)
+			{
+				++ret;
+				TORRENT_ASSERT(last->next == 0 || last->next->prev == last);
+				TORRENT_ASSERT(last->prev == 0 || last->prev->next == last);
+				last = last->next;
+			}
+			list_end = last;
+			TORRENT_ASSERT(list_end->next == 0);
+			return ret;
+		}
+
+		TORRENT_ASSERT(list_end->next == 0);
+
+#if TORRENT_USE_SYNCIO
+		// this is only optional when we have a phys_offset member
+		// and we can sort by it, i.e. only when we're doing sync I/O
+		if (elevator_direction == 0)
+#endif
+		{
+			// append the aios chain at the end of the list
+			list_end->next = aios;
+			aios->prev = list_end;
+
+			file::aiocb_t* last = list_end;
+			while (last->next)
+			{
+				++ret;
+				TORRENT_ASSERT(last->next == 0 || last->next->prev == last);
+				TORRENT_ASSERT(last->prev == 0 || last->prev->next == last);
+				last = last->next;
+			}
+			// update the end-of-list pointer
+			list_end = last;
+			TORRENT_ASSERT(list_end->next == 0);
+			return ret;
+		}
+
+#if TORRENT_USE_SYNCIO
+		// insert each aio ordered by phys_offset
+		// according to elevator_direction
+
+		ptime start_sort = time_now_hires();
+
+		while (aios)
+		{
+			++ret;
+			// pop the first element from aios into i
+			file::aiocb_t* i = aios;
+			aios = aios->next;
+			i->next = 0;
+			if (aios) aios->prev = 0;
+
+			// find the right place in the current list to insert i
+			// since the local elevator direction may change during
+			// this scan, use a local copy
+			// we want the ordering to look something like this:
+			//
+			//     /      or like this:      ^
+			//    /     (depending on the   /
+			// \         elevator          /
+			//  \        direction)           \ 
+			//   V                             \ 
+			//
+
+			/* for this to work, we need a tail pointer
+
+			// first, if if i is "ahead of" list, we search from the
+			// beginning of the right place for insertion. If i is "behind"
+			// list, search from the end of the list
+			size_type last_offset = j ? j->phys_offset : 0;
+			if (is_ahead_of(last_offset, i->phys_offset, elevator_direction))
+			{
+				// scan from the beginning
+			}
+			else
+			{
+				// scan from the end
+			}
+			*/
+
+			// the knee is where the elevator direction changes. We never
+			// want to insert an element before the first one, since that
+			// might make the drive head move backwards
+			int elevator = elevator_direction;
+			file::aiocb_t* last = 0;
+			file::aiocb_t* j = list_start;
+			size_type last_offset = j ? j->phys_offset : 0;
+			// this will keep iterating as long as j->phys_offset < i->phys_offset
+			// for negative elevator dir, and as long as j->phys_offset > i->phys_offset
+			// for positive elevator dir.
+			// never insert in front of the first element (j == list), since
+			// that's the one that determines where the current head is
+			while (j
+				&& (!elevator_ordered(i->phys_offset, j->phys_offset, last_offset, elevator)
+					|| j == list_start))
+			{
+				if (!same_sign(j->phys_offset - last_offset, elevator))
+				{
+					// the elevator direction changed
+					elevator *= -1;
+				}
+
+				last_offset = j->phys_offset;
+				last = j;
+				j = j->next;
+			}
+			last->next = i;
+			i->next = j;
+			i->prev = last;
+			if (j) j->prev = i;
+			else list_end = i;
+		}
+		
+		TORRENT_ASSERT(list_end->next == 0);
+
+		if (io)
+		{
+			ptime done = time_now_hires();
+			io->m_sort_time.add_sample(total_microseconds(done - start_sort));
+			io->m_cache_stats.cumulative_sort_time += total_microseconds(done - start_sort);
+		}
+
+		return ret;
+#endif // TORRENT_USE_SYNCIO
+	}
+
+#if (TORRENT_USE_AIO && !TORRENT_USE_AIO_SIGNALFD && !TORRENT_USE_AIO_PORTS && !TORRENT_USE_AIO_KQUEUE) \
+	|| TORRENT_USE_SYNCIO
+	// this semaphore is global so that the global signal
+	// handler can access it. The side-effect of this is
+	// that if there are more than one instances of libtorrent
+	// they will all share a single semaphore, and 
+	// all of them will wake up regardless of which one actually
+	// was affected. This seems like a reasonable work-around
+	// since it will most likely only affect unit-tests anyway
+
+	// used to wake up the disk IO thread
+	semaphore g_job_sem;
+
+	// incremented in signal handler
+	// for each job that's completed
+	boost::detail::atomic_count g_completed_aios(0);
+#endif
 
 // ------- disk_io_thread ------
 
 	disk_io_thread::disk_io_thread(io_service& ios
-		, boost::function<void()> const& queue_callback
-		, file_pool& fp
+		, boost::function<void(alert*)> const& post_alert
+		, void* userdata
 		, int block_size)
-		: disk_buffer_pool(block_size)
-		, m_abort(false)
-		, m_waiting_to_shutdown(false)
+		: m_abort(false)
+		, m_userdata(userdata)
+		, m_last_cache_expiry(min_time())
+		, m_pending_buffer_size(0)
 		, m_queue_buffer_size(0)
 		, m_last_file_check(time_now_hires())
+		, m_file_pool(40)
+		, m_hash_thread(this)
+		, m_disk_cache(block_size, m_hash_thread, ios, post_alert)
 		, m_last_stats_flip(time_now())
+		, m_in_progress(0)
+		, m_to_issue(0)
+		, m_to_issue_end(0)
+		, m_num_to_issue(0)
+		, m_peak_num_to_issue(0)
+		, m_outstanding_jobs(0)
+		, m_peak_outstanding(0)
+#if TORRENT_USE_SYNCIO
+		, m_elevator_direction(1)
+		, m_elevator_turns(0)
+		, m_last_phys_off(0)
+#endif
 		, m_physical_ram(0)
-		, m_exceeded_write_queue(false)
 		, m_ios(ios)
-		, m_queue_callback(queue_callback)
 		, m_work(io_service::work(m_ios))
-		, m_file_pool(fp)
+		, m_last_disk_aio_performance_warning(min_time())
+		, m_post_alert(post_alert)
+#if TORRENT_USE_SYNCIO
+		, m_worker_thread(this)
+#endif
+#if TORRENT_USE_SUBMIT_THREADS
+		, m_submit_queue(&m_aiocb_pool)
+#endif
+#if TORRENT_USE_OVERLAPPED
+		, m_completion_port(CreateIoCompletionPort(INVALID_HANDLE_VALUE
+			, NULL, 0, 1))
+#endif
 		, m_disk_io_thread(boost::bind(&disk_io_thread::thread_fun, this))
 	{
-		// don't do anything in here. Essentially all members
+		// Essentially all members
 		// of this object are owned by the newly created thread.
 		// initialize stuff in thread_fun().
+#if TORRENT_USE_IOSUBMIT
+		m_io_queue = 0;
+		int ret = io_setup(4096, &m_io_queue);
+		if (ret != 0)
+		{
+			// error handling!
+			TORRENT_ASSERT(false);
+		}
+		m_disk_event_fd = eventfd(0, 0);
+		if (m_disk_event_fd < 0)
+		{
+			TORRENT_ASSERT(false);
+		}
+		m_job_event_fd = eventfd(0, 0);
+		if (m_job_event_fd < 0)
+		{
+			TORRENT_ASSERT(false);
+		}
+		m_aiocb_pool.io_queue = m_io_queue;
+		m_aiocb_pool.event = m_disk_event_fd;
+		
+#endif
+
+#if TORRENT_USE_SYNCIO
+		m_aiocb_pool.worker_thread = &m_worker_thread;
+#endif
+
+#if TORRENT_USE_AIO
+
+#if TORRENT_USE_AIO_PORTS 
+		m_port = port_create();
+		DLOG(stderr, "port_create() = %d\n", m_port);
+		TORRENT_ASSERT(m_port >= 0);
+		m_aiocb_pool.port = m_port;
+#endif // TORRENT_USE_AIO_PORTS
+
+#if TORRENT_USE_AIO_SIGNALFD
+		m_job_event_fd = eventfd(0, 0);
+		if (m_job_event_fd < 0)
+		{
+			TORRENT_ASSERT(false);
+		}
+		sigset_t mask;
+		sigemptyset(&mask);
+		sigaddset(&mask, TORRENT_AIO_SIGNAL);
+
+		m_signal_fd[1] = signalfd(-1, &mask, SFD_NONBLOCK);
+		if (pthread_sigmask(SIG_BLOCK, &mask, 0) == -1)
+		{
+			TORRENT_ASSERT(false);
+		}
+#endif // TORRENT_USE_AIO_SIGNALFD
+
+#if TORRENT_USE_AIO_KQUEUE
+		m_queue = kqueue();
+		TORRENT_ASSERT(m_queue >= 0);
+		m_aiocb_pool.queue = m_queue;
+		pipe(m_job_pipe);
+		// set up an event on m_job_pipe[1] being readable
+		// this is how we communicate that a new job has been
+		// posted
+		struct kevent e;
+		EV_SET(&e, m_job_pipe[1], EVFILT_READ, EV_ADD, 0, 0, 0);
+		kevent(m_queue, &e, 1, 0, 0, 0);
+#endif // TORRENT_USE_AIO_KQUEUE
+
+#endif // TORRENT_USE_AIO
+
+		// initialize default settings
+		m_disk_cache.set_settings(m_settings);
 	}
 
 	disk_io_thread::~disk_io_thread()
 	{
+		DLOG(stderr, "destructing disk_io_thread [%p]\n", this);
+
 		TORRENT_ASSERT(m_abort == true);
+		TORRENT_ASSERT(m_in_progress == 0);
+		TORRENT_ASSERT(m_to_issue == 0);
+
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		// by now, all pieces should have been evicted
+		std::pair<block_cache::iterator, block_cache::iterator> pieces
+			= m_disk_cache.all_pieces();
+		TORRENT_ASSERT(pieces.first == pieces.second);
+#endif
+
+#if TORRENT_USE_AIO
+
+#if TORRENT_USE_AIO_PORTS
+		close(m_port);
+#elif TORRENT_USE_AIO_KQUEUE
+		close(m_job_pipe[0]);
+		close(m_job_pipe[1]);
+		close(m_queue);
+#else
+		sigset_t mask;
+		sigemptyset(&mask);
+		sigaddset(&mask, TORRENT_AIO_SIGNAL);
+
+		if (pthread_sigmask(SIG_BLOCK, &mask, 0) == -1)
+		{
+			TORRENT_ASSERT(false);
+		}
+
+#if TORRENT_USE_AIO_SIGNALFD
+		close(m_signal_fd[0]);
+		close(m_signal_fd[1]);
+		close(m_event_fd);
+#endif // TORRENT_USE_AIO_SIGNALFD
+#endif // TORRENT_USE_AIO_PORTS
+
+#elif TORRENT_USE_OVERLAPPED
+		CloseHandle(m_completion_port);
+#elif TORRENT_USE_IOSUBMIT
+		io_destroy(m_io_queue);
+		close(m_disk_event_fd);
+		close(m_job_event_fd);
+#endif
+	}
+
+	void disk_io_thread::reclaim_block(block_cache_reference ref)
+	{
+		TORRENT_ASSERT(ref.storage);
+		// technically this isn't allowed, since these values are owned
+		// and modified by the disk thread (and this call is made from the
+		// network thread). However, it's just asserts (so it only affects
+		// debug builds) and on the most popular systems, these read operations
+		// will most likely be atomic anyway
+		disk_io_job* j = m_aiocb_pool.allocate_job(disk_io_job::reclaim_block);
+		TORRENT_ASSERT(ref.piece >= 0);
+		TORRENT_ASSERT(ref.storage != 0);
+		TORRENT_ASSERT(ref.block >= 0);
+		TORRENT_ASSERT(ref.piece < ((piece_manager*)ref.storage)->files()->num_pieces());
+		TORRENT_ASSERT(ref.block <= ((piece_manager*)ref.storage)->files()->piece_length() / 0x4000);
+		j->d.io.ref = ref;
+		add_job(j, true);
+	}
+
+	void disk_io_thread::set_settings(session_settings* sett)
+	{
+		disk_io_job* j = m_aiocb_pool.allocate_job(disk_io_job::update_settings);
+		j->buffer = (char*)sett;
+		add_job(j);
 	}
 
 	void disk_io_thread::abort()
 	{
-		mutex::scoped_lock l(m_queue_mutex);
-		disk_io_job j;
-		m_waiting_to_shutdown = true;
-		j.action = disk_io_job::abort_thread;
-		j.start_time = time_now_hires();
-		m_jobs.insert(m_jobs.begin(), j);
-		m_signal.signal(l);
+		disk_io_job* j = m_aiocb_pool.allocate_job(disk_io_job::abort_thread);
+		add_job(j);
 	}
 
 	void disk_io_thread::join()
 	{
+		DLOG(stderr, "[%p] waiting for disk_io_thread\n", this);
 		m_disk_io_thread.join();
-		mutex::scoped_lock l(m_queue_mutex);
 		TORRENT_ASSERT(m_abort == true);
-		m_jobs.clear();
 	}
 
-	bool disk_io_thread::can_write() const
+	// flush blocks of 'cont_block' contiguous blocks, and if at least 'num'
+	// blocks are flushed, stop.
+	int disk_io_thread::try_flush_contiguous(cached_piece_entry* p, int cont_block, int num)
 	{
-		mutex::scoped_lock l(m_queue_mutex);
-		return !m_exceeded_write_queue;
+		int start_of_run = 0;
+		int i = 0;
+		cont_block = (std::min)(cont_block, int(p->blocks_in_piece));
+		int ret = 0;
+		DLOG(stderr, "[%p] try_flush_contiguous: %d blocks: %d cont_block: %d num: %d\n"
+			, this, int(p->piece), int(p->blocks_in_piece), int(cont_block), num);
+
+		int block_size = m_disk_cache.block_size();
+		int hash_pos = p->hash == 0 ? 0 : (p->hash->offset + block_size - 1) / block_size;
+		cached_piece_entry* pe = const_cast<cached_piece_entry*>(&*p);
+
+		for (; i < p->blocks_in_piece; ++i)
+		{
+			if (p->blocks[i].dirty && !p->blocks[i].pending) continue;
+
+			if (start_of_run == i
+				|| i - start_of_run < cont_block)
+			{
+				start_of_run = i + 1;
+				continue;
+			}
+
+			// we should flush start_of_run - i.
+			// we're flushing a block which we will need
+			// to read back later, when we hash this piece
+			if (start_of_run > hash_pos) pe->need_readback = true;
+			ret += io_range(p, start_of_run, i, op_write, 0);
+			start_of_run = i + 1;
+			if (ret >= num) return ret;
+		}
+
+		if (i - start_of_run >= cont_block)
+		{
+			// we're flushing a block which we will need
+			// to read back later, when we hash this piece
+			if (start_of_run > hash_pos) pe->need_readback = true;
+			// we should flush start_of_run - i.
+			ret += io_range(p, start_of_run, i, op_write, 0);
+			start_of_run = i + 1;
+		}
+		return ret;
 	}
 
-	void disk_io_thread::flip_stats(ptime now)
+	// flush all blocks that are below p->hash.offset, since we've
+	// already hashed those blocks, they won't cause any read-back
+	int disk_io_thread::try_flush_hashed(cached_piece_entry* p, int cont_block, int num)
+	{
+		TORRENT_ASSERT(cont_block > 0);
+		if (p->hash == 0)
+		{
+			DLOG(stderr, "[%p] no hash\n", this);
+			return 0;
+		}
+
+		// end is one past the end
+		// round offset up to include the last block, which might
+		// have an odd size
+		int block_size = m_disk_cache.block_size();
+		int end = (p->hash->offset + block_size - 1) / block_size;
+
+		// nothing has been hashed yet, don't flush anything
+		if (end == 0 && !p->need_readback) return 0;
+
+		// the number of contiguous blocks we need to be allowed to flush
+		cont_block = (std::min)(cont_block, int(p->blocks_in_piece));
+
+		// if everything has been hashed, we might as well flush everythin
+		// regardless of the contiguous block restriction
+		if (end == int(p->blocks_in_piece)) cont_block = 1;
+
+		if (p->need_readback)
+		{
+			// if this piece needs a read-back already, don't
+			// try to keep it from being flushed, since we'll
+			// need to read it back regardless. Flushing will
+			// save blocks that can be used to "save" other
+			// pieces from being fllushed prematurely
+			end = int(p->blocks_in_piece);
+		}
+
+		// count number of blocks that would be flushed
+		int num_blocks = 0;
+		for (int i = end-1; i >= 0; --i)
+			num_blocks += (p->blocks[i].dirty && !p->blocks[i].pending);
+
+		// we did not satisfy the cont_block requirement
+		// i.e. too few blocks would be flushed at this point, put it off
+		if (cont_block > num_blocks) return 0;
+
+		DLOG(stderr, "[%p] try_flush_hashed: %d blocks: %d end: %d num: %d\n"
+			, this, int(p->piece), int(p->blocks_in_piece), end, num);
+
+		return io_range(p, 0, end, op_write, 0);
+	}
+
+	int count_aios(file::aiocb_t* a)
+	{
+		int ret = 0;
+		while (a)
+		{
+			TORRENT_ASSERT(a->prev == 0 || a->prev->next == a);
+			TORRENT_ASSERT(a->next == 0 || a->next->prev == a);
+			++ret;
+			a = a->next;
+		}
+		return ret;
+	}
+
+	// issues read or write operations for blocks in the given
+	// range on the given piece. Returns the number of blocks operations
+	// were actually issued for
+	int disk_io_thread::io_range(cached_piece_entry* pe, int start, int end
+		, int readwrite, int flags)
+	{
+		INVARIANT_CHECK;
+
+		DLOG(stderr, "[%p] io_range: readwrite=%d piece=%d [%d, %d)\n"
+			, this, readwrite, int(pe->piece), start, end);
+		TORRENT_ASSERT(start >= 0);
+		TORRENT_ASSERT(start < end);
+		end = (std::min)(end, int(pe->blocks_in_piece));
+
+		int piece_size = pe->storage->files()->piece_size(pe->piece);
+		TORRENT_ASSERT(piece_size > 0);
+		
+		int buffer_size = 0;
+
+		file::iovec_t* iov = TORRENT_ALLOCA(file::iovec_t, pe->blocks_in_piece);
+		int iov_counter = 0;
+		int ret = 0;
+
+		end = (std::min)(end, int(pe->blocks_in_piece));
+
+#ifdef DEBUG_STORAGE
+		DLOG(stderr, "[%p] io_range: piece: %d [", this, int(pe->piece));
+		for (int i = 0; i < start; ++i) DLOG(stderr, ".");
+#endif
+
+		// the termination condition is deliberately <= end here
+		// so that we get one extra loop where we can issue the last
+		// async operation
+		for (int i = start; i <= end; ++i)
+		{
+			// don't flush blocks that are empty (buf == 0), not dirty
+			// (read cache blocks), or pending (already being written)
+			if (i == end
+				|| pe->blocks[i].buf == 0
+				// if we're writing and the block is already pending, it
+				// means we're already writing it, skip it!
+				|| pe->blocks[i].pending
+				|| (!pe->blocks[i].dirty && readwrite == op_write)
+				|| (!pe->blocks[i].uninitialized && readwrite == op_read))
+			{
+/*				if (i == end)
+				{
+					DLOG(stderr, "[%p] io_range: skipping block=%d end: %d\n", this, i, end);
+				}
+				else
+				{
+					DLOG(stderr, "[%p] io_range: skipping block=%d end: %d buf=%p pending=%d dirty=%d\n"
+						, this, i, end, pe->blocks[i].buf, pe->blocks[i].pending, pe->blocks[i].dirty);
+				}
+*/				if (buffer_size == 0)
+				{
+					if (i != end) DLOG(stderr, ".");
+					continue;
+				}
+
+				int elevator_direction = 0;
+#if TORRENT_USE_SYNCIO
+				elevator_direction = m_settings.allow_reordered_disk_operations ? m_elevator_direction : 0;
+#endif
+
+				int block_size = m_disk_cache.block_size();
+				TORRENT_ASSERT(buffer_size <= i * block_size);
+				int to_write = (std::min)(i * block_size, piece_size) - buffer_size;
+				int range_start = i - (buffer_size + block_size - 1) / block_size;
+				file::aiocb_t* aios = 0;
+				async_handler* a = m_aiocb_pool.alloc_handler();
+				if (a == 0)
+				{
+					// #error handle no mem
+				}
+				if (readwrite == op_write)
+				{
+//					DLOG(stderr, "[%p] io_range: write piece=%d start_block=%d end_block=%d\n"
+//						, this, int(pe->piece), range_start, i);
+					m_pending_buffer_size += to_write;
+					a->handler = boost::bind(&disk_io_thread::on_disk_write, this, pe
+						, range_start, i, to_write, _1);
+
+					aios = pe->storage->get_storage_impl()->async_writev(iov, iov_counter
+						, pe->piece, to_write, flags, a);
+					m_cache_stats.blocks_written += i - range_start;
+					++m_cache_stats.writes;
+				}
+				else
+				{
+//					DLOG(stderr, "[%p] io_range: read piece=%d start_block=%d end_block=%d\n"
+//						, this, int(pe->piece), range_start, i);
+					++m_outstanding_jobs;
+					a->handler = boost::bind(&disk_io_thread::on_disk_read, this, pe
+						, range_start, i, _1);
+					aios = pe->storage->get_storage_impl()->async_readv(iov, iov_counter
+						, pe->piece, range_start * block_size, flags, a);
+					m_cache_stats.blocks_read += i - range_start;
+					++m_cache_stats.reads;
+				}
+
+				if (a->references == 0)
+				{
+					// this is a special case for when the storage doesn't want to produce
+					// any actual async. file operations, but just filled in the buffers
+					if (!a->error.ec) a->transferred = bufs_size(iov, iov_counter);
+					a->handler(a);
+					m_aiocb_pool.free_handler(a);
+					a = 0;
+				}
+
+#ifdef TORRENT_DEBUG
+				// make sure we're not already requesting this same block
+				file::aiocb_t* k = aios;
+				while (k)
+				{
+					file::aiocb_t* found = find_aiocb(m_to_issue, k);
+					TORRENT_ASSERT(found == 0);
+					found = find_aiocb(m_in_progress, k);
+					TORRENT_ASSERT(found == 0);
+					k = k->next;
+				}
+#endif
+
+				m_num_to_issue += append_aios(m_to_issue, m_to_issue_end, aios, elevator_direction, this);
+				if (m_num_to_issue > m_peak_num_to_issue) m_peak_num_to_issue = m_num_to_issue;
+				TORRENT_ASSERT(m_num_to_issue == count_aios(m_to_issue));
+
+				iov_counter = 0;
+				buffer_size = 0;
+				continue;
+			}
+			DLOG(stderr, "x");
+
+			int block_size = m_disk_cache.block_size();
+			block_size = (std::min)(piece_size - i * block_size, block_size);
+			TORRENT_ASSERT_VAL(i < end, i);
+			iov[iov_counter].iov_base = pe->blocks[i].buf;
+			iov[iov_counter].iov_len = block_size;
+#ifdef TORRENT_DEBUG
+			if (readwrite == op_write)
+				TORRENT_ASSERT(pe->blocks[i].dirty == true);
+			else
+				TORRENT_ASSERT(pe->blocks[i].dirty == false);
+#endif
+			TORRENT_ASSERT(pe->blocks[i].pending == false);
+			pe->blocks[i].uninitialized = false;
+			if (!pe->blocks[i].pending)
+			{
+				TORRENT_ASSERT(pe->blocks[i].buf);
+				pe->blocks[i].pending = true;
+				if (pe->blocks[i].refcount == 0) m_disk_cache.pinned_change(1);
+				++pe->blocks[i].refcount;
+				TORRENT_ASSERT(pe->blocks[i].refcount > 0); // make sure it didn't wrap
+				++pe->refcount;
+				TORRENT_ASSERT(pe->refcount > 0); // make sure it didn't wrap
+			}
+			++iov_counter;
+			++ret;
+			buffer_size += block_size;
+		}
+
+		if (m_outstanding_jobs > m_peak_outstanding) m_peak_outstanding = m_outstanding_jobs;
+
+#ifdef DEBUG_STORAGE
+		for (int i = end; i < int(pe->blocks_in_piece); ++i) DLOG(stderr, ".");
+		DLOG(stderr, "] ret = %d\n", ret);
+#endif
+
+		return ret;
+	}
+
+	void disk_io_thread::on_disk_write(cached_piece_entry* pe, int begin
+		, int end, int to_write, async_handler* handler)
+	{
+		if (!handler->error.ec)
+		{
+			boost::uint32_t write_time = total_microseconds(time_now_hires() - handler->started);
+			m_write_time.add_sample(write_time);
+			m_cache_stats.cumulative_write_time += write_time;
+		}
+
+		TORRENT_ASSERT(m_pending_buffer_size >= to_write);
+		m_pending_buffer_size -= to_write;
+
+		DLOG(stderr, "[%p] on_disk_write piece: %d start: %d end: %d\n"
+			, this, int(pe->piece), begin, end);
+		m_disk_cache.mark_as_done(pe, begin, end, m_completed_jobs, handler->error);
+
+		if (!handler->error)
+		{
+			boost::uint32_t job_time = total_microseconds(time_now_hires() - handler->started);
+			m_job_time.add_sample(job_time);
+			m_cache_stats.cumulative_job_time += job_time;
+		}
+	}
+
+	void disk_io_thread::on_disk_read(cached_piece_entry* pe, int begin
+		, int end, async_handler* handler)
+	{
+		if (!handler->error.ec)
+		{
+			boost::uint32_t read_time = total_microseconds(time_now_hires() - handler->started);
+			m_read_time.add_sample(read_time);
+			m_cache_stats.cumulative_read_time += read_time;
+		}
+
+		file::iovec_t* vec = TORRENT_ALLOCA(file::iovec_t, end - begin);
+		int piece_size = pe->storage->files()->piece_size(pe->piece);
+		int block_size = m_disk_cache.block_size();
+		for (int i = begin, k = 0; i < end; ++i, ++k)
+		{
+			vec[k].iov_base = (file::iovec_base_t)pe->blocks[i].buf;
+			vec[k].iov_len = (std::min)(piece_size - i * block_size, block_size);
+		}
+
+		pe->storage->get_storage_impl()->readv_done(vec, end - begin
+			, pe->piece, begin * block_size);
+
+		DLOG(stderr, "[%p] on_disk_read piece: %d start: %d end: %d\n"
+			, this, int(pe->piece), begin, end);
+		m_disk_cache.mark_as_done(pe, begin, end, m_completed_jobs
+			, handler->error);
+
+		if (!handler->error)
+		{
+			boost::uint32_t job_time = total_microseconds(time_now_hires() - handler->started);
+			m_job_time.add_sample(job_time);
+			m_cache_stats.cumulative_job_time += job_time;
+		}
+
+		TORRENT_ASSERT(m_outstanding_jobs > 0);
+		--m_outstanding_jobs;
+	}
+
+	void disk_io_thread::flush_piece(cached_piece_entry* pe, int flags, int& ret)
+	{
+		if (flags & flush_delete_cache)
+		{
+			// delete dirty blocks and post handlers with
+			// operation_aborted error code
+			m_disk_cache.abort_dirty(pe, m_completed_jobs);
+		}
+		else if ((flags & flush_write_cache) && pe->num_dirty > 0)
+		{
+			// issue write commands
+			io_range(pe, 0, INT_MAX, op_write, 0);
+
+			// if we're also flushing the read cache, this piece
+			// should be removed as soon as all write jobs finishes
+			// otherwise it will turn into a read piece
+		}
+
+		// we need to count read jobs as well
+		// because we can't close files with
+		// any outstanding jobs
+		ret += pe->jobs.size();
+
+		// mark_for_deletion may erase the piece from the cache, that's
+		// why we don't have the 'i' iterator referencing it at this point
+		if (flags & (flush_read_cache | flush_delete_cache))
+			m_disk_cache.mark_for_deletion(pe);
+	}
+
+	// returns the number of outstanding jobs on the pieces. If this is 0
+	// it indicates that files can be closed without interrupting any operation
+	int disk_io_thread::flush_cache(disk_io_job* j, boost::uint32_t flags)
+	{
+		int ret = 0;
+
+		piece_manager* storage = j->storage.get();
+
+		std::pair<block_cache::iterator, block_cache::iterator> range;
+
+		if (storage)
+		{
+			// iterate over all blocks and issue writes for the ones
+			// that have dirty blocks (i.e. needs to be written)
+			for (boost::unordered_set<cached_piece_entry*>::iterator i
+				= storage->cached_pieces().begin(), end(storage->cached_pieces().end()); i != end;)
+			{
+				cached_piece_entry* pe = *i;
+				++i;
+				TORRENT_ASSERT(pe->storage == j->storage);
+				flush_piece(pe, flags, ret);
+			}
+		}
+		else
+		{
+			for (block_cache::iterator i = range.first; i != range.second;)
+			{
+				cached_piece_entry* pe = const_cast<cached_piece_entry*>(&*i);
+				++i;
+				flush_piece(pe, flags, ret);
+			}
+		}
+		return ret;
+	}
+
+	// this is called if we're exceeding (or about to exceed) the cache
+	// size limit. This means we should not restrict ourselves to contiguous
+	// blocks of write cache line size, but try to flush all old blocks
+	// this is why we pass in 1 as cont_block to the flushing functions
+	void disk_io_thread::try_flush_write_blocks(int num)
+	{
+		DLOG(stderr, "[%p] try_flush_write_blocks: %d\n", this, num);
+
+		list_iterator range = m_disk_cache.write_lru_pieces();
+
+		TORRENT_ASSERT(m_settings.disk_cache_algorithm == session_settings::avoid_readback);
+
+		if (m_settings.disk_cache_algorithm == session_settings::largest_contiguous)
+		{
+			for (list_iterator p = range; p.get() && num > 0; p.next())
+			{
+				cached_piece_entry* e = (cached_piece_entry*)p.get();
+				if (e->num_dirty == 0) continue;
+
+				// prefer contiguous blocks. If we won't find any, we'll
+				// start over but actually flushing single blocks
+				num -= try_flush_contiguous(e, m_settings.write_cache_line_size, num);
+			}
+		}
+		else if (m_settings.disk_cache_algorithm == session_settings::avoid_readback)
+		{
+			for (list_iterator p = range; p.get() && num > 0; p.next())
+			{
+				cached_piece_entry* e = (cached_piece_entry*)p.get();
+				if (e->num_dirty == 0) continue;
+
+				num -= try_flush_hashed(e, 1, num);
+			}
+		}
+
+		// if we still need to flush blocks, start over and flush
+		// everything in LRU order (degrade to lru cache eviction)
+		if (num > 0)
+		{
+			for (list_iterator p = range; p.get() && num > 0; p.next())
+			{
+				cached_piece_entry* e = (cached_piece_entry*)p.get();
+				if (e->num_dirty == 0) continue;
+
+				num -= try_flush_contiguous(e, 1, num);
+			}
+		}
+	}
+
+	void disk_io_thread::flush_expired_write_blocks()
+	{
+		DLOG(stderr, "[%p] flush_expired_write_blocks\n", this);
+
+		TORRENT_ASSERT(m_settings.disk_cache_algorithm == session_settings::avoid_readback);
+
+		ptime now = time_now();
+		time_duration expiration_limit = seconds(m_settings.cache_expiry);
+
+#ifdef TORRENT_DEBUG
+		ptime timeout = min_time();
+#endif
+
+		for (list_iterator p = m_disk_cache.write_lru_pieces(); p.get(); p.next())
+		{
+			cached_piece_entry* e = (cached_piece_entry*)p.get();
+#ifdef TORRENT_DEBUG
+			TORRENT_ASSERT(e->expire >= timeout);
+			timeout = e->expire;
+#endif
+
+			// since we're iterating in order of last use, if this piece
+			// shouldn't be evicted, none of the following ones will either
+			if (now - e->expire < expiration_limit) break;
+			if (e->num_dirty == 0) continue;
+
+			io_range(e, 0, INT_MAX, op_write, 0);
+		}
+	}
+
+	typedef int (disk_io_thread::*disk_io_fun_t)(disk_io_job* j);
+
+	// this is a jump-table for disk I/O jobs
+	static const disk_io_fun_t job_functions[] =
+	{
+		&disk_io_thread::do_read,
+		&disk_io_thread::do_write,
+		&disk_io_thread::do_hash,
+		&disk_io_thread::do_move_storage,
+		&disk_io_thread::do_release_files,
+		&disk_io_thread::do_delete_files,
+		&disk_io_thread::do_check_fastresume,
+		&disk_io_thread::do_save_resume_data,
+		&disk_io_thread::do_rename_file,
+		&disk_io_thread::do_abort_thread,
+		&disk_io_thread::do_clear_read_cache,
+		&disk_io_thread::do_abort_torrent,
+		&disk_io_thread::do_update_settings,
+		&disk_io_thread::do_cache_piece,
+		&disk_io_thread::do_finalize_file,
+		&disk_io_thread::do_get_cache_info,
+		&disk_io_thread::do_hashing_done,
+		&disk_io_thread::do_file_status,
+		&disk_io_thread::do_reclaim_block,
+		&disk_io_thread::do_clear_piece,
+		&disk_io_thread::do_sync_piece,
+		&disk_io_thread::do_flush_piece,
+		&disk_io_thread::do_trim_cache,
+		&disk_io_thread::do_aiocb_complete,
+	};
+
+	static const char* job_action_name[] =
+	{
+		"read",
+		"write",
+		"hash",
+		"move_storage",
+		"release_files",
+		"delete_files",
+		"check_fastresume",
+		"save_resume_data",
+		"rename_file",
+		"abort_thread",
+		"clear_read_cache",
+		"abort_torrent",
+		"update_settings",
+		"cache_piece",
+		"finalize_file",
+		"get_cache_info",
+		"hashing_done",
+		"file_status",
+		"reclaim_block",
+		"clear_piece",
+		"sync_piece",
+		"flush_piece",
+		"trim_cache",
+		"aiocb_complete"
+	};
+
+	void disk_io_thread::perform_async_job(disk_io_job* j)
+	{
+		INVARIANT_CHECK;
+		TORRENT_ASSERT(j->next == 0);
+
+		int evict = m_disk_cache.num_to_evict(0);
+		if (evict > 0)
+		{
+			evict = m_disk_cache.try_evict_blocks(evict, 1);
+			if (evict > 0) try_flush_write_blocks(evict);
+		}
+
+		DLOG(stderr, "[%p] perform_async_job job: %s piece: %d offset: %d\n"
+			, this, job_action_name[j->action], j->piece, j->d.io.offset);
+		if (j->storage && j->storage->get_storage_impl()->m_settings == 0)
+			j->storage->get_storage_impl()->m_settings = &m_settings;
+
+		TORRENT_ASSERT(j->action < sizeof(job_functions)/sizeof(job_functions[0]));
+
+		// is the fence up for this storage?
+		if (j->storage && j->storage->has_fence())
+		{
+			DLOG(stderr, "[%p]   perform_async_job: blocked\n", this);
+			// Yes it is! We're not allowed
+			// to issue this job. Queue it up
+			m_blocked_jobs.push_back(j);
+			return;
+		}
+
+		if (time_now() > m_last_stats_flip + seconds(1)) flip_stats();
+
+		ptime now = time_now_hires();
+		m_queue_time.add_sample(total_microseconds(now - j->start_time));
+		j->start_time = now;
+
+		// call disk function
+		int ret = (this->*(job_functions[j->action]))(j);
+
+		DLOG(stderr, "[%p]   return: %d error: %s\n"
+			, this, ret, j->error ? j->error.ec.message().c_str() : "");
+
+		if (ret != defer_handler)
+		{
+			TORRENT_ASSERT(j->next == 0);
+			DLOG(stderr, "[%p]   posting callback j->buffer: %p\n", this, j->buffer);
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+			TORRENT_ASSERT(j->callback_called == false);
+			j->callback_called = true;
+#endif
+			j->ret = ret;
+			m_completed_jobs.push_back(j);
+		}
+
+		// if this job actually completed (as opposed to deferred the handler)
+		// and it's a job that raises the fence (like move storage, release
+		// files, etc.), we may have to uncork the jobs that were blocked by it.
+		if (ret != defer_handler && (j->flags & disk_io_job::need_uncork))
+		{
+			DLOG(stderr, "[%p]   uncorking\n", this);
+			// we should only uncork if the storage doesn't
+			// have a fence up anymore
+			TORRENT_ASSERT(!j->storage->has_fence());
+			disk_io_job* k = (disk_io_job*)m_blocked_jobs.get_all();
+
+			while (k)
+			{
+				disk_io_job* j = k;
+				k = (disk_io_job*)k->next;
+				j->next = 0;
+				perform_async_job(j);
+			}
+		}
+	}
+
+	int disk_io_thread::do_read(disk_io_job* j)
+	{
+		DLOG(stderr, "[%p] do_read\n", this);
+		INVARIANT_CHECK;
+
+		TORRENT_ASSERT(j->d.io.buffer_size <= m_disk_cache.block_size());
+		j->d.io.ref.storage = 0;
+
+		// there's no point in hinting that we will read something
+		// when using async I/O anyway
+#if TORRENT_USE_SYNCIO
+		// TODO: when reading too much ahead, linux seems to freeze (posix_fadvise() blocks indefinitely)
+		// this logic should be changed to apply to aiocb_t objects instead of disk_io_job, and once
+		// sorted, the first X aiocb_t object should have the hint_read called on them. That way the
+		// number of read-ahead-bytes is limited
+		if (m_settings.use_disk_read_ahead)
+		{
+			j->storage->get_storage_impl()->hint_read(j->piece, j->d.io.offset, j->d.io.buffer_size);
+		}
+#endif
+
+		int block_size = m_disk_cache.block_size();
+
+		if (m_settings.use_read_cache)
+		{
+			int ret = m_disk_cache.try_read(j);
+			if (ret >= 0)
+			{
+				DLOG(stderr, "[%p] do_read: cache hit\n", this);
+				j->flags |= disk_io_job::cache_hit;
+				return ret;
+			}
+			else if (ret == -2)
+			{
+				j->error.ec = error::no_memory;
+				return disk_operation_failed;
+			}
+
+			// cache the piece, unless we're using an explicit cache
+			if (!m_settings.explicit_read_cache)
+			{
+				cached_piece_entry* p = m_disk_cache.allocate_piece(j, cached_piece_entry::read_lru1);
+				if (p)
+				{
+					int start_block = j->d.io.offset / block_size;
+					int end_block = (std::min)(int(p->blocks_in_piece)
+							, start_block + m_settings.read_cache_line_size);
+					// this will also add the job to the pending job list in this piece
+					// unless it fails and returns -1
+					int ret = m_disk_cache.allocate_pending(p, start_block, end_block, j, 0, true);
+					DLOG(stderr, "[%p] do_read: allocate_pending ret=%d start_block=%d end_block=%d\n"
+							, this, ret, start_block, end_block);
+
+					// a return value of 0 means these same blocks are already
+					// scheduled to be read, and we just tacked on this new jobs
+					// to be notified of the buffers being complete
+					if (ret >= 0)
+					{
+						// some blocks were allocated
+						if (ret > 0) io_range(p, start_block, end_block, op_read, j->flags);
+
+						DLOG(stderr, "[%p] do_read: cache miss\n", this);
+						return defer_handler;
+					}
+					else if (ret == -1)
+					{
+						// allocation failed
+						m_disk_cache.mark_for_deletion(p);
+						j->buffer = 0;
+						j->error.ec = error::no_memory;
+						return disk_operation_failed;
+					}
+
+					// we get here if allocate_pending failed with
+					// an error other than -1. This happens for instance
+					// if the cache is full. Then fall through and issue the
+					// read circumventing the cache
+
+					m_disk_cache.mark_for_deletion(p);
+				}
+			}
+		}
+
+		j->buffer = m_disk_cache.allocate_buffer("send buffer");
+		if (j->buffer == 0)
+		{
+			j->error.ec = error::no_memory;
+			return disk_operation_failed;
+		}
+
+		DLOG(stderr, "[%p] do_read: async\n", this);
+		++m_outstanding_jobs;
+		if (m_outstanding_jobs > m_peak_outstanding) m_peak_outstanding = m_outstanding_jobs;
+		async_handler* a = m_aiocb_pool.alloc_handler();
+		if (a == 0)
+		{
+			j->error.ec = error::no_memory;
+			return disk_operation_failed;
+		}
+		a->handler = boost::bind(&disk_io_thread::on_read_one_buffer, this, _1, j);
+		file::iovec_t b = { j->buffer, j->d.io.buffer_size };
+		file::aiocb_t* aios = j->storage->get_storage_impl()->async_readv(&b, 1
+			, j->piece, j->d.io.offset, j->flags, a);
+
+		if (a->references == 0)
+		{
+			// this is a special case for when the storage doesn't want to produce
+			// any actual async. file operations, but just filled in the buffers
+			if (!a->error.ec) a->transferred = j->d.io.buffer_size;
+			a->handler(a);
+			m_aiocb_pool.free_handler(a);
+			a = 0;
+		}
+
+		DLOG(stderr, "prepending aios (%p) from read_async_impl to m_to_issue (%p)\n"
+			, aios, m_to_issue);
+
+#ifdef TORRENT_DEBUG
+		// make sure we're not already requesting this same block
+		file::aiocb_t* k = aios;
+		while (k)
+		{
+			file::aiocb_t* found = find_aiocb(m_to_issue, k);
+			TORRENT_ASSERT(found == 0);
+			found = find_aiocb(m_in_progress, k);
+			TORRENT_ASSERT(found == 0);
+			k = k->next;
+		}
+#endif
+
+		int elevator_direction = 0;
+#if TORRENT_USE_SYNCIO
+		elevator_direction = m_settings.allow_reordered_disk_operations ? m_elevator_direction : 0;
+#endif
+		m_num_to_issue += append_aios(m_to_issue, m_to_issue_end, aios, elevator_direction, this);
+		if (m_num_to_issue > m_peak_num_to_issue) m_peak_num_to_issue = m_num_to_issue;
+		TORRENT_ASSERT(m_num_to_issue == count_aios(m_to_issue));
+
+//		for (file::aiocb_t* j = m_to_issue; j; j = j->next)
+//			DLOG(stderr, "  %"PRId64, j->phys_offset);
+//		DLOG(stderr, "\n");
+		return defer_handler;
+	}
+
+	int disk_io_thread::do_write(disk_io_job* j)
+	{
+		INVARIANT_CHECK;
+		TORRENT_ASSERT(j->buffer != 0);
+		TORRENT_ASSERT(j->d.io.buffer_size <= m_disk_cache.block_size());
+		int block_size = m_disk_cache.block_size();
+
+		if (m_settings.cache_size > 0)
+		{
+			cached_piece_entry* pe = m_disk_cache.add_dirty_block(j);
+
+			if (pe == 0)
+			{
+				m_disk_cache.free_buffer(j->buffer);
+				j->buffer = 0;
+				j->error.ec = error::no_memory;
+				return disk_operation_failed;
+			}
+
+			if (pe->hash == 0 && !m_settings.disable_hash_checks)
+			{
+				pe->hash = new partial_hash;
+				m_disk_cache.update_cache_state(pe);
+			}
+
+			// flushes the piece to disk in case
+			// it satisfies the condition for a write
+			// piece to be flushed
+			if (m_settings.disk_cache_algorithm == session_settings::avoid_readback)
+			{
+				try_flush_hashed(pe, m_settings.write_cache_line_size);
+			}
+			else
+			{
+				try_flush_contiguous(pe, m_settings.write_cache_line_size);
+			}
+
+			// if we have more blocks in the cache than allowed by
+			// the cache size limit, flush some dirty blocks
+			// deduct the writing blocks from the cache size, otherwise we'll flush the
+			// entire cache as soon as we exceed the limit, since all flush operations are
+			// async.
+			int num_pending_write_blocks = (m_pending_buffer_size + block_size - 1) / block_size;
+			int current_size = m_disk_cache.in_use();
+			if (m_settings.cache_size <= current_size - num_pending_write_blocks)
+			{
+				int left = current_size - m_settings.cache_size;
+				left = m_disk_cache.try_evict_blocks(left, 1);
+				if (left > 0 && !m_settings.dont_flush_write_cache)
+					try_flush_write_blocks(left);
+			}
+
+			// the handler will be called when the block
+			// is flushed to disk
+			return defer_handler;
+		}
+
+		file::iovec_t b = { j->buffer, j->d.io.buffer_size };
+
+		m_pending_buffer_size += j->d.io.buffer_size;
+
+		async_handler* a = m_aiocb_pool.alloc_handler();
+		if (a == 0)
+		{
+			j->error.ec = error::no_memory;
+			return disk_operation_failed;
+		}
+		a->handler = boost::bind(&disk_io_thread::on_write_one_buffer, this, _1, j);
+		file::aiocb_t* aios = j->storage->get_storage_impl()->async_writev(&b, 1
+			, j->piece, j->d.io.offset, j->flags, a);
+
+		DLOG(stderr, "prepending aios (%p) from write_async_impl to m_to_issue (%p)\n"
+			, aios, m_to_issue);
+
+		if (a->references == 0)
+		{
+			// this is a special case for when the storage doesn't want to produce
+			// any actual async. file operations, but just filled in the buffers
+			if (!a->error.ec) a->transferred = j->d.io.buffer_size;
+			a->handler(a);
+			m_aiocb_pool.free_handler(a);
+			a = 0;
+		}
+
+#ifdef TORRENT_DEBUG
+		// make sure we're not already requesting this same block
+		file::aiocb_t* i = aios;
+		while (i)
+		{
+			file::aiocb_t* found = find_aiocb(m_to_issue, i);
+			TORRENT_ASSERT(found == 0);
+			found = find_aiocb(m_in_progress, i);
+			TORRENT_ASSERT(found == 0);
+			i = i->next;
+		}
+#endif
+
+		int elevator_direction = 0;
+#if TORRENT_USE_SYNCIO
+		elevator_direction = m_settings.allow_reordered_disk_operations ? m_elevator_direction : 0;
+#endif
+		m_num_to_issue += append_aios(m_to_issue, m_to_issue_end, aios, elevator_direction, this);
+		if (m_num_to_issue > m_peak_num_to_issue) m_peak_num_to_issue = m_num_to_issue;
+		TORRENT_ASSERT(m_num_to_issue == count_aios(m_to_issue));
+
+//		for (file::aiocb_t* j = m_to_issue; j; j = j->next)
+//			DLOG(stderr, "  %"PRId64, j->phys_offset);
+//		DLOG(stderr, "\n");
+		return defer_handler;
+	}
+
+	int disk_io_thread::do_hash(disk_io_job* j)
+	{
+		INVARIANT_CHECK;
+
+		cached_piece_entry* pe = m_disk_cache.find_piece(j);
+
+		int ret = defer_handler;
+
+		bool job_added = false;
+		if (m_settings.disable_hash_checks)
+		{
+			DLOG(stderr, "[%p] do_hash: hash checking turned off, returning piece: %d\n"
+				, this, int(pe ? pe->piece : -1));
+			return 0;
+		}
+
+		int block_size = m_disk_cache.block_size();
+
+		int start_block = 0;
+		bool need_read = false;
+
+		// potentially allocate and issue read commands for blocks we don't have, but
+		// need in order to calculate the hash
+		if (pe == 0)
+		{
+			DLOG(stderr, "[%p] do_hash: allocating a new piece: %d\n"
+				, this, int(j->piece));
+
+			pe = m_disk_cache.allocate_piece(j, cached_piece_entry::read_lru1);
+			if (pe == 0)
+			{
+				TORRENT_ASSERT(j->buffer == 0);
+				j->error.ec = error::no_memory;
+				return disk_operation_failed;
+			}
+
+			// allocate_pending will add the job to the piece
+			ret = m_disk_cache.allocate_pending(pe, 0, pe->blocks_in_piece, j, 2);
+			DLOG(stderr, "[%p] do_hash: allocate_pending ret=%d\n", this, ret);
+			job_added = true;
+
+			if (ret >= 0)
+			{
+				// some blocks were allocated
+				if (ret > 0) need_read = true;
+				TORRENT_ASSERT(start_block == 0);
+				ret = defer_handler;
+			}
+			else if (ret == -1)
+			{
+				// allocation failed
+				m_disk_cache.mark_for_deletion(pe);
+				TORRENT_ASSERT(j->buffer == 0);
+				j->error.ec = error::no_memory;
+				return disk_operation_failed;
+			}
+			else if (ret < -1)
+			{
+				m_disk_cache.mark_for_deletion(pe);
+				// this shouldn't happen
+				TORRENT_ASSERT(false);
+			}
+			ret = defer_handler;
+		}
+		else
+		{
+			// issue read commands to read those blocks in
+			if (pe->hash)
+			{
+				if (pe->hashing != cached_piece_entry::not_hashing)
+					start_block = pe->hashing;
+				else start_block = (pe->hash->offset + block_size - 1) / block_size;
+			}
+
+			// find a (potential) range that we can start hashing, of blocks that we already have
+			// it's OK to start hashing blocks that are dirty and being written right now
+			// in fact, we want to do that to be able to serve them as soon as possible
+			int end = start_block;
+			while (end < pe->blocks_in_piece
+				&& pe->blocks[end].buf
+				&& (!pe->blocks[end].pending || pe->blocks[end].dirty)) ++end;
+
+			if (end > start_block && pe->hashing == cached_piece_entry::not_hashing)
+			{
+				// do we need the partial hash object?
+				if (pe->hash == 0)
+				{
+					DLOG(stderr, "[%p] do_hash: creating hash object piece: %d\n"
+						, this, int(pe->piece));
+					// TODO: maybe the partial_hash objects should be pool allocated
+					pe->hash = new partial_hash;
+					m_disk_cache.update_cache_state(pe);
+				}
+
+				m_hash_thread.async_hash(pe, start_block, end);
+			}
+
+			// deal with read-back. i.e. blocks that have already been flushed to disk
+			// and are no longer in the cache, we need to read those back in order to hash
+			// them
+			if (end < pe->blocks_in_piece)
+			{
+				ret = m_disk_cache.allocate_pending(pe, end, pe->blocks_in_piece, j, 2);
+				DLOG(stderr, "[%p] do_hash: allocate_pending() = %d piece: %d\n"
+					, this, ret, int(pe->piece));
+				if (ret >= 0)
+				{
+					// if allocate_pending succeeds, it adds the job as well
+					job_added = true;
+					// some blocks were allocated
+					if (ret > 0) need_read = true;
+					ret = defer_handler;
+				}
+				else if (ret == -1)
+				{
+					// allocation failed
+					m_disk_cache.mark_for_deletion(pe);
+					TORRENT_ASSERT(j->buffer == 0);
+					j->error.ec = error::no_memory;
+					return disk_operation_failed;
+				}
+				ret = defer_handler;
+			}
+			else if (pe->hashing == cached_piece_entry::not_hashing)
+			{
+				// we get here if the hashing is already complete
+				// in the pe->hash object. We just need to finalize
+				// it and compare to the actual hash
+				// This doesn't seem very likely to ever happen
+
+				TORRENT_ASSERT(pe->hash->offset == j->storage->files()->piece_size(pe->piece));
+				partial_hash& ph = *pe->hash;
+				memcpy(j->d.piece_hash, &ph.h.final()[0], 20);
+				ret = 0;
+				// return value:
+				// 0: success, piece passed hash check
+				// -1: disk failure
+				if (j->flags & disk_io_job::volatile_read)
+				{
+					pe->marked_for_deletion = true;
+					DLOG(stderr, "[%p] do_hash: volatile, mark piece for deletion. "
+						"ret: %d piece: %d\n", this, ret, int(pe->piece));
+				}
+				delete pe->hash;
+				pe->hash = 0;
+				m_disk_cache.update_cache_state(pe);
+				return ret;
+			}
+		}
+
+		// do we need the partial hash object?
+		if (pe->hash == 0)
+		{
+			DLOG(stderr, "[%p] do_hash: creating hash object piece: %d\n"
+				, this, int(pe->piece));
+			// TODO: maybe the partial_hash objects should be pool allocated
+			pe->hash = new partial_hash;
+			m_disk_cache.update_cache_state(pe);
+		}
+
+		// increase the refcount for all blocks the hash job needs in
+		// order to complete. These are decremented in block_cache::reap_piece_jobs
+		// for hash jobs
+		for (int i = start_block; i < pe->blocks_in_piece; ++i)
+		{
+			TORRENT_ASSERT(pe->blocks[i].buf);
+			if (pe->blocks[i].refcount == 0) m_disk_cache.pinned_change(1);
+			++pe->blocks[i].refcount;
+			++pe->refcount;
+			TORRENT_ASSERT(pe->blocks[i].refcount > 0); // make sure it didn't wrap
+			TORRENT_ASSERT(pe->refcount > 0); // make sure it didn't wrap
+#ifdef TORRENT_DEBUG
+			++pe->blocks[i].check_count;
+#endif
+		}
+		j->d.io.offset = start_block;
+
+		if (!job_added)
+		{
+			DLOG(stderr, "[%p] do_hash: adding job piece: %d\n"
+				, this, int(pe->piece));
+			TORRENT_ASSERT(j->piece == pe->piece);
+			pe->jobs.push_back(j);
+		}
+
+		if (need_read)
+		{
+			m_cache_stats.total_read_back += io_range(pe, start_block
+				, pe->blocks_in_piece, op_read, j->flags);
+		}
+#if DEBUG_STORAGE
+		DLOG(stderr, "[%p] do_hash: jobs [", this);
+		for (tailqueue_iterator i = pe->jobs.iterate(); i.get(); i.next())
+		{
+			DLOG(stderr, " %s", job_action_name[((disk_io_job*)i.get())->action]);
+		}
+		DLOG(stderr, " ]\n");
+#endif
+
+		return defer_handler;
+	}
+
+	int disk_io_thread::do_move_storage(disk_io_job* j)
+	{
+		// if files have to be closed, that's the storage's responsibility
+		j->storage->get_storage_impl()->move_storage(j->buffer, j->error);
+		return j->error ? disk_operation_failed : 0;
+	}
+
+	int disk_io_thread::do_release_files(disk_io_job* j)
+	{
+		INVARIANT_CHECK;
+
+		int ret = flush_cache(j, flush_write_cache);
+		if (ret == 0)
+		{
+			// this means there are no outstanding requests
+			// to this piece. We can go ahead and close the
+			// files immediately without interfering with
+			// any async operations
+			j->storage->get_storage_impl()->release_files(j->error);
+			return j->error ? disk_operation_failed : 0;
+		}
+
+		// this fence have to block both read and write operations and let read operations
+		// When blocks are reference counted, even read operation would force cache pieces to linger
+		// raise the fence to block new async. operations
+		j->flags |= disk_io_job::need_uncork;
+		DLOG(stderr, "[%p] raising fence ret: %d\n", this, ret);
+		j->storage->raise_fence(boost::bind(&disk_io_thread::perform_async_job, this, j));
+		return defer_handler;
+	}
+
+	int disk_io_thread::do_delete_files(disk_io_job* j)
+	{
+		TORRENT_ASSERT(j->buffer == 0);
+		INVARIANT_CHECK;
+
+		int ret = flush_cache(j, flush_delete_cache);
+		if (ret == 0)
+		{
+			// this means there are no outstanding requests
+			// to this piece. We can go ahead and delete the
+			// files immediately without interfering with
+			// any async operations
+			j->storage->get_storage_impl()->delete_files(j->error);
+			return j->error ? disk_operation_failed : 0;
+		}
+
+		// raise the fence to block new async. operations
+		j->flags |= disk_io_job::need_uncork;
+		DLOG(stderr, "[%p] raising fence ret: %d\n", this, ret);
+		j->storage->raise_fence(boost::bind(&disk_io_thread::perform_async_job, this, j));
+		return defer_handler;
+	}
+
+	int disk_io_thread::do_check_fastresume(disk_io_job* j)
+	{
+		lazy_entry const* rd = (lazy_entry const*)j->buffer;
+		TORRENT_ASSERT(rd != 0);
+
+		return j->storage->check_fastresume(*rd, j->error);
+	}
+
+	int disk_io_thread::do_save_resume_data(disk_io_job* j)
+	{
+		int ret = flush_cache(j, flush_write_cache);
+		if (ret == 0)
+		{
+			// this means there are no outstanding requests
+			// to this piece. We can go ahead and close the
+			// files immediately without interfering with
+			// any async operations
+			entry* resume_data = new entry(entry::dictionary_t);
+			j->storage->get_storage_impl()->write_resume_data(*resume_data, j->error);
+			TORRENT_ASSERT(j->buffer == 0);
+			j->buffer = (char*)resume_data;
+			return j->error ? disk_operation_failed : 0;
+		}
+
+//#error this fence would only have to block write operations and could let read operations through
+
+		// raise the fence to block new
+		j->flags |= disk_io_job::need_uncork;
+		DLOG(stderr, "[%p] raising fence\n", this);
+		j->storage->raise_fence(boost::bind(&disk_io_thread::perform_async_job, this, j));
+		return defer_handler;
+	}
+
+	int disk_io_thread::do_rename_file(disk_io_job* j)
+	{
+		// if files need to be closed, that's the storage's responsibility
+		j->storage->get_storage_impl()->rename_file(j->piece, j->buffer, j->error);
+		return j->error ? disk_operation_failed : 0;
+	}
+
+	int disk_io_thread::do_abort_thread(disk_io_job* j)
+	{
+		// issue write commands for all dirty blocks
+		// and clear all read jobs
+		flush_cache(j, flush_read_cache | flush_write_cache);
+		m_abort = true;
+
+		std::set<piece_manager*> fences;
+		std::vector<char*> to_free;
+		// we're aborting. Cancel all jobs that are blocked or
+		// have been deferred as well
+		disk_io_job* i = (disk_io_job*)m_blocked_jobs.get_all();
+		while (i)
+		{
+			disk_io_job* k = i;
+			i = (disk_io_job*)i->next;
+			k->next = 0;
+
+			if (k->buffer) to_free.push_back(k->buffer);
+			k->buffer = 0;
+			if (k->storage->has_fence()) fences.insert(k->storage.get());
+			k->error.ec = error::operation_aborted;
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+			TORRENT_ASSERT(k->callback_called == false);
+			k->callback_called = true;
+#endif
+			m_completed_jobs.push_back(k);
+			k = (disk_io_job*)k->next;
+		}
+		if (!to_free.empty()) m_disk_cache.free_multiple_buffers(&to_free[0], to_free.size());
+
+		// if there is a storage that has a fence up
+		// it's going to get left hanging here.
+		// lower all fences
+
+		for (std::set<piece_manager*>::iterator i = fences.begin()
+			, end(fences.end()); i != end; ++i)
+			(*i)->lower_fence();
+
+		return 0;
+	}
+
+	int disk_io_thread::do_clear_read_cache(disk_io_job* j)
+	{
+		flush_cache(j, flush_read_cache);
+		return 0;
+	}
+
+	int disk_io_thread::do_abort_torrent(disk_io_job* j)
+	{
+		// issue write commands for all dirty blocks
+		// and clear all read jobs
+		flush_cache(j, flush_read_cache | flush_write_cache);
+
+		std::vector<char*> to_free;
+		// we're aborting. Cancel all jobs that are blocked or
+		// have been deferred as well
+		disk_io_job* i = (disk_io_job*)m_blocked_jobs.get_all();
+		while (i)
+		{
+			disk_io_job* k = i;
+			i = (disk_io_job*)i->next;
+			k->next = 0;
+			if (k->storage != j->storage)
+			{
+				// not ours, put it back
+				m_blocked_jobs.push_back(postinc(k));
+				continue;
+			}
+
+			if ((k->action == disk_io_job::read || k->action == disk_io_job::write)
+				&& k->buffer)
+			{
+				to_free.push_back(k->buffer);
+				k->buffer = 0;
+			}
+
+			k->error.ec = error::operation_aborted;
+			TORRENT_ASSERT(k->callback);
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+			TORRENT_ASSERT(k->callback_called == false);
+			k->callback_called = true;
+#endif
+			m_completed_jobs.push_back(k);
+		}
+
+		if (!to_free.empty()) m_disk_cache.free_multiple_buffers(&to_free[0], to_free.size());
+
+		// the fence function will issue all blocked jobs, but we
+		// just cleared them all from m_blocked_jobs anyway
+		// lowering the fence will at least allow new jobs
+		if (j->storage->has_fence()) j->storage->lower_fence();
+
+		m_disk_cache.release_memory();
+
+		if (j->storage->num_pieces() == 0) return 0;
+
+		// there are some blocks left, we cannot post the completion
+		// for this job yet.
+
+		j->storage->set_abort_job(j);
+
+		return defer_handler;
+	}
+
+	int disk_io_thread::do_update_settings(disk_io_job* j)
+	{
+		TORRENT_ASSERT(j->buffer);
+		session_settings const& s = *((session_settings*)j->buffer);
+		TORRENT_ASSERT(s.cache_size >= 0);
+		TORRENT_ASSERT(s.cache_expiry > 0);
+		int block_size = m_disk_cache.block_size();
+
+#if defined TORRENT_WINDOWS
+		if (m_settings.low_prio_disk != s.low_prio_disk)
+		{
+			m_file_pool.set_low_prio_io(s.low_prio_disk);
+			// we need to close all files, since the prio
+			// only takes affect when files are opened
+			m_file_pool.release(0);
+		}
+#endif
+		if (m_settings.hashing_threads != s.hashing_threads)
+			m_hash_thread.set_num_threads(s.hashing_threads);
+
+#if TORRENT_USE_AIOINIT
+		if (m_settings.aio_threads != s.aio_threads
+			|| m_settings.aio_max != s.aio_max)
+		{
+			aioinit a;
+			memset(&a, 0, sizeof(a));
+			a.aio_threads = s.aio_threads;
+			a.aio_num = s.aio_max;
+			aio_init(&a);
+		}
+#endif
+
+#if TORRENT_USE_SYNCIO
+		if (m_settings.aio_threads != s.aio_threads)
+			m_worker_thread.set_num_threads(s.aio_threads);
+#endif
+
+		m_settings = s;
+		m_file_pool.resize(m_settings.file_pool_size);
+#if defined __APPLE__ && defined __MACH__ && MAC_OS_X_VERSION_MIN_REQUIRED >= 1050
+		setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD
+			, m_settings.low_prio_disk ? IOPOL_THROTTLE : IOPOL_DEFAULT);
+#elif defined IOPRIO_WHO_PROCESS
+		syscall(ioprio_set, IOPRIO_WHO_PROCESS, getpid());
+#endif
+		if (m_settings.cache_size == -1)
+		{
+			// the cache size is set to automatic. Make it
+			// depend on the amount of physical RAM
+			// if we don't know how much RAM we have, just set the
+			// cache size to 16 MiB (1024 blocks)
+			if (m_physical_ram == 0)
+				m_settings.cache_size = 1024;
+			else
+				m_settings.cache_size = m_physical_ram / 8 / block_size;
+		}
+		m_disk_cache.set_settings(m_settings);
+
+		// deduct the writing blocks from the cache size, otherwise we'll flush the
+		// entire cache as soon as we exceed the limit, since all flush operations are
+		// async.
+		int num_pending_write_blocks = (m_pending_buffer_size + block_size - 1) / block_size;
+		int current_size = m_disk_cache.in_use();
+		if (current_size - num_pending_write_blocks > m_settings.cache_size)
+			m_disk_cache.try_evict_blocks(current_size - m_settings.cache_size, 0);
+
+		return 0;
+	}
+
+	int disk_io_thread::do_cache_piece(disk_io_job* j)
+	{
+		INVARIANT_CHECK;
+		TORRENT_ASSERT(j->buffer == 0);
+
+		cached_piece_entry* pe = m_disk_cache.allocate_piece(j, cached_piece_entry::read_lru1);
+		if (pe == 0)
+		{
+			j->error.ec = errors::no_memory;
+			return disk_operation_failed;
+		}
+		int ret = m_disk_cache.allocate_pending(pe, 0, pe->blocks_in_piece, j);
+
+		if (ret >= 0)
+		{
+			if (ret > 0) io_range(pe, 0, INT_MAX, op_read, j->flags);
+			return defer_handler;
+		}
+		else if (ret == -1)
+		{
+			TORRENT_ASSERT(j->buffer == 0);
+			j->error.ec = error::no_memory;
+			return disk_operation_failed;
+		}
+		// the piece is already in the cache
+		return 0;
+	}
+
+	int disk_io_thread::do_finalize_file(disk_io_job* j)
+	{
+		j->storage->get_storage_impl()->finalize_file(j->piece, j->error);
+		return j->error ? disk_operation_failed : 0;
+	}
+
+	void disk_io_thread::get_disk_metrics(cache_status& ret) const
+	{
+		ret = m_cache_stats;
+
+		ret.total_used_buffers = m_disk_cache.in_use();
+#if TORRENT_USE_SYNCIO
+		ret.elevator_turns = m_elevator_turns;
+#else
+		ret.elevator_turns = 0;
+#endif
+		ret.queued_bytes = m_pending_buffer_size + m_queue_buffer_size;
+
+		ret.blocked_jobs = m_blocked_jobs.size();
+		ret.queued_jobs = m_num_to_issue;
+		ret.peak_queued = m_peak_num_to_issue;
+		ret.pending_jobs = m_outstanding_jobs;
+		ret.peak_pending = m_peak_outstanding;
+		ret.num_aiocb = m_aiocb_pool.in_use();
+		ret.peak_aiocb = m_aiocb_pool.peak_in_use();
+		ret.num_jobs = m_aiocb_pool.jobs_in_use();
+		ret.num_read_jobs = m_aiocb_pool.read_jobs_in_use();
+		ret.num_write_jobs = m_aiocb_pool.write_jobs_in_use();
+
+		m_disk_cache.get_stats(&ret);
+	}
+
+	void disk_io_thread::flip_stats()
 	{
 		// calling mean() will actually reset the accumulators
 		m_cache_stats.average_queue_time = m_queue_time.mean();
@@ -133,1317 +1945,382 @@ namespace libtorrent
 		m_cache_stats.average_hash_time = m_hash_time.mean();
 		m_cache_stats.average_job_time = m_job_time.mean();
 		m_cache_stats.average_sort_time = m_sort_time.mean();
-
-		m_last_stats_flip = now;
+		m_cache_stats.average_issue_time = m_issue_time.mean();
+		m_last_stats_flip = time_now();
 	}
 
-	void disk_io_thread::get_cache_info(sha1_hash const& ih, std::vector<cached_piece_info>& ret) const
+	void get_cache_info(cached_piece_info& info, cached_piece_entry const* i, int block_size)
 	{
-		mutex::scoped_lock l(m_piece_mutex);
-		ret.clear();
-		ret.reserve(m_pieces.size());
-		for (cache_t::const_iterator i = m_pieces.begin()
-			, end(m_pieces.end()); i != end; ++i)
-		{
-			torrent_info const& ti = *i->storage->info();
-			if (ti.info_hash() != ih) continue;
-			cached_piece_info info;
-			info.next_to_hash = i->next_block_to_hash;
-			info.piece = i->piece;
-			info.last_use = i->expire;
-			info.kind = cached_piece_info::write_cache;
-			int blocks_in_piece = (ti.piece_size(i->piece) + (m_block_size) - 1) / m_block_size;
-			info.blocks.resize(blocks_in_piece);
-			for (int b = 0; b < blocks_in_piece; ++b)
-				if (i->blocks[b].buf) info.blocks[b] = true;
-			ret.push_back(info);
-		}
-		for (cache_t::const_iterator i = m_read_pieces.begin()
-			, end(m_read_pieces.end()); i != end; ++i)
-		{
-			torrent_info const& ti = *i->storage->info();
-			if (ti.info_hash() != ih) continue;
-			cached_piece_info info;
-			info.next_to_hash = i->next_block_to_hash;
-			info.piece = i->piece;
-			info.last_use = i->expire;
-			info.kind = cached_piece_info::read_cache;
-			int blocks_in_piece = (ti.piece_size(i->piece) + (m_block_size) - 1) / m_block_size;
-			info.blocks.resize(blocks_in_piece);
-			for (int b = 0; b < blocks_in_piece; ++b)
-				if (i->blocks[b].buf) info.blocks[b] = true;
-			ret.push_back(info);
-		}
-	}
-	
-	cache_status disk_io_thread::status() const
-	{
-		mutex::scoped_lock l(m_piece_mutex);
-		m_cache_stats.total_used_buffers = in_use();
-		m_cache_stats.queued_bytes = m_queue_buffer_size;
-
-		cache_status ret = m_cache_stats;
-
-		ret.job_queue_length = m_jobs.size() + m_sorted_read_jobs.size();
-		ret.read_queue_size = m_sorted_read_jobs.size();
-
-		return ret;
+		info.piece = i->piece;
+		info.last_use = i->expire;
+		info.need_readback = i->need_readback;
+		info.next_to_hash = i->hash == 0 ? -1 : (i->hash->offset + block_size - 1) / block_size;
+		info.kind = i->num_dirty ? cached_piece_info::write_cache : cached_piece_info::read_cache;
+		int blocks_in_piece = i->blocks_in_piece;
+		info.blocks.resize(blocks_in_piece);
+		for (int b = 0; b < blocks_in_piece; ++b)
+			info.blocks[b] = i->blocks[b].buf != 0;
+		// count the number of jobs hanging off of this piece, keep
+		// separate counts per type of job
+		memset(info.num_jobs, 0, sizeof(info.num_jobs));
+		for (tailqueue_iterator iter = i->jobs.iterate(); iter.get(); iter.next())
+			++info.num_jobs[((disk_io_job*)iter.get())->action];
 	}
 
-	// aborts read operations
-	void disk_io_thread::stop(boost::intrusive_ptr<piece_manager> s)
+	int disk_io_thread::do_get_cache_info(disk_io_job* j)
 	{
-		mutex::scoped_lock l(m_queue_mutex);
-		// read jobs are aborted, write and move jobs are syncronized
-		for (std::deque<disk_io_job>::iterator i = m_jobs.begin();
-			i != m_jobs.end();)
+		cache_status* ret = (cache_status*)j->buffer;
+		get_disk_metrics(*ret);
+
+		if (j->flags & disk_io_job::no_pieces) return 0;
+
+		int block_size = m_disk_cache.block_size();
+
+		// TODO: this is potentially pretty expensive, allow cache info jobs to not ask for this full list
+		if (j->storage)
 		{
-			if (i->storage != s)
-			{
-				++i;
-				continue;
-			}
-			if (should_cancel_on_abort(*i))
-			{
-				if (i->action == disk_io_job::write)
-				{
-					TORRENT_ASSERT(m_queue_buffer_size >= i->buffer_size);
-					m_queue_buffer_size -= i->buffer_size;
-				}
-				post_callback(*i, -3);
-				i = m_jobs.erase(i);
-				continue;
-			}
-			++i;
-		}
-		disk_io_job j;
-		j.action = disk_io_job::abort_torrent;
-		j.storage = s;
-		add_job(j, l);
-	}
+			ret->pieces.resize(j->storage->num_pieces());
+			int counter = 0;
 
-	struct update_last_use
-	{
-		update_last_use(int exp): expire(exp) {}
-		void operator()(disk_io_thread::cached_piece_entry& p)
-		{
-			TORRENT_ASSERT(p.storage);
-			p.expire = time_now() + seconds(expire);
-		}
-		int expire;
-	};
-
-	disk_io_thread::cache_piece_index_t::iterator disk_io_thread::find_cached_piece(
-		disk_io_thread::cache_t& cache
-		, disk_io_job const& j, mutex::scoped_lock& l)
-	{
-		cache_piece_index_t& idx = cache.get<0>();
-		cache_piece_index_t::iterator i
-			= idx.find(std::pair<void*, int>(j.storage.get(), j.piece));
-		TORRENT_ASSERT(i == idx.end() || (i->storage == j.storage && i->piece == j.piece));
-		return i;
-	}
-	
-	void disk_io_thread::flush_expired_pieces()
-	{
-		ptime now = time_now();
-
-		mutex::scoped_lock l(m_piece_mutex);
-
-		INVARIANT_CHECK;
-		// flush write cache
-		cache_lru_index_t& widx = m_pieces.get<1>();
-		cache_lru_index_t::iterator i = widx.begin();
-		time_duration cut_off = seconds(m_settings.cache_expiry);
-		while (i != widx.end() && now - i->expire > cut_off)
-		{
-			TORRENT_ASSERT(i->storage);
-			flush_range(const_cast<cached_piece_entry&>(*i), 0, INT_MAX, l);
-			TORRENT_ASSERT(i->num_blocks == 0);
-
-			// we want to keep the piece in here to have an accurate
-			// number for next_block_to_hash, if we're in avoid_readback mode
-
-			bool erase = m_settings.disk_cache_algorithm != session_settings::avoid_readback;
-			if (!erase)
-			{
-				// however, if we've already hashed the whole piece, in-order
-				// there's no need to keep it around
-				int piece_size = i->storage->info()->piece_size(i->piece);
-				int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-				erase = i->next_block_to_hash == blocks_in_piece;
-			}
-
-			if (erase) widx.erase(i++);
-			else ++i;
-		}
-
-		if (m_settings.explicit_read_cache) return;
-
-		// flush read cache
-		std::vector<char*> bufs;
-		cache_lru_index_t& ridx = m_read_pieces.get<1>();
-		i = ridx.begin();
-		while (i != ridx.end() && now - i->expire > cut_off)
-		{
-			drain_piece_bufs(const_cast<cached_piece_entry&>(*i), bufs, l);
-			ridx.erase(i++);
-		}
-		if (!bufs.empty()) free_multiple_buffers(&bufs[0], bufs.size());
-	}
-
-	int disk_io_thread::drain_piece_bufs(cached_piece_entry& p, std::vector<char*>& buf
-		, mutex::scoped_lock& l)
-	{
-		int piece_size = p.storage->info()->piece_size(p.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-		int ret = 0;
-
-		for (int i = 0; i < blocks_in_piece; ++i)
-		{
-			if (p.blocks[i].buf == 0) continue;
-			buf.push_back(p.blocks[i].buf);
-			++ret;
-			p.blocks[i].buf = 0;
-			--p.num_blocks;
-			--m_cache_stats.cache_size;
-			--m_cache_stats.read_cache_size;
-		}
-		return ret;
-	}
-
-	// returns the number of blocks that were freed
-	int disk_io_thread::free_piece(cached_piece_entry& p, mutex::scoped_lock& l)
-	{
-		int piece_size = p.storage->info()->piece_size(p.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-		int ret = 0;
-
-		// build a vector of all the buffers we need to free
-		// and free them all in one go
-		std::vector<char*> buffers;
-		for (int i = 0; i < blocks_in_piece; ++i)
-		{
-			if (p.blocks[i].buf == 0) continue;
-			buffers.push_back(p.blocks[i].buf);
-			++ret;
-			p.blocks[i].buf = 0;
-			--p.num_blocks;
-			--m_cache_stats.cache_size;
-			--m_cache_stats.read_cache_size;
-		}
-		if (!buffers.empty()) free_multiple_buffers(&buffers[0], buffers.size());
-		return ret;
-	}
-
-	// returns the number of blocks that were freed
-	int disk_io_thread::clear_oldest_read_piece(
-		int num_blocks, int ignore, mutex::scoped_lock& l)
-	{
-		INVARIANT_CHECK;
-
-		cache_lru_index_t& idx = m_read_pieces.get<1>();
-		if (idx.empty()) return 0;
-
-		cache_lru_index_t::iterator i = idx.begin();
-		if (i->piece == ignore)
-		{
-			++i;
-			if (i == idx.end()) return 0;
-		}
-
-		// don't replace an entry that hasn't expired yet
-		if (time_now() < i->expire) return 0;
-		int blocks = 0;
-
-		// build a vector of all the buffers we need to free
-		// and free them all in one go
-		std::vector<char*> buffers;
-		if (num_blocks >= i->num_blocks)
-		{
-			blocks = drain_piece_bufs(const_cast<cached_piece_entry&>(*i), buffers, l);
+			for (boost::unordered_set<cached_piece_entry*>::iterator i
+				= j->storage->cached_pieces().begin(), end(j->storage->cached_pieces().end());
+				i != end; ++i, ++counter)
+				get_cache_info(ret->pieces[counter], *i, block_size);
 		}
 		else
 		{
-			// delete blocks from the start and from the end
-			// until num_blocks have been freed
-			int end = (i->storage->info()->piece_size(i->piece) + m_block_size - 1) / m_block_size - 1;
-			int start = 0;
+			ret->pieces.resize(m_disk_cache.num_pieces());
+			int counter = 0;
+			std::pair<block_cache::iterator, block_cache::iterator> range
+				= m_disk_cache.all_pieces();
 
-			while (num_blocks)
-			{
-				// if we have a volatile read cache, only clear
-				// from the end, since we're already clearing
-				// from the start as blocks are read
-				if (!m_settings.volatile_read_cache)
-				{
-					while (i->blocks[start].buf == 0 && start <= end) ++start;
-					if (start > end) break;
-					buffers.push_back(i->blocks[start].buf);
-					i->blocks[start].buf = 0;
-					++blocks;
-					--const_cast<cached_piece_entry&>(*i).num_blocks;
-					--m_cache_stats.cache_size;
-					--m_cache_stats.read_cache_size;
-					--num_blocks;
-					if (!num_blocks) break;
-				}
-
-				while (i->blocks[end].buf == 0 && start <= end) --end;
-				if (start > end) break;
-				buffers.push_back(i->blocks[end].buf);
-				i->blocks[end].buf = 0;
-				++blocks;
-				--const_cast<cached_piece_entry&>(*i).num_blocks;
-				--m_cache_stats.cache_size;
-				--m_cache_stats.read_cache_size;
-				--num_blocks;
-			}
+			for (block_cache::iterator i = range.first; i != range.second; ++i, ++counter)
+				get_cache_info(ret->pieces[counter], &*i, block_size);
 		}
-		if (i->num_blocks == 0) idx.erase(i);
-
-		if (!buffers.empty()) free_multiple_buffers(&buffers[0], buffers.size());
-		return blocks;
-	}
-
-	int contiguous_blocks(disk_io_thread::cached_piece_entry const& b)
-	{
-		int ret = 0;
-		int current = 0;
-		int blocks_in_piece = (b.storage->info()->piece_size(b.piece) + 16 * 1024 - 1) / (16 * 1024);
-		for (int i = 0; i < blocks_in_piece; ++i)
-		{
-			if (b.blocks[i].buf) ++current;
-			else
-			{
-				if (current > ret) ret = current;
-				current = 0;
-			}
-		}
-		if (current > ret) ret = current;
-		return ret;
-	}
-
-	int disk_io_thread::flush_contiguous_blocks(cached_piece_entry& p
-		, mutex::scoped_lock& l, int lower_limit, bool avoid_readback)
-	{
-		// first find the largest range of contiguous  blocks
-		int len = 0;
-		int current = 0;
-		int pos = 0;
-		int start = 0;
-		int blocks_in_piece = (p.storage->info()->piece_size(p.piece)
-			+ m_block_size - 1) / m_block_size;
-
-		if (avoid_readback)
-		{
-			start = p.next_block_to_hash;
-			for (int i = p.next_block_to_hash; i < blocks_in_piece; ++i)
-			{
-				if (p.blocks[i].buf) ++current;
-				else break;
-			}
-		}
-		else
-		{
-			for (int i = 0; i < blocks_in_piece; ++i)
-			{
-				if (p.blocks[i].buf) ++current;
-				else
-				{
-					if (current > len)
-					{
-						len = current;
-						pos = start;
-					}
-					current = 0;
-					start = i + 1;
-				}
-			}
-		}
-		if (current > len)
-		{
-			len = current;
-			pos = start;
-		}
-
-		if (len < lower_limit || len <= 0) return 0;
-		len = flush_range(p, pos, pos + len, l);
-		return len;
-	}
-
-	bool cmp_contiguous(disk_io_thread::cached_piece_entry const& lhs
-		, disk_io_thread::cached_piece_entry const& rhs)
-	{
-		return lhs.num_contiguous_blocks < rhs.num_contiguous_blocks;
-	}
-
-	// flushes 'blocks' blocks from the cache
-	int disk_io_thread::flush_cache_blocks(mutex::scoped_lock& l
-		, int blocks, int ignore, int options)
-	{
-		// first look if there are any read cache entries that can
-		// be cleared
-		int ret = 0;
-		int tmp = 0;
-		do {
-			tmp = clear_oldest_read_piece(blocks, ignore, l);
-			blocks -= tmp;
-			ret += tmp;
-		} while (tmp > 0 && blocks > 0);
-
-		if (blocks == 0) return ret;
-
-		if (options & dont_flush_write_blocks) return ret;
-
-		// if we don't have any blocks in the cache, no need to go look for any
-		if (m_cache_stats.cache_size == 0) return ret;
-
-		if (m_settings.disk_cache_algorithm == session_settings::lru)
-		{
-			cache_lru_index_t& idx = m_pieces.get<1>();
-			while (blocks > 0)
-			{
-				cache_lru_index_t::iterator i = idx.begin();
-				if (i == idx.end()) return ret;
-				tmp = flush_range(const_cast<cached_piece_entry&>(*i), 0, INT_MAX, l);
-				idx.erase(i);
-				blocks -= tmp;
-				ret += tmp;
-			}
-		}
-		else if (m_settings.disk_cache_algorithm == session_settings::largest_contiguous)
-		{
-			cache_lru_index_t& idx = m_pieces.get<1>();
-			while (blocks > 0)
-			{
-				cache_lru_index_t::iterator i = std::max_element(idx.begin(), idx.end(), &cmp_contiguous);
-				if (i == idx.end()) return ret;
-				tmp = flush_contiguous_blocks(const_cast<cached_piece_entry&>(*i), l);
-				if (i->num_blocks == 0) idx.erase(i);
-				blocks -= tmp;
-				ret += tmp;
-			}
-		}
-		else if (m_settings.disk_cache_algorithm == session_settings::avoid_readback)
-		{
-			cache_lru_index_t& idx = m_pieces.get<1>();
-			for (cache_lru_index_t::iterator i = idx.begin(); i != idx.end();)
-			{
-				cached_piece_entry& p = const_cast<cached_piece_entry&>(*i);
-				cache_lru_index_t::iterator piece = i;
-				++i;
-
-				if (!piece->blocks[p.next_block_to_hash].buf) continue;
-				int piece_size = p.storage->info()->piece_size(p.piece);
-				int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-				int start = p.next_block_to_hash;
-				int end = start + 1;
-				while (end < blocks_in_piece && p.blocks[end].buf) ++end;
-				tmp = flush_range(p, start, end, l);
-				p.num_contiguous_blocks = contiguous_blocks(p);
-				if (p.num_blocks == 0 && p.next_block_to_hash == blocks_in_piece)
-					idx.erase(piece);
-				blocks -= tmp;
-				ret += tmp;
-				if (blocks <= 0) break;
-			}
-
-			// if we still need to flush blocks, flush the largest contiguous blocks
-			// regardless of if we'll have to read them back later
-			while (blocks > 0)
-			{
-				cache_lru_index_t::iterator i = std::max_element(idx.begin(), idx.end(), &cmp_contiguous);
-				if (i == idx.end() || i->num_blocks == 0) return ret;
-				tmp = flush_contiguous_blocks(const_cast<cached_piece_entry&>(*i), l);
-				// at this point, we will for sure need a read-back for
-				// this piece anyway. We might as well save some time looping
-				// over the disk cache by deleting the entry
-				if (i->num_blocks == 0) idx.erase(i);
-				blocks -= tmp;
-				ret += tmp;
-			}
-		}
-		return ret;
-	}
-
-	int disk_io_thread::flush_range(cached_piece_entry& p
-		, int start, int end, mutex::scoped_lock& l)
-	{
-		INVARIANT_CHECK;
-
-		TORRENT_ASSERT(start < end);
-
-		int piece_size = p.storage->info()->piece_size(p.piece);
-#ifdef TORRENT_DISK_STATS
-		m_log << log_time() << " flushing " << piece_size << std::endl;
-#endif
-		TORRENT_ASSERT(piece_size > 0);
-		
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-		int buffer_size = 0;
-		int offset = 0;
-
-		boost::scoped_array<char> buf;
-		file::iovec_t* iov = 0;
-		int iov_counter = 0;
-		if (m_settings.coalesce_writes) buf.reset(new (std::nothrow) char[piece_size]);
-		else iov = TORRENT_ALLOCA(file::iovec_t, blocks_in_piece);
-
-		end = (std::min)(end, blocks_in_piece);
-		int num_write_calls = 0;
-		ptime write_start = time_now_hires();
-		for (int i = start; i <= end; ++i)
-		{
-			if (i == end || p.blocks[i].buf == 0)
-			{
-				if (buffer_size == 0) continue;
-			
-				TORRENT_ASSERT(buffer_size <= i * m_block_size);
-				l.unlock();
-				if (iov)
-				{
-					int ret = p.storage->write_impl(iov, p.piece, (std::min)(
-						i * m_block_size, piece_size) - buffer_size, iov_counter);
-					iov_counter = 0;
-					if (ret > 0) ++num_write_calls;
-				}
-				else
-				{
-					TORRENT_ASSERT(buf);
-					file::iovec_t b = { buf.get(), buffer_size };
-					int ret = p.storage->write_impl(&b, p.piece, (std::min)(
-						i * m_block_size, piece_size) - buffer_size, 1);
-					if (ret > 0) ++num_write_calls;
-				}
-				l.lock();
-				++m_cache_stats.writes;
-//				std::cerr << " flushing p: " << p.piece << " bytes: " << buffer_size << std::endl;
-				buffer_size = 0;
-				offset = 0;
-				continue;
-			}
-			int block_size = (std::min)(piece_size - i * m_block_size, m_block_size);
-			TORRENT_ASSERT(offset + block_size <= piece_size);
-			TORRENT_ASSERT(offset + block_size > 0);
-			if (iov)
-			{
-				TORRENT_ASSERT(!buf);
-				iov[iov_counter].iov_base = p.blocks[i].buf;
-				iov[iov_counter].iov_len = block_size;
-				++iov_counter;
-			}
-			else
-			{
-				TORRENT_ASSERT(buf);
-				TORRENT_ASSERT(iov == 0);
-				std::memcpy(buf.get() + offset, p.blocks[i].buf, block_size);
-				offset += m_block_size;
-			}
-			buffer_size += block_size;
-			TORRENT_ASSERT(p.num_blocks > 0);
-			--p.num_blocks;
-			++m_cache_stats.blocks_written;
-			--m_cache_stats.cache_size;
-			if (i == p.next_block_to_hash) ++p.next_block_to_hash;
-		}
-
-		ptime done = time_now_hires();
-
-		int ret = 0;
-		disk_io_job j;
-		j.storage = p.storage;
-		j.action = disk_io_job::write;
-		j.buffer = 0;
-		j.piece = p.piece;
-		test_error(j);
-		std::vector<char*> buffers;
-		for (int i = start; i < end; ++i)
-		{
-			if (p.blocks[i].buf == 0) continue;
-			j.buffer_size = (std::min)(piece_size - i * m_block_size, m_block_size);
-			int result = j.error ? -1 : j.buffer_size;
-			j.offset = i * m_block_size;
-			j.callback = p.blocks[i].callback;
-			buffers.push_back(p.blocks[i].buf);
-			post_callback(j, result);
-			p.blocks[i].callback.clear();
-			p.blocks[i].buf = 0;
-			++ret;
-		}
-		if (!buffers.empty()) free_multiple_buffers(&buffers[0], buffers.size());
-
-		if (num_write_calls > 0)
-		{
-			m_write_time.add_sample(total_microseconds(done - write_start) / num_write_calls);
-			m_cache_stats.cumulative_write_time += total_milliseconds(done - write_start);
-		}
-		if (ret > 0)
-			p.num_contiguous_blocks = contiguous_blocks(p);
-
-		TORRENT_ASSERT(buffer_size == 0);
-//		std::cerr << " flushing p: " << p.piece << " cached_blocks: " << m_cache_stats.cache_size << std::endl;
-#ifdef TORRENT_DEBUG
-		for (int i = start; i < end; ++i)
-			TORRENT_ASSERT(p.blocks[i].buf == 0);
-#endif
-		return ret;
-	}
-
-	// returns -1 on failure
-	int disk_io_thread::cache_block(disk_io_job& j
-		, boost::function<void(int,disk_io_job const&)>& handler
-		, int cache_expire
-		, mutex::scoped_lock& l)
-	{
-		INVARIANT_CHECK;
-		TORRENT_ASSERT(find_cached_piece(m_pieces, j, l) == m_pieces.end());
-		TORRENT_ASSERT((j.offset & (m_block_size-1)) == 0);
-		TORRENT_ASSERT(j.cache_min_time >= 0);
-		cached_piece_entry p;
-
-		int piece_size = j.storage->info()->piece_size(j.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-		// there's no point in caching the piece if
-		// there's only one block in it
-		if (blocks_in_piece <= 1) return -1;
-
-#ifdef TORRENT_DISK_STATS
-		rename_buffer(j.buffer, "write cache");
-#endif
-
-		p.piece = j.piece;
-		p.storage = j.storage;
-		p.expire = time_now() + seconds(j.cache_min_time);
-		p.num_blocks = 1;
-		p.num_contiguous_blocks = 1;
-		p.next_block_to_hash = 0;
-		p.blocks.reset(new (std::nothrow) cached_block_entry[blocks_in_piece]);
-		if (!p.blocks) return -1;
-		int block = j.offset / m_block_size;
-//		std::cerr << " adding cache entry for p: " << j.piece << " block: " << block << " cached_blocks: " << m_cache_stats.cache_size << std::endl;
-		p.blocks[block].buf = j.buffer;
-		p.blocks[block].callback.swap(handler);
-		++m_cache_stats.cache_size;
-		cache_lru_index_t& idx = m_pieces.get<1>();
-		TORRENT_ASSERT(p.storage);
-		idx.insert(p);
 		return 0;
 	}
 
-	// fills a piece with data from disk, returns the total number of bytes
-	// read or -1 if there was an error
-	int disk_io_thread::read_into_piece(cached_piece_entry& p, int start_block
-		, int options, int num_blocks, mutex::scoped_lock& l)
+	int disk_io_thread::do_hashing_done(disk_io_job* j)
 	{
-		TORRENT_ASSERT(num_blocks > 0);
-		int piece_size = p.storage->info()->piece_size(p.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
+		m_hash_thread.hash_job_done();
+		m_disk_cache.hashing_done((cached_piece_entry*)j->buffer
+			, j->piece, j->d.io.offset, m_completed_jobs);
+		return 0;
+	}
 
-		int end_block = start_block;
-		int num_read = 0;
+	int disk_io_thread::do_file_status(disk_io_job* j)
+	{
+		std::vector<pool_file_status>* files = (std::vector<pool_file_status>*)j->buffer;
+		m_file_pool.get_status(files, (void*)j->storage->get_storage_impl());
+		return 0;
+	}
 
-		int iov_counter = 0;
-		file::iovec_t* iov = TORRENT_ALLOCA(file::iovec_t, (std::min)(blocks_in_piece - start_block, num_blocks));
-
-		int piece_offset = start_block * m_block_size;
-
-		int ret = 0;
-
-		boost::scoped_array<char> buf;
-		for (int i = start_block; i < blocks_in_piece
-			&& ((options & ignore_cache_size)
-				|| in_use() < m_settings.cache_size); ++i)
+	int disk_io_thread::do_reclaim_block(disk_io_job* j)
+	{
+		TORRENT_ASSERT(j->d.io.ref.storage);
+		if (j->d.io.ref.block < 0)
 		{
-			int block_size = (std::min)(piece_size - piece_offset, m_block_size);
-			TORRENT_ASSERT(piece_offset <= piece_size);
-
-			// this is a block that is already allocated
-			// free it and allocate a new one
-			if (p.blocks[i].buf)
-			{
-				free_buffer(p.blocks[i].buf);
-				--p.num_blocks;
-				--m_cache_stats.cache_size;
-				--m_cache_stats.read_cache_size;
-			}
-			p.blocks[i].buf = allocate_buffer("read cache");
-
-			// the allocation failed, break
-			if (p.blocks[i].buf == 0)
-			{
-				free_piece(p, l);
-				return -1;
-			}
-			++p.num_blocks;
-			++m_cache_stats.cache_size;
-			++m_cache_stats.read_cache_size;
-			++end_block;
-			++num_read;
-			iov[iov_counter].iov_base = p.blocks[i].buf;
-			iov[iov_counter].iov_len = block_size;
-			++iov_counter;
-			piece_offset += m_block_size;
-			if (num_read >= num_blocks) break;
+			TORRENT_ASSERT(false);
+			return 0;
 		}
 
-		if (end_block == start_block)
+		m_disk_cache.reclaim_block(j->d.io.ref, m_completed_jobs);
+		return 0;
+	}
+
+	int disk_io_thread::do_clear_piece(disk_io_job* j)
+	{
+		cached_piece_entry* pe = m_disk_cache.find_piece(j);
+		if (pe == 0) return 0;
+
+		// cancel all jobs (at least the ones that haven't
+		// started yet).
+		storage_error e;
+		e.ec = error_code(boost::system::errc::operation_canceled, get_system_category());
+
+		disk_io_job* k = (disk_io_job*)pe->jobs.get_all();
+		while (k)
 		{
-			// something failed. Free all buffers
-			// we just allocated
-			free_piece(p, l);
-			return -2;
+			disk_io_job* j = k;
+			k = (disk_io_job*)k->next;
+			j->next = 0;
+
+			if (j->action != disk_io_job::write)
+			{
+				pe->jobs.push_back(j);
+				continue;
+			}
+
+			int job_start = j->d.io.offset / m_disk_cache.block_size();
+			int job_last = (j->d.io.offset + j->d.io.buffer_size - 1) / m_disk_cache.block_size();
+			if (pe->blocks[job_start].pending
+				|| pe->blocks[job_last].pending)
+			{
+				pe->jobs.push_back(j);
+				continue;
+			}
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+			TORRENT_ASSERT(j->callback_called == false);
+			j->callback_called = true;
+#endif
+			j->error = e;
+			m_completed_jobs.push_back(j);
 		}
 
-		TORRENT_ASSERT(iov_counter <= (std::min)(blocks_in_piece - start_block, num_blocks));
+		m_disk_cache.evict_piece(pe);
+		return 0;
+	}
 
-		// the buffer_size is the size of the buffer we need to read
-		// all these blocks.
-		const int buffer_size = (std::min)((end_block - start_block) * m_block_size
-			, piece_size - start_block * m_block_size);
-		TORRENT_ASSERT(buffer_size > 0);
-		TORRENT_ASSERT(buffer_size <= piece_size);
-		TORRENT_ASSERT(buffer_size + start_block * m_block_size <= piece_size);
+	// if the piece doesn't have any outstanding operations
+	// queued on it, complete immediately and return true.
+	// if it has outstanding operations, add the job to it
+	// and return false. The job will be completed when the
+	// piece no longer have any outstanding operations
+	int disk_io_thread::do_sync_piece(disk_io_job* j)
+	{
+		cached_piece_entry* pe = m_disk_cache.find_piece(j);
+		if (pe == 0) return 0;
+		if (pe->refcount == 0) return 0;
+		pe->jobs.push_back(j);
+		return defer_handler;
+	}
 
-		if (m_settings.coalesce_reads)
-			buf.reset(new (std::nothrow) char[buffer_size]);
+	int disk_io_thread::do_flush_piece(disk_io_job* j)
+	{
+		cached_piece_entry* pe = m_disk_cache.find_piece(j);
 
-		if (buf)
+		// flush the write jobs for this piece
+		if (pe != 0 && pe->num_dirty > 0)
 		{
-			l.unlock();
-			file::iovec_t b = { buf.get(), buffer_size };
-			ret = p.storage->read_impl(&b, p.piece, start_block * m_block_size, 1);
-			l.lock();
-			++m_cache_stats.reads;
-			if (p.storage->error())
-			{
-				free_piece(p, l);
-				return -1;
-			}
+			DLOG(stderr, "[%p] do_flush_piece: flushing %d dirty blocks piece: %d\n"
+				, this, int(pe->num_dirty), int(pe->piece));
+			// issue write commands
+			io_range(pe, 0, INT_MAX, op_write, j->flags);
+		}
+		return 0;
+	}
 
-			if (ret != buffer_size)
-			{
-				// this means the file wasn't big enough for this read
-				p.storage->get_storage_impl()->set_error(""
-					, errors::file_too_short);
-				free_piece(p, l);
-				return -1;
-			}
-		
-			int offset = 0;
-			for (int i = 0; i < iov_counter; ++i)
-			{
-				TORRENT_ASSERT(iov[i].iov_base);
-				TORRENT_ASSERT(iov[i].iov_len > 0);
-				TORRENT_ASSERT(int(offset + iov[i].iov_len) <= buffer_size);
-				std::memcpy(iov[i].iov_base, buf.get() + offset, iov[i].iov_len);
-				offset += iov[i].iov_len;
-			}
+	int disk_io_thread::do_trim_cache(disk_io_job* j)
+	{
+		// no need to do anything in here, since perform_async_job() always
+		// trims the cache
+		return 0;
+	}
+
+	int disk_io_thread::do_aiocb_complete(disk_io_job* j)
+	{
+		file::aiocb_t* aios = (file::aiocb_t*)j->buffer;
+		aios->handler->done(j->error, j->ret, aios, &m_aiocb_pool);
+		return 0;
+	}
+
+	void disk_io_thread::on_write_one_buffer(async_handler* handler, disk_io_job* j)
+	{
+		int ret = j->d.io.buffer_size;
+		TORRENT_ASSERT(handler->error.ec || handler->transferred == j->d.io.buffer_size);
+
+		TORRENT_ASSERT(m_pending_buffer_size >= j->d.io.buffer_size);
+		m_pending_buffer_size -= j->d.io.buffer_size;
+
+		m_disk_cache.free_buffer(j->buffer);
+		j->buffer = 0;
+
+		DLOG(stderr, "[%p] on_write_one_buffer piece=%d offset=%d error=%s\n"
+			, this, j->piece, j->d.io.offset, handler->error.ec.message().c_str());
+		if (handler->error.ec)
+		{
+			j->error = handler->error;
+			ret = -1;
 		}
 		else
 		{
-			l.unlock();
-			ret = p.storage->read_impl(iov, p.piece, start_block * m_block_size, iov_counter);
-			l.lock();
-			++m_cache_stats.reads;
-			if (p.storage->error())
-			{
-				free_piece(p, l);
-				return -1;
-			}
-
-			if (ret != buffer_size)
-			{
-				// this means the file wasn't big enough for this read
-				p.storage->get_storage_impl()->set_error(""
-					, errors::file_too_short);
-				free_piece(p, l);
-				return -1;
-			}
+			boost::uint32_t write_time = total_microseconds(time_now_hires() - handler->started);
+			m_write_time.add_sample(write_time);
+			m_job_time.add_sample(write_time);
+			m_cache_stats.cumulative_write_time += write_time;
+			m_cache_stats.cumulative_job_time += write_time;
 		}
 
-		TORRENT_ASSERT(ret == buffer_size);
-		return ret;
+		++m_cache_stats.blocks_written;
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		TORRENT_ASSERT(j->callback_called == false);
+		j->callback_called = true;
+#endif
+		m_completed_jobs.push_back(j);
 	}
 
-	// returns -1 on read error, -2 if there isn't any space in the cache
-	// or the number of bytes read
-	int disk_io_thread::cache_read_block(disk_io_job const& j, mutex::scoped_lock& l)
+	void disk_io_thread::on_read_one_buffer(async_handler* handler, disk_io_job* j)
 	{
-		INVARIANT_CHECK;
+		TORRENT_ASSERT(m_outstanding_jobs > 0);
+		--m_outstanding_jobs;
+		DLOG(stderr, "[%p] on_read_one_buffer piece=%d offset=%d error=%s\n"
+			, this, j->piece, j->d.io.offset, handler->error.ec.message().c_str());
+		int ret = j->d.io.buffer_size;
+		j->error = handler->error;
+		if (!j->error && handler->transferred != j->d.io.buffer_size)
+			j->error.ec = errors::file_too_short;
 
-		TORRENT_ASSERT(j.cache_min_time >= 0);
-
-		// this function will create a new cached_piece_entry
-		// and requires that it doesn't already exist
-		cache_piece_index_t& idx = m_read_pieces.get<0>();
-		TORRENT_ASSERT(find_cached_piece(m_read_pieces, j, l) == idx.end());
-
-		int piece_size = j.storage->info()->piece_size(j.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-
-		int start_block = j.offset / m_block_size;
-
-		int blocks_to_read = blocks_in_piece - start_block;
-		blocks_to_read = (std::min)(blocks_to_read, (std::max)((m_settings.cache_size
-			+ m_cache_stats.read_cache_size - in_use())/2, 3));
-		blocks_to_read = (std::min)(blocks_to_read, m_settings.read_cache_line_size);
-		if (j.max_cache_line > 0) blocks_to_read = (std::min)(blocks_to_read, j.max_cache_line);
-
-		if (in_use() + blocks_to_read > m_settings.cache_size)
+		if (j->error)
 		{
-			int clear = in_use() + blocks_to_read - m_settings.cache_size;
-			if (flush_cache_blocks(l, clear, j.piece, dont_flush_write_blocks) < clear)
-				return -2;
-		}
-
-		cached_piece_entry p;
-		p.piece = j.piece;
-		p.storage = j.storage;
-		p.expire = time_now() + seconds(j.cache_min_time);
-		p.num_blocks = 0;
-		p.num_contiguous_blocks = 0;
-		p.next_block_to_hash = 0;
-		p.blocks.reset(new (std::nothrow) cached_block_entry[blocks_in_piece]);
-		if (!p.blocks) return -1;
-
-		int ret = read_into_piece(p, start_block, 0, blocks_to_read, l);
-
-		TORRENT_ASSERT(p.storage);
-		if (ret >= 0) idx.insert(p);
-
-		return ret;
-	}
-
-#ifdef TORRENT_DEBUG
-	void disk_io_thread::check_invariant() const
-	{
-		int cached_write_blocks = 0;
-		cache_piece_index_t const& idx = m_pieces.get<0>();
-		for (cache_piece_index_t::const_iterator i = idx.begin()
-			, end(idx.end()); i != end; ++i)
-		{
-			cached_piece_entry const& p = *i;
-			TORRENT_ASSERT(p.blocks);
-//			TORRENT_ASSERT(p.num_contiguous_blocks == contiguous_blocks(p));
-			
-			TORRENT_ASSERT(p.storage);
-			int piece_size = p.storage->info()->piece_size(p.piece);
-			int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-			int blocks = 0;
-			for (int k = 0; k < blocks_in_piece; ++k)
-			{
-				if (p.blocks[k].buf)
-				{
-#if !defined TORRENT_DISABLE_POOL_ALLOCATOR && defined TORRENT_EXPENSIVE_INVARIANT_CHECKS
-					TORRENT_ASSERT(is_disk_buffer(p.blocks[k].buf));
-#endif
-					++blocks;
-				}
-			}
-//			TORRENT_ASSERT(blocks == p.num_blocks);
-			cached_write_blocks += blocks;
-		}
-	
-		int cached_read_blocks = 0;
-		for (cache_t::const_iterator i = m_read_pieces.begin()
-			, end(m_read_pieces.end()); i != end; ++i)
-		{
-			cached_piece_entry const& p = *i;
-			TORRENT_ASSERT(p.blocks);
-			
-			int piece_size = p.storage->info()->piece_size(p.piece);
-			int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-			int blocks = 0;
-			for (int k = 0; k < blocks_in_piece; ++k)
-			{
-				if (p.blocks[k].buf)
-				{
-#if !defined TORRENT_DISABLE_POOL_ALLOCATOR && defined TORRENT_EXPENSIVE_INVARIANT_CHECKS
-					TORRENT_ASSERT(is_disk_buffer(p.blocks[k].buf));
-#endif
-					++blocks;
-				}
-			}
-//			TORRENT_ASSERT(blocks == p.num_blocks);
-			cached_read_blocks += blocks;
-		}
-
-		TORRENT_ASSERT(cached_read_blocks == m_cache_stats.read_cache_size);
-		TORRENT_ASSERT(cached_read_blocks + cached_write_blocks == m_cache_stats.cache_size);
-
-#ifdef TORRENT_DISK_STATS
-		int read_allocs = m_categories.find(std::string("read cache"))->second;
-		int write_allocs = m_categories.find(std::string("write cache"))->second;
-		TORRENT_ASSERT(cached_read_blocks == read_allocs);
-		TORRENT_ASSERT(cached_write_blocks == write_allocs);
-#endif
-
-		// when writing, there may be a one block difference, right before an old piece
-		// is flushed
-		TORRENT_ASSERT(m_cache_stats.cache_size <= m_settings.cache_size + 1);
-	}
-#endif
-
-	// reads the full piece specified by j into the read cache
-	// returns the iterator to it and whether or not it already
-	// was in the cache (hit).
-	int disk_io_thread::cache_piece(disk_io_job const& j, cache_piece_index_t::iterator& p
-		, bool& hit, int options, mutex::scoped_lock& l)
-	{
-		INVARIANT_CHECK;
-
-		TORRENT_ASSERT(j.cache_min_time >= 0);
-
-		cache_piece_index_t& idx = m_read_pieces.get<0>();
-		p = find_cached_piece(m_read_pieces, j, l);
-
-		hit = true;
-		int ret = 0;
-
-		int piece_size = j.storage->info()->piece_size(j.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-
-		if (p != m_read_pieces.end() && p->num_blocks != blocks_in_piece)
-		{
-			INVARIANT_CHECK;
-			// we have the piece in the cache, but not all of the blocks
-			ret = read_into_piece(const_cast<cached_piece_entry&>(*p), 0
-				, options, blocks_in_piece, l);
-			hit = false;
-			if (ret < 0) return ret;
-			idx.modify(p, update_last_use(j.cache_min_time));
-		}
-		else if (p == m_read_pieces.end())
-		{
-			INVARIANT_CHECK;
-			// if the piece cannot be found in the cache,
-			// read the whole piece starting at the block
-			// we got a request for.
-
-			cached_piece_entry pe;
-			pe.piece = j.piece;
-			pe.storage = j.storage;
-			pe.expire = time_now() + seconds(j.cache_min_time);
-			pe.num_blocks = 0;
-			pe.num_contiguous_blocks = 0;
-			pe.next_block_to_hash = 0;
-			pe.blocks.reset(new (std::nothrow) cached_block_entry[blocks_in_piece]);
-			if (!pe.blocks) return -1;
-			ret = read_into_piece(pe, 0, options, INT_MAX, l);
-
-			hit = false;
-			if (ret < 0) return ret;
-			TORRENT_ASSERT(pe.storage);
-			p = idx.insert(pe).first;
+			TORRENT_ASSERT(j->buffer == 0);
+			ret = -1;
 		}
 		else
 		{
-			idx.modify(p, update_last_use(j.cache_min_time));
-		}
-		TORRENT_ASSERT(!m_read_pieces.empty());
-		TORRENT_ASSERT(p->piece == j.piece);
-		TORRENT_ASSERT(p->storage == j.storage);
-		return ret;
-	}
-
-	// cache the entire piece and hash it
-	int disk_io_thread::read_piece_from_cache_and_hash(disk_io_job const& j, sha1_hash& h)
-	{
-		TORRENT_ASSERT(j.buffer);
-
-		TORRENT_ASSERT(j.cache_min_time >= 0);
-
-		mutex::scoped_lock l(m_piece_mutex);
-
-		int piece_size = j.storage->info()->piece_size(j.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-
-		if (in_use() + blocks_in_piece >= m_settings.cache_size)
-		{
-			flush_cache_blocks(l, in_use() - m_settings.cache_size + blocks_in_piece);
-		}
-	
-		cache_piece_index_t::iterator p;
-		bool hit;
-		int ret = cache_piece(j, p, hit, ignore_cache_size, l);
-		if (ret < 0) return ret;
-
-		if (!m_settings.disable_hash_checks)
-		{
-			hasher ctx;
-
-			for (int i = 0; i < blocks_in_piece; ++i)
-			{
-				TORRENT_ASSERT(p->blocks[i].buf);
-				ctx.update((char const*)p->blocks[i].buf, (std::min)(piece_size, m_block_size));
-				piece_size -= m_block_size;
-			}
-			h = ctx.final();
+			boost::uint32_t read_time = total_microseconds(time_now_hires() - handler->started);
+			m_read_time.add_sample(read_time);
+			m_job_time.add_sample(read_time);
+			m_cache_stats.cumulative_read_time += read_time;
+			m_cache_stats.cumulative_job_time += read_time;
 		}
 
-		ret = copy_from_piece(const_cast<cached_piece_entry&>(*p), hit, j, l);
-		TORRENT_ASSERT(ret > 0);
-		if (ret < 0) return ret;
-		cache_piece_index_t& idx = m_read_pieces.get<0>();
-		if (p->num_blocks == 0) idx.erase(p);
-		else idx.modify(p, update_last_use(j.cache_min_time));
+		file::iovec_t vec;
+		vec.iov_base = (file::iovec_base_t)j->buffer;
+		vec.iov_len = j->d.io.buffer_size;
 
-		// if read cache is disabled or we exceeded the
-		// limit, remove this piece from the cache
-		// also, if the piece wasn't in the cache when
-		// the function was called, and we're using an
-		// explicit read cache, remove it again
-		if (in_use() >= m_settings.cache_size
-			|| !m_settings.use_read_cache
-			|| (m_settings.explicit_read_cache && !hit))
-		{
-			TORRENT_ASSERT(!m_read_pieces.empty());
-			TORRENT_ASSERT(p->piece == j.piece);
-			TORRENT_ASSERT(p->storage == j.storage);
-			if (p != m_read_pieces.end())
-			{
-				free_piece(const_cast<cached_piece_entry&>(*p), l);
-				m_read_pieces.erase(p);
-			}
-		}
+		j->storage->get_storage_impl()->readv_done(&vec, 1, j->piece, j->d.io.offset);
 
-		ret = j.buffer_size;
 		++m_cache_stats.blocks_read;
-		if (hit) ++m_cache_stats.blocks_read_hit;
-		return ret;
-	}
 
-	// this doesn't modify the read cache, it only
-	// checks to see if the given read request can
-	// be fully satisfied from the given cached piece
-	// this is similar to copy_from_piece() but it
-	// doesn't do anything but determining if it's a
-	// cache hit or not
-	bool disk_io_thread::is_cache_hit(cached_piece_entry& p
-		, disk_io_job const& j, mutex::scoped_lock& l)
-	{
-		int block = j.offset / m_block_size;
-		int block_offset = j.offset & (m_block_size-1);
-		int size = j.buffer_size;
-		int min_blocks_to_read = block_offset > 0 && (size > m_block_size - block_offset) ? 2 : 1;
-		TORRENT_ASSERT(size <= m_block_size);
-		int start_block = block;
-		// if we have to read more than one block, and
-		// the first block is there, make sure we test
-		// for the second block
-		if (p.blocks[start_block].buf != 0 && min_blocks_to_read > 1)
-			++start_block;
+		// the only way the buffer is freed is by a callback
+		TORRENT_ASSERT(j->callback);
 
-#ifdef TORRENT_DEBUG	
-		int piece_size = j.storage->info()->piece_size(j.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-		TORRENT_ASSERT(start_block < blocks_in_piece);
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		TORRENT_ASSERT(j->callback_called == false);
+		j->callback_called = true;
 #endif
-
-		return p.blocks[start_block].buf != 0;
+		m_completed_jobs.push_back(j);
 	}
 
-	int disk_io_thread::copy_from_piece(cached_piece_entry& p, bool& hit
-		, disk_io_job const& j, mutex::scoped_lock& l)
+	// This is sometimes called from an outside thread!
+	void disk_io_thread::add_job(disk_io_job* j, bool high_priority)
 	{
-		TORRENT_ASSERT(j.buffer);
+		j->start_time = time_now_hires();
 
-		// copy from the cache and update the last use timestamp
-		int block = j.offset / m_block_size;
-		int block_offset = j.offset & (m_block_size-1);
-		int buffer_offset = 0;
-		int size = j.buffer_size;
-		int min_blocks_to_read = block_offset > 0 && (size > m_block_size - block_offset) ? 2 : 1;
-		TORRENT_ASSERT(size <= m_block_size);
-		int start_block = block;
-		if (p.blocks[start_block].buf != 0 && min_blocks_to_read > 1)
-			++start_block;
+		mutex::scoped_lock l(m_job_mutex);
 
-		int piece_size = j.storage->info()->piece_size(j.piece);
-		int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-		TORRENT_ASSERT(start_block < blocks_in_piece);
+		TORRENT_ASSERT(!m_abort
+			|| j->action == disk_io_job::reclaim_block
+			|| j->action == disk_io_job::hash_complete);
 
-		// if block_offset > 0, we need to read two blocks, and then
-		// copy parts of both, because it's not aligned to the block
-		// boundaries
-		if (p.blocks[start_block].buf == 0)
-		{
-			// if we use an explicit read cache, pretend there's no
-			// space to force hitting disk without caching anything
-			if (m_settings.explicit_read_cache) return -2;
-
-			int end_block = start_block;
-			while (end_block < blocks_in_piece && p.blocks[end_block].buf == 0) ++end_block;
-
-			int blocks_to_read = end_block - block;
-			blocks_to_read = (std::min)(blocks_to_read, (std::max)((m_settings.cache_size
-				+ m_cache_stats.read_cache_size - in_use())/2, 3));
-			blocks_to_read = (std::min)(blocks_to_read, m_settings.read_cache_line_size);
-			blocks_to_read = (std::max)(blocks_to_read, min_blocks_to_read);
-			if (j.max_cache_line > 0) blocks_to_read = (std::min)(blocks_to_read, j.max_cache_line);
-			
-			// if we don't have enough space for the new piece, try flushing something else
-			if (in_use() + blocks_to_read > m_settings.cache_size)
-			{
-				int clear = in_use() + blocks_to_read - m_settings.cache_size;
-				if (flush_cache_blocks(l, clear, p.piece, dont_flush_write_blocks) < clear)
-					return -2;
-			}
-
-			int ret = read_into_piece(p, block, 0, blocks_to_read, l);
-			hit = false;
-			if (ret < 0) return ret;
-			if (ret < size + block_offset) return -2;
-			TORRENT_ASSERT(p.blocks[block].buf);
-		}
-
-		// build a vector of all the buffers we need to free
-		// and free them all in one go
-		std::vector<char*> buffers;
-		while (size > 0)
-		{
-			TORRENT_ASSERT(p.blocks[block].buf);
-			int to_copy = (std::min)(m_block_size
-					- block_offset, size);
-			std::memcpy(j.buffer + buffer_offset
-				, p.blocks[block].buf + block_offset
-				, to_copy);
-			size -= to_copy;
-			block_offset = 0;
-			buffer_offset += to_copy;
-			if (m_settings.volatile_read_cache)
-			{
-				// if volatile read cache is set, the assumption is
-				// that no other peer is likely to request the same
-				// piece. Therefore, for each request out of the cache
-				// we clear the block that was requested and any blocks
-				// the peer skipped
-				for (int i = block; i >= 0 && p.blocks[i].buf; --i)
-				{
-					buffers.push_back(p.blocks[i].buf);
-					p.blocks[i].buf = 0;
-					--p.num_blocks;
-					--m_cache_stats.cache_size;
-					--m_cache_stats.read_cache_size;
-				}
-			}
-			++block;
-		}
-		if (!buffers.empty()) free_multiple_buffers(&buffers[0], buffers.size());
-		return j.buffer_size;
-	}
-
-	int disk_io_thread::try_read_from_cache(disk_io_job const& j, bool& hit, int flags)
-	{
-		TORRENT_ASSERT(j.buffer);
-		TORRENT_ASSERT(j.cache_min_time >= 0);
-
-		mutex::scoped_lock l(m_piece_mutex);
-		if (!m_settings.use_read_cache) return -2;
-
-		cache_piece_index_t& idx = m_read_pieces.get<0>();
-		cache_piece_index_t::iterator p
-			= find_cached_piece(m_read_pieces, j, l);
-
-		hit = true;
-		int ret = 0;
-
-		// if the piece cannot be found in the cache,
-		// read the whole piece starting at the block
-		// we got a request for.
-		if (p == idx.end())
-		{
-			if (flags & cache_only) return -2;
-			// if we use an explicit read cache and we
-			// couldn't find the block in the cache,
-			// pretend that there's not enough space
-			// to cache it, to force the read operation
-			// go go straight to disk
-			if (m_settings.explicit_read_cache) return -2;
-
-			ret = cache_read_block(j, l);
-			hit = false;
-			if (ret < 0) return ret;
-
-			p = find_cached_piece(m_read_pieces, j, l);
-			TORRENT_ASSERT(!m_read_pieces.empty());
-			TORRENT_ASSERT(p->piece == j.piece);
-			TORRENT_ASSERT(p->storage == j.storage);
-		}
-
-		TORRENT_ASSERT(p != idx.end());
-
-		ret = copy_from_piece(const_cast<cached_piece_entry&>(*p), hit, j, l);
-		if (ret < 0) return ret;
-		if (p->num_blocks == 0) idx.erase(p);
-		else idx.modify(p, update_last_use(j.cache_min_time));
-
-		ret = j.buffer_size;
-		++m_cache_stats.blocks_read;
-		if (hit) ++m_cache_stats.blocks_read_hit;
-		return ret;
-	}
-
-	size_type disk_io_thread::queue_buffer_size() const
-	{
-		mutex::scoped_lock l(m_queue_mutex);
-		return m_queue_buffer_size;
-	}
-
-	typedef std::list<std::pair<disk_io_job, int> > job_queue_t;
-	void completion_queue_handler(job_queue_t* completed_jobs)
-	{
-		boost::shared_ptr<job_queue_t> holder(completed_jobs);
-
-		for (job_queue_t::iterator i = completed_jobs->begin()
-			, end(completed_jobs->end()); i != end; ++i)
-		{
-			TORRENT_TRY
-			{
-				i->first.callback(i->second, i->first);
-			}
-			TORRENT_CATCH(std::exception& e)
-			{}
-		}
-	}
-
-	int disk_io_thread::add_job(disk_io_job const& j
-		, mutex::scoped_lock& l
-		, boost::function<void(int, disk_io_job const&)> const& f)
-	{
-		const_cast<disk_io_job&>(j).start_time = time_now_hires();
-
-		if (j.action == disk_io_job::write)
-		{
-			m_queue_buffer_size += j.buffer_size;
-			if (m_queue_buffer_size >= m_settings.max_queued_disk_bytes
-				&& m_settings.max_queued_disk_bytes > 0)
-				m_exceeded_write_queue = true;
-		}
 /*
-		else if (j.action == disk_io_job::read)
+		if (m_abort && j->action != disk_io_job::hash_complete
+			&& j->action != disk_io_job::reclaim_block)
 		{
-			// if this is a cache hit, return it right away!
-			// this is OK because the cache is actually protected by
-			// the m_piece_mutex
-			bool hit = false;
-			if (j.buffer == 0)
-			{
-				// this is OK because the disk_buffer pool has its
-				// own mutex to protect the pool allocator
-				const_cast<disk_io_job&>(j).buffer = allocate_buffer("send buffer");
-			}
-			int ret = try_read_from_cache(j, hit, cache_only);
-			if (hit && ret >= 0)
-			{
-				TORRENT_ASSERT(f);
-				const_cast<disk_io_job&>(j).callback.swap(
-					const_cast<boost::function<void(int, disk_io_job const&)>&>(f));
-				job_queue_t* q = new job_queue_t;
-				q->push_back(std::make_pair(j, ret));
-				m_ios.post(boost::bind(completion_queue_handler, q));
-				return m_queue_buffer_size;
-			}
-			free_buffer(j.buffer);
-			const_cast<disk_io_job&>(j).buffer = 0;
+			l.unlock();
+			m_aiocb_pool.free_job(j);
+			return;
 		}
 */
-		m_jobs.push_back(j);
-		m_jobs.back().callback.swap(const_cast<boost::function<void(int, disk_io_job const&)>&>(f));
+		if (high_priority)
+			m_queued_jobs.push_front(j);
+		else
+			m_queued_jobs.push_back(j);
 
-		m_signal.signal(l);
-		return m_queue_buffer_size;
+		if (j->action == disk_io_job::write)
+			m_queue_buffer_size += j->d.io.buffer_size;
+
+		l.unlock();
+
+		DLOG(stderr, "[%p] add_job job: %s\n", this, job_action_name[j->action]);
+
+		// high priority jobs tries to wake up the disk thread immediately
+		if (high_priority) submit_jobs_impl();
 	}
 
-	int disk_io_thread::add_job(disk_io_job const& j
-		, boost::function<void(int, disk_io_job const&)> const& f)
+	void disk_io_thread::submit_jobs()
 	{
-		TORRENT_ASSERT(!m_abort);
-		TORRENT_ASSERT(j.storage
-			|| j.action == disk_io_job::abort_thread
-			|| j.action == disk_io_job::update_settings);
-		TORRENT_ASSERT(j.buffer_size <= m_block_size);
-		mutex::scoped_lock l(m_queue_mutex);
-		return add_job(j, l, f);
+		mutex::scoped_lock l (m_job_mutex);
+		if (m_queued_jobs.empty()) return;
+		l.unlock();
+
+		submit_jobs_impl();
 	}
 
-	bool disk_io_thread::test_error(disk_io_job& j)
+	void disk_io_thread::submit_jobs_impl()
 	{
-		TORRENT_ASSERT(j.storage);
-		error_code const& ec = j.storage->error();
-		if (ec)
-		{
-			j.buffer = 0;
-			j.str.clear();
-			j.error = ec;
-			j.error_file = j.storage->error_file();
-#ifdef TORRENT_DEBUG
-			printf("ERROR: '%s' in %s\n", ec.message().c_str(), j.error_file.c_str());
+		// wake up the disk thread to issue this new job
+#if TORRENT_USE_OVERLAPPED
+		PostQueuedCompletionStatus(m_completion_port, 1, 0, 0);
+#elif TORRENT_USE_AIO_SIGNALFD || TORRENT_USE_IOSUBMIT
+		boost::uint64_t dummy = 1;
+		int len = write(m_job_event_fd, &dummy, sizeof(dummy));
+		DLOG(stderr, "[%p] write(m_job_event_fd) = %d\n", this, len);
+		TORRENT_ASSERT(len == sizeof(dummy));
+#elif TORRENT_USE_AIO_PORTS
+		port_send(m_port, 1, 0);
+#elif TORRENT_USE_AIO_KQUEUE
+		boost::uint8_t dummy = 0;
+		int len = write(m_job_pipe[0], &dummy, sizeof(dummy));
+		DLOG(stderr, "[%p] write(m_job_pipe) = %d\n", this, len);
+		TORRENT_ASSERT(len == sizeof(dummy));
+#else
+		g_job_sem.signal_all();
 #endif
-			j.storage->clear_error();
-			return true;
-		}
-		return false;
 	}
 
-	void disk_io_thread::post_callback(disk_io_job const& j, int ret)
+#if TORRENT_USE_AIO && !TORRENT_USE_AIO_SIGNALFD && !TORRENT_USE_AIO_PORTS && !TORRENT_USE_AIO_KQUEUE
+
+	void disk_io_thread::signal_handler(int signal, siginfo_t* si, void*)
 	{
-		if (!j.callback) return;
-		m_queued_completions.push_back(std::make_pair(j, ret));
+		if (signal != TORRENT_AIO_SIGNAL) return;
+
+		DLOG(stderr, "*** signal_handler\n");
+
+		++g_completed_aios;
+		// wake up the disk thread to
+		// make it handle these completed jobs
+		g_job_sem.signal_all();
 	}
+#endif
 
-	enum action_flags_t
-	{
-		read_operation = 1
-		, buffer_operation = 2
-		, cancel_on_abort = 4
-	};
-
-	static const boost::uint8_t action_flags[] =
-	{
-		read_operation + buffer_operation + cancel_on_abort // read
-		, buffer_operation // write
-		, 0 // hash
-		, 0 // move_storage
-		, 0 // release_files
-		, 0 // delete_files
-		, 0 // check_fastresume
-		, read_operation + cancel_on_abort // check_files
-		, 0 // save_resume_data
-		, 0 // rename_file
-		, 0 // abort_thread
-		, 0 // clear_read_cache
-		, 0 // abort_torrent
-		, cancel_on_abort // update_settings
-		, read_operation + cancel_on_abort // read_and_hash
-		, read_operation + cancel_on_abort // cache_piece
-		, 0 // finalize_file
-	};
-
-	bool should_cancel_on_abort(disk_io_job const& j)
-	{
-		TORRENT_ASSERT(j.action >= 0 && j.action < int(sizeof(action_flags)));
-		return action_flags[j.action] & cancel_on_abort;
-	}
-
-	bool is_read_operation(disk_io_job const& j)
-	{
-		TORRENT_ASSERT(j.action >= 0 && j.action < int(sizeof(action_flags)));
-		return action_flags[j.action] & read_operation;
-	}
-
-	bool operation_has_buffer(disk_io_job const& j)
-	{
-		TORRENT_ASSERT(j.action >= 0 && j.action < int(sizeof(action_flags)));
-		return action_flags[j.action] & buffer_operation;
-	}
+#ifdef TORRENT_DEBUG
+#define TORRENT_ASSERT_VALID_AIOCB(x) \
+	do { \
+		TORRENT_ASSERT(m_aiocb_pool.is_from(x)); \
+		bool found = false; \
+		for (file::aiocb_t* i = m_in_progress; i; i = i->next) { \
+			if (i != x) continue; \
+			found = true; \
+			break; \
+		} \
+		TORRENT_ASSERT(found); \
+	} while(false)
+#else
+#define TORRENT_ASSERT_VALID_AIOCB(x) do {} while(false)
+#endif // TORRENT_DEBUG
 
 	void disk_io_thread::thread_fun()
 	{
-#ifdef TORRENT_DISK_STATS
-		m_log.open("disk_io_thread.log", std::ios::trunc);
+#if defined TORRENT_DEBUG && defined BOOST_HAS_PTHREADS
+		m_file_pool.set_thread_owner();
 #endif
+
+#if TORRENT_USE_OVERLAPPED
+		TORRENT_ASSERT(m_completion_port != INVALID_HANDLE_VALUE);
+		m_file_pool.set_iocp(m_completion_port);
+#endif
+
+#ifdef TORRENT_DISK_STATS
+		m_aiocb_pool.file_access_log = fopen("file_access.log", "w+");
+#endif
+
+
+#if TORRENT_USE_RLIMIT
+		// ---- auto-cap open files ----
+
+		struct rlimit rl;
+		if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
+		{
+			// deduct some margin for epoll/kqueue, log files,
+			// futexes, shared objects etc.
+			rl.rlim_cur -= 20;
+
+			// 80% of the available file descriptors should go to connections
+			// 20% goes towards regular files
+			m_file_pool.resize((std::min)(m_file_pool.size_limit(), int(rl.rlim_cur * 2 / 10)));
+		}
+#endif // TORRENT_USE_RLIMIT
 
 		// figure out how much physical RAM there is in
 		// this machine. This is used for automatically
@@ -1479,993 +2356,519 @@ namespace libtorrent
 			}
 		}
 #endif
-		// 1 = forward in list, -1 = backwards in list
-		int elevator_direction = 1;
 
-		read_jobs_t::iterator elevator_job_pos = m_sorted_read_jobs.begin();
-		size_type last_elevator_pos = 0;
-		bool need_update_elevator_pos = false;
-		int immediate_jobs_in_row = 0;
+#if TORRENT_USE_AIO
+#if defined BOOST_HAS_PTHREADS
+		sigset_t mask;
+		sigemptyset(&mask);
+		sigaddset(&mask, TORRENT_AIO_SIGNAL);
 
-		for (;;)
+// if we're using signalfd, we don't want a signal handler to catch our
+// signal, but our file descriptor to swallow all of them
+#if TORRENT_USE_AIO_SIGNALFD
+		m_signal_fd[0] = signalfd(-1, &mask, SFD_NONBLOCK);
+		// #error error handling needed
+
+		if (pthread_sigmask(SIG_BLOCK, &mask, 0) == -1)
 		{
-#ifdef TORRENT_DISK_STATS
-			m_log << log_time() << " idle" << std::endl;
+			TORRENT_ASSERT(false);
+		}
+#else
+		if (pthread_sigmask(SIG_UNBLOCK, &mask, 0) == -1)
+		{
+			TORRENT_ASSERT(false);
+		}
+#endif // TORRENT_USE_AIO_SIGNALFD
+#endif // BOOST_HAS_PTHREADS
+#endif // TORRENT_USE_AIO
+
+#if TORRENT_USE_AIO && !TORRENT_USE_AIO_SIGNALFD && !TORRENT_USE_AIO_PORTS && !TORRENT_USE_AIO_KQUEUE
+		struct sigaction sa;
+
+		sa.sa_flags = SA_SIGINFO | SA_RESTART;
+		sa.sa_sigaction = &disk_io_thread::signal_handler;
+		sigemptyset(&sa.sa_mask);
+
+		if (sigaction(TORRENT_AIO_SIGNAL, &sa, 0) == -1)
+		{
+			TORRENT_ASSERT(false);
+		}
 #endif
 
-
-			mutex::scoped_lock jl(m_queue_mutex);
-
-			if (m_queued_completions.size() >= 30 || (m_jobs.empty() && !m_queued_completions.empty()))
-			{
-				job_queue_t* q = new job_queue_t;
-				q->swap(m_queued_completions);
-				m_ios.post(boost::bind(completion_queue_handler, q));
-			}
-
-
-			ptime job_start;
-			while (m_jobs.empty() && m_sorted_read_jobs.empty() && !m_abort)
-			{
-				// if there hasn't been an event in one second
-				// see if we should flush the cache
-//				if (!m_signal.timed_wait(jl, boost::posix_time::seconds(1)))
-//					flush_expired_pieces();
-				m_signal.wait(jl);
-				m_signal.clear(jl);
-
-				job_start = time_now();
-				if (job_start >= m_last_stats_flip + seconds(1)) flip_stats(job_start);
-			}
-
-			if (m_abort && m_jobs.empty())
-			{
-				jl.unlock();
-
-				mutex::scoped_lock l(m_piece_mutex);
-				// flush all disk caches
-				cache_piece_index_t& widx = m_pieces.get<0>();
-				for (cache_piece_index_t::iterator i = widx.begin()
-					, end(widx.end()); i != end; ++i)
-					flush_range(const_cast<cached_piece_entry&>(*i), 0, INT_MAX, l);
-
-#ifdef TORRENT_DISABLE_POOL_ALLOCATOR
-				// since we're aborting the thread, we don't actually
-				// need to free all the blocks individually. We can just
-				// clear the piece list and the memory will be freed when we
-				// destruct the m_pool. If we're not using a pool, we actually
-				// have to free everything individually though
-				cache_piece_index_t& idx = m_read_pieces.get<0>();
-				for (cache_piece_index_t::iterator i = idx.begin()
-					, end(idx.end()); i != end; ++i)
-					free_piece(const_cast<cached_piece_entry&>(*i), l);
+#if (TORRENT_USE_AIO && !TORRENT_USE_AIO_SIGNALFD && !TORRENT_USE_AIO_PORTS) \
+	|| TORRENT_USE_SYNCIO
+		int last_completed_aios = 0;
 #endif
 
-				m_pieces.clear();
-				m_read_pieces.clear();
-				// release the io_service to allow the run() call to return
-				// we do this once we stop posting new callbacks to it.
-				m_work.reset();
-				return;
-			}
+		do
+		{
+			bool new_job = false;
+			bool iocbs_reaped = false;
 
-			disk_io_job j;
-
-			ptime now = time_now_hires();
-			ptime operation_start = now;
-
-			// make sure we don't starve out the read queue by just issuing
-			// write jobs constantly, mix in a read job every now and then
-			// with a configurable ratio
-			// this rate must increase to every other jobs if the queued
-			// up read jobs increases too far.
-			int read_job_every = m_settings.read_job_every;
-
-			int unchoke_limit = m_settings.unchoke_slots_limit;
-			if (unchoke_limit < 0) unchoke_limit = 100;
-
-			if (m_sorted_read_jobs.size() > unchoke_limit * 2)
+#if TORRENT_USE_OVERLAPPED
+			TORRENT_ASSERT(m_completion_port != INVALID_HANDLE_VALUE);
+			file::aiocb_t* aio = 0;
+			DWORD bytes_transferred;
+			ULONG_PTR key;
+			OVERLAPPED* ol = 0;
+			DLOG(stderr, "[%p] GetQueuedCompletionStatus()\n", this);
+			bool ret = GetQueuedCompletionStatus(m_completion_port
+				, &bytes_transferred, &key, &ol, INFINITE);
+			if (ret == false)
 			{
-				int range = unchoke_limit;
-				int exceed = m_sorted_read_jobs.size() - range * 2;
-				read_job_every = (exceed * 1 + (range - exceed) * read_job_every) / 2;
-				if (read_job_every < 1) read_job_every = 1;
+				error_code ec(GetLastError(), get_system_category());
+				DLOG(stderr, "[%p] GetQueuedCompletionStatus() = FALSE %s\n"
+					, this, ec.message().c_str());
+				sleep(10);
 			}
-
-			bool pick_read_job = m_jobs.empty()
-				|| (immediate_jobs_in_row >= read_job_every
-					&& !m_sorted_read_jobs.empty());
-
-			if (!pick_read_job)
+			if (key == NULL && ol != 0)
 			{
-				// we have a job in the job queue. If it's
-				// a read operation and we are allowed to
-				// reorder jobs, sort it into the read job
-				// list and continue, otherwise just pop it
-				// and use it later
-				j = m_jobs.front();
-				m_jobs.pop_front();
-				if (j.action == disk_io_job::write)
-				{
-					TORRENT_ASSERT(m_queue_buffer_size >= j.buffer_size);
-					m_queue_buffer_size -= j.buffer_size;
-					
-					if (m_exceeded_write_queue)
-					{
-						int low_watermark = m_settings.max_queued_disk_bytes_low_watermark == 0
-							|| m_settings.max_queued_disk_bytes_low_watermark >= m_settings.max_queued_disk_bytes
-							? size_type(m_settings.max_queued_disk_bytes) * 7 / 8
-							: m_settings.max_queued_disk_bytes_low_watermark;
-
-						if (m_queue_buffer_size < low_watermark
-							|| m_settings.max_queued_disk_bytes == 0)
-						{
-							m_exceeded_write_queue = false;
-							// we just dropped below the high watermark of number of bytes
-							// queued for writing to the disk. Notify the session so that it
-							// can trigger all the connections waiting for this event
-							if (m_queue_callback) m_ios.post(m_queue_callback);
-						}
-					}
-				}
-
-				jl.unlock();
-
-				bool defer = false;
-
-				if (is_read_operation(j))
-				{
-					defer = true;
-
-					// at this point the operation we're looking
-					// at is a read operation. If this read operation
-					// can be fully satisfied by the read cache, handle
-					// it immediately
-					if (m_settings.use_read_cache)
-					{
-#ifdef TORRENT_DISK_STATS
-						m_log << log_time() << " check_cache_hit" << std::endl;
-#endif
-						// unfortunately we need to lock the cache
-						// if the cache querying function would be
-						// made asyncronous, this would not be
-						// necessary anymore
-						mutex::scoped_lock l(m_piece_mutex);
-						cache_piece_index_t::iterator p
-							= find_cached_piece(m_read_pieces, j, l);
-				
-						cache_piece_index_t& idx = m_read_pieces.get<0>();
-						// if it's a cache hit, process the job immediately
-						if (p != idx.end() && is_cache_hit(const_cast<cached_piece_entry&>(*p), j, l))
-							defer = false;
-					}
-				}
-
-				if (m_settings.use_disk_read_ahead && defer)
-				{
-					j.storage->hint_read_impl(j.piece, j.offset, j.buffer_size);
-				}
-
-				TORRENT_ASSERT(j.offset >= 0);
-				if (m_settings.allow_reordered_disk_operations && defer)
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " sorting_job" << std::endl;
-#endif
-					ptime sort_start = time_now_hires();
-
-					size_type phys_off = j.storage->physical_offset(j.piece, j.offset);
-					need_update_elevator_pos = need_update_elevator_pos || m_sorted_read_jobs.empty();
-					m_sorted_read_jobs.insert(std::pair<size_type, disk_io_job>(phys_off, j));
-
-					ptime now = time_now_hires();
-					m_sort_time.add_sample(total_microseconds(now - sort_start));
-					m_job_time.add_sample(total_microseconds(now - operation_start));
-					m_cache_stats.cumulative_sort_time += total_milliseconds(now - sort_start);
-					m_cache_stats.cumulative_job_time += total_milliseconds(now - operation_start);
-					continue;
-				}
-
-				++immediate_jobs_in_row;
+				file::aiocb_t* aio = to_aiocb(ol);
+				// since synchronous calls also use overlapped
+				// we'll get some stack allocated overlapped structures
+				// as well. Once everything is moved over to async.
+				// operations, hopefully this won't be needed anymore
+				if (!m_aiocb_pool.is_from(aio)) continue;
+				TORRENT_ASSERT_VALID_AIOCB(aio);
+				file::aiocb_t* next = aio->next;
+				bool removed = reap_aio(aio, m_aiocb_pool);
+				if (removed) ++m_cache_stats.cumulative_completed_aiocbs;
+				iocbs_reaped = removed;
+				if (removed && m_in_progress == aio) m_in_progress = next;
+				DLOG(stderr, "[%p] overlapped = %p removed = %d\n", this, ol, removed);
 			}
 			else
 			{
-				// the job queue is empty, pick the next read job
-				// from the sorted job list. So we don't need the
-				// job queue lock anymore
-				jl.unlock();
+				// this should only happen for our own posted
+				// events from add_job()
+//				TORRENT_ASSERT(key == 1);
+				new_job = true;
+			}
+#elif TORRENT_USE_IOSUBMIT
+			fd_set set;
+			FD_ZERO(&set);
+			FD_SET(m_disk_event_fd, &set);
+			FD_SET(m_job_event_fd, &set);
+			DLOG(stderr, "[%p] select(m_disk_event_fd, m_job_event_fd)\n", this);
+			int ret = select((std::max)(m_disk_event_fd, m_job_event_fd) + 1, &set, 0, 0, 0);
+			DLOG(stderr, "[%p]  = %d\n", this, ret);
 
-				immediate_jobs_in_row = 0;
-
-				TORRENT_ASSERT(!m_sorted_read_jobs.empty());
-
-				// if m_sorted_read_jobs used to be empty,
-				// we need to update the elevator position
-				if (need_update_elevator_pos)
-				{
-					elevator_job_pos = m_sorted_read_jobs.lower_bound(last_elevator_pos);
-					need_update_elevator_pos = false;
-				}
-
-				// if we've reached the end, change the elevator direction
-				if (elevator_job_pos == m_sorted_read_jobs.end())
-				{
-					elevator_direction = -1;
-					--elevator_job_pos;
-				}
-				TORRENT_ASSERT(!m_sorted_read_jobs.empty());
-
-				TORRENT_ASSERT(elevator_job_pos != m_sorted_read_jobs.end());
-				j = elevator_job_pos->second;
-				read_jobs_t::iterator to_erase = elevator_job_pos;
-
-				// if we've reached the begining of the sorted list,
-				// change the elvator direction
-				if (elevator_job_pos == m_sorted_read_jobs.begin())
-					elevator_direction = 1;
-
-				// move the elevator before erasing the job we're processing
-				// to keep the iterator valid
-				if (elevator_direction > 0) ++elevator_job_pos;
-				else --elevator_job_pos;
-
-				TORRENT_ASSERT(to_erase != elevator_job_pos);
-				last_elevator_pos = to_erase->first;
-				m_sorted_read_jobs.erase(to_erase);
+			if (FD_ISSET(m_job_event_fd, &set))
+			{
+				boost::uint64_t n = 0;
+				int ret = read(m_job_event_fd, &n, sizeof(n));
+				if (ret != sizeof(n)) DLOG(stderr, "[%p] read(m_job_event_fd) = %d %s\n"
+					, this, ret, strerror(errno));
+				new_job = true;
 			}
 
-			m_queue_time.add_sample(total_microseconds(now - j.start_time));
-
-			// if there's a buffer in this job, it will be freed
-			// when this holder is destructed, unless it has been
-			// released.
-			disk_buffer_holder holder(*this
-				, operation_has_buffer(j) ? j.buffer : 0);
-
-			flush_expired_pieces();
-
-			int ret = 0;
-
-			TORRENT_ASSERT(j.storage
-				|| j.action == disk_io_job::abort_thread
-				|| j.action == disk_io_job::update_settings);
-#ifdef TORRENT_DISK_STATS
-			ptime start = time_now();
-#endif
-
-			if (j.cache_min_time < 0)
-				j.cache_min_time = j.cache_min_time == 0 ? m_settings.default_cache_min_age
-					: (std::max)(m_settings.default_cache_min_age, j.cache_min_time);
-
-			TORRENT_TRY
+			if (FD_ISSET(m_disk_event_fd, &set))
 			{
+				// at least one disk event finished, maybe more.
+				// reading from the event fd will reset the event
+				// and tell us how many times it was fired. i.e.
+				// how many disk events are ready to be reaped
+				const int max_events = 512;
+				io_event events[max_events];
+				boost::int64_t n = 0;
+				int ret = read(m_disk_event_fd, &n, sizeof(n));
+				if (ret != sizeof(n)) DLOG(stderr, "[%p] read(m_disk_event_fd) = %d %s\n"
+					, this, ret, strerror(errno));
 
-			if (j.storage && j.storage->get_storage_impl()->m_settings == 0)
-				j.storage->get_storage_impl()->m_settings = &m_settings;
+				DLOG(stderr, "[%p] %"PRId64" completed disk jobs\n", this, n);
 
-			switch (j.action)
-			{
-				case disk_io_job::update_settings:
+				int num_events = 0;
+				do
 				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " update_settings " << std::endl;
-#endif
-					TORRENT_ASSERT(j.buffer);
-					session_settings const& s = *((session_settings*)j.buffer);
-					TORRENT_ASSERT(s.cache_size >= 0);
-					TORRENT_ASSERT(s.cache_expiry > 0);
+					// if we allow reading more than n jobs here, there is a race condition
+					// since there might have been more jobs completed since we read the
+					// event fd, we could end up reaping more events than were signalled by the
+					// event fd, resulting in trying to reap them again later, getting stuck
+					num_events = io_getevents(m_io_queue, 1, (std::min)(max_events, int(n)), events, NULL);
+					if (num_events < 0) DLOG(stderr, "[%p] io_getevents() = %d %s\n"
+						, this, num_events, strerror(-num_events));
 
-#if defined TORRENT_WINDOWS
-					if (m_settings.low_prio_disk != s.low_prio_disk)
+					for (int i = 0; i < num_events; ++i)
 					{
-						m_file_pool.set_low_prio_io(s.low_prio_disk);
-						// we need to close all files, since the prio
-						// only takes affect when files are opened
-						m_file_pool.release(0);
+						file::aiocb_t* aio = to_aiocb(events[i].obj);
+						TORRENT_ASSERT(aio->in_use);
+						TORRENT_ASSERT_VALID_AIOCB(aio);
+						file::aiocb_t* next = aio->next;
+						// copy the return codes from the io_event
+						aio->ret = events[i].res;
+						aio->error = events[i].res < 0 ? -events[i].res : 0;
+						bool removed = reap_aio(aio, m_aiocb_pool);
+						if (removed) ++m_cache_stats.cumulative_completed_aiocbs;
+						iocbs_reaped = removed;
+						if (removed && m_in_progress == aio) m_in_progress = next;
+						DLOG(stderr, "[%p]  removed = %d\n", this, removed);
 					}
-#endif
-					m_settings = s;
-					m_file_pool.resize(m_settings.file_pool_size);
-#if defined __APPLE__ && defined __MACH__ && MAC_OS_X_VERSION_MIN_REQUIRED >= 1050
-					setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD
-						, m_settings.low_prio_disk ? IOPOL_THROTTLE : IOPOL_DEFAULT);
-#elif defined IOPRIO_WHO_PROCESS
-					syscall(ioprio_set, IOPRIO_WHO_PROCESS, getpid());
-#endif
-					if (m_settings.cache_size == -1)
-					{
-						// the cache size is set to automatic. Make it
-						// depend on the amount of physical RAM
-						// if we don't know how much RAM we have, just set the
-						// cache size to 16 MiB (1024 blocks)
-						if (m_physical_ram == 0)
-							m_settings.cache_size = 1024;
-						else
-							m_settings.cache_size = m_physical_ram / 8 / m_block_size;
-					}
-					break;
-				}
-				case disk_io_job::abort_torrent:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " abort_torrent " << std::endl;
-#endif
-					mutex::scoped_lock jl(m_queue_mutex);
-					for (std::deque<disk_io_job>::iterator i = m_jobs.begin();
-						i != m_jobs.end();)
-					{
-						if (i->storage != j.storage)
-						{
-							++i;
-							continue;
-						}
-						if (should_cancel_on_abort(*i))
-						{
-							if (i->action == disk_io_job::write)
-							{
-								TORRENT_ASSERT(m_queue_buffer_size >= i->buffer_size);
-								m_queue_buffer_size -= i->buffer_size;
-							}
-							post_callback(*i, -3);
-							i = m_jobs.erase(i);
-							continue;
-						}
-						++i;
-					}
-					// now clear all the read jobs
-					for (read_jobs_t::iterator i = m_sorted_read_jobs.begin();
-						i != m_sorted_read_jobs.end();)
-					{
-						if (i->second.storage != j.storage)
-						{
-							++i;
-							continue;
-						}
-						post_callback(i->second, -3);
-						if (elevator_job_pos == i) ++elevator_job_pos;
-						m_sorted_read_jobs.erase(i++);
-					}
-					jl.unlock();
-
-					mutex::scoped_lock l(m_piece_mutex);
-
-					// build a vector of all the buffers we need to free
-					// and free them all in one go
-					std::vector<char*> buffers;
-					for (cache_t::iterator i = m_read_pieces.begin();
-						i != m_read_pieces.end();)
-					{
-						if (i->storage == j.storage)
-						{
-							drain_piece_bufs(const_cast<cached_piece_entry&>(*i), buffers, l);
-							i = m_read_pieces.erase(i);
-						}
-						else
-						{
-							++i;
-						}
-					}
-					l.unlock();
-					if (!buffers.empty()) free_multiple_buffers(&buffers[0], buffers.size());
-					release_memory();
-					break;
-				}
-				case disk_io_job::abort_thread:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " abort_thread " << std::endl;
-#endif
-					// clear all read jobs
-					mutex::scoped_lock jl(m_queue_mutex);
-
-					for (std::deque<disk_io_job>::iterator i = m_jobs.begin();
-						i != m_jobs.end();)
-					{
-						if (should_cancel_on_abort(*i))
-						{
-							if (i->action == disk_io_job::write)
-							{
-								TORRENT_ASSERT(m_queue_buffer_size >= i->buffer_size);
-								m_queue_buffer_size -= i->buffer_size;
-							}
-							post_callback(*i, -3);
-							i = m_jobs.erase(i);
-							continue;
-						}
-						++i;
-					}
-					jl.unlock();
-
-					for (read_jobs_t::iterator i = m_sorted_read_jobs.begin();
-						i != m_sorted_read_jobs.end();)
-					{
-						if (i->second.storage != j.storage)
-						{
-							++i;
-							continue;
-						}
-						post_callback(i->second, -3);
-						if (elevator_job_pos == i) ++elevator_job_pos;
-						m_sorted_read_jobs.erase(i++);
-					}
-
-					m_abort = true;
-					break;
-				}
-				case disk_io_job::read_and_hash:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " read_and_hash " << j.buffer_size << std::endl;
-#endif
-					INVARIANT_CHECK;
-					TORRENT_ASSERT(j.buffer == 0);
-					j.buffer = allocate_buffer("send buffer");
-					TORRENT_ASSERT(j.buffer_size <= m_block_size);
-					if (j.buffer == 0)
-					{
-						ret = -1;
-#if BOOST_VERSION == 103500
-						j.error = error_code(boost::system::posix_error::not_enough_memory
-							, get_posix_category());
-#elif BOOST_VERSION > 103500
-						j.error = error_code(boost::system::errc::not_enough_memory
-							, get_posix_category());
-#else
-						j.error = error::no_memory;
-#endif
-						j.str.clear();
-						break;
-					}
-
-					disk_buffer_holder read_holder(*this, j.buffer);
-
-					// read the entire piece and verify the piece hash
-					// since we need to check the hash, this function
-					// will ignore the cache size limit (at least for
-					// reading and hashing, not for keeping it around)
-					sha1_hash h;
-					ret = read_piece_from_cache_and_hash(j, h);
-
-					// -2 means there's no space in the read cache
-					// or that the read cache is disabled
-					if (ret == -1)
-					{
-						test_error(j);
-						break;
-					}
-					if (!m_settings.disable_hash_checks)
-						ret = (j.storage->info()->hash_for_piece(j.piece) == h)?ret:-3;
-					if (ret == -3)
-					{
-						j.storage->mark_failed(j.piece);
-						j.error = errors::failed_hash_check;
-						j.str.clear();
-						j.buffer = 0;
-						break;
-					}
-
-					TORRENT_ASSERT(j.buffer == read_holder.get());
-					read_holder.release();
-#if TORRENT_DISK_STATS
-					rename_buffer(j.buffer, "released send buffer");
-#endif
-					break;
-				}
-				case disk_io_job::finalize_file:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " finalize_file " << j.piece << std::endl;
-#endif
-					j.storage->finalize_file(j.piece);
-					break;
-				}
-				case disk_io_job::read:
-				{
-					if (test_error(j))
-					{
-						ret = -1;
-						break;
-					}
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time();
-#endif
-					INVARIANT_CHECK;
-					if (j.buffer == 0) j.buffer = allocate_buffer("send buffer");
-					TORRENT_ASSERT(j.buffer_size <= m_block_size);
-					if (j.buffer == 0)
-					{
-#ifdef TORRENT_DISK_STATS
-						m_log << " read 0" << std::endl;
-#endif
-						ret = -1;
-#if BOOST_VERSION == 103500
-						j.error = error_code(boost::system::posix_error::not_enough_memory
-							, get_posix_category());
-#elif BOOST_VERSION > 103500
-						j.error = error_code(boost::system::errc::not_enough_memory
-							, get_posix_category());
-#else
-						j.error = error::no_memory;
-#endif
-						j.str.clear();
-						break;
-					}
-
-					disk_buffer_holder read_holder(*this, j.buffer);
-
-					bool hit;
-					ret = try_read_from_cache(j, hit);
-
-#ifdef TORRENT_DISK_STATS
-					m_log << (hit?" read-cache-hit ":" read ") << j.buffer_size << std::endl;
-#endif
-					// -2 means there's no space in the read cache
-					// or that the read cache is disabled
-					if (ret == -1)
-					{
-						j.buffer = 0;
-						test_error(j);
-						break;
-					}
-					else if (ret == -2)
-					{
-						file::iovec_t b = { j.buffer, j.buffer_size };
-						ret = j.storage->read_impl(&b, j.piece, j.offset, 1);
-						if (ret < 0)
-						{
-							test_error(j);
-							break;
-						}
-						if (ret != j.buffer_size)
-						{
-							// this means the file wasn't big enough for this read
-							j.buffer = 0;
-							j.error = errors::file_too_short;
-							j.error_file.clear();
-							j.str.clear();
-							ret = -1;
-							break;
-						}
-						++m_cache_stats.blocks_read;
-						hit = false;
-					}
-					if (!hit)
-					{
-						ptime now = time_now_hires();
-						m_read_time.add_sample(total_microseconds(now - operation_start));
-						m_cache_stats.cumulative_read_time += total_milliseconds(now - operation_start);
-					}
-					TORRENT_ASSERT(j.buffer == read_holder.get());
-					read_holder.release();
-#if TORRENT_DISK_STATS
-					rename_buffer(j.buffer, "released send buffer");
-#endif
-					break;
-				}
-				case disk_io_job::write:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " write " << j.buffer_size << std::endl;
-#endif
-					mutex::scoped_lock l(m_piece_mutex);
-					INVARIANT_CHECK;
-
-					TORRENT_ASSERT(!j.storage->error());
-					TORRENT_ASSERT(j.cache_min_time >= 0);
-
-					if (in_use() >= m_settings.cache_size)
-					{
-						flush_cache_blocks(l, in_use() - m_settings.cache_size + 1);
-						if (test_error(j)) break;
-					}
-					TORRENT_ASSERT(!j.storage->error());
-
-					cache_piece_index_t& idx = m_pieces.get<0>();
-					cache_piece_index_t::iterator p = find_cached_piece(m_pieces, j, l);
-					int block = j.offset / m_block_size;
-					TORRENT_ASSERT(j.buffer);
-					TORRENT_ASSERT(j.buffer_size <= m_block_size);
-					int piece_size = j.storage->info()->piece_size(j.piece);
-					int blocks_in_piece = (piece_size + m_block_size - 1) / m_block_size;
-					if (p != idx.end())
-					{
-						bool recalc_contiguous = false;
-						TORRENT_ASSERT(p->blocks[block].buf == 0);
-						if (p->blocks[block].buf)
-						{
-							free_buffer(p->blocks[block].buf);
-							--m_cache_stats.cache_size;
-							--const_cast<cached_piece_entry&>(*p).num_blocks;
-						}
-						else if ((block > 0 && p->blocks[block-1].buf)
-							|| (block < blocks_in_piece-1 && p->blocks[block+1].buf)
-							|| p->num_blocks == 0)
-						{
-							// update the contiguous blocks counter for this piece. Only if it has
-							// an adjacent block. If it doesn't, we already know it couldn't have
-							// increased the largest contiguous block span in this piece
-							recalc_contiguous = true;
-						}
-						p->blocks[block].buf = j.buffer;
-						p->blocks[block].callback.swap(j.callback);
-#ifdef TORRENT_DISK_STATS
-						rename_buffer(j.buffer, "write cache");
-#endif
-						++m_cache_stats.cache_size;
-						++const_cast<cached_piece_entry&>(*p).num_blocks;
-						if (recalc_contiguous)
-						{
-							const_cast<cached_piece_entry&>(*p).num_contiguous_blocks = contiguous_blocks(*p);
-						}
-						idx.modify(p, update_last_use(j.cache_min_time));
-						// we might just have created a contiguous range
-						// that meets the requirement to be flushed. try it
-						// if we're in avoid_readback mode, don't do this. Only flush
-						// pieces when we need more space in the cache (which will avoid
-						// flushing blocks out-of-order) or when we issue a hash job,
-						// wich indicates the piece is completely downloaded
-						flush_contiguous_blocks(const_cast<cached_piece_entry&>(*p)
-							, l, m_settings.write_cache_line_size
-							, m_settings.disk_cache_algorithm == session_settings::avoid_readback);
-
-						if (p->num_blocks == 0) idx.erase(p);
-						test_error(j);
-						TORRENT_ASSERT(!j.storage->error());
-					}
-					else
-					{
-						TORRENT_ASSERT(!j.storage->error());
-						if (cache_block(j, j.callback, j.cache_min_time, l) < 0)
-						{
-							l.unlock();
-							ptime start = time_now_hires();
-							file::iovec_t iov = {j.buffer, j.buffer_size};
-							ret = j.storage->write_impl(&iov, j.piece, j.offset, 1);
-							l.lock();
-							if (ret < 0)
-							{
-								test_error(j);
-								break;
-							}
-							ptime done = time_now_hires();
-							m_write_time.add_sample(total_microseconds(done - start));
-							m_cache_stats.cumulative_write_time += total_milliseconds(done - start);
-							// we successfully wrote the block. Ignore previous errors
-							j.storage->clear_error();
-							break;
-						}
-						TORRENT_ASSERT(!j.storage->error());
-					}
-					// we've now inserted the buffer
-					// in the cache, we should not
-					// free it at the end
-					holder.release();
-
-					if (in_use() > m_settings.cache_size)
-					{
-						flush_cache_blocks(l, in_use() - m_settings.cache_size);
-						test_error(j);
-					}
-					TORRENT_ASSERT(!j.storage->error());
-
-					break;
-				}
-				case disk_io_job::cache_piece:
-				{
-					mutex::scoped_lock l(m_piece_mutex);
-
-					if (test_error(j))
-					{
-						ret = -1;
-						break;
-					}
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " cache " << j.piece << std::endl;
-#endif
-					INVARIANT_CHECK;
-					TORRENT_ASSERT(j.buffer == 0);
-
-					cache_piece_index_t::iterator p;
-					bool hit;
-					ret = cache_piece(j, p, hit, 0, l);
-					if (ret == -2) ret = -1;
-
-					if (ret < 0) test_error(j);
-					break;
-				}
-				case disk_io_job::hash:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " hash" << std::endl;
-#endif
-					TORRENT_ASSERT(!j.storage->error());
-					mutex::scoped_lock l(m_piece_mutex);
-					INVARIANT_CHECK;
-
-					cache_piece_index_t& idx = m_pieces.get<0>();
-					cache_piece_index_t::iterator i = find_cached_piece(m_pieces, j, l);
-					if (i != idx.end())
-					{
-						TORRENT_ASSERT(i->storage);
-						int ret = flush_range(const_cast<cached_piece_entry&>(*i), 0, INT_MAX, l);
-						idx.erase(i);
-						if (test_error(j))
-						{
-							ret = -1;
-							j.storage->mark_failed(j.piece);
-							break;
-						}
-					}
-					l.unlock();
-					if (m_settings.disable_hash_checks)
-					{
-						ret = 0;
-						break;
-					}
-
-					ptime hash_start = time_now_hires();
-
-					int readback = 0;
-					sha1_hash h = j.storage->hash_for_piece_impl(j.piece, &readback);
-					if (test_error(j))
-					{
-						ret = -1;
-						j.storage->mark_failed(j.piece);
-						break;
-					}
-
-					m_cache_stats.total_read_back += readback / m_block_size;
-
-					ret = (j.storage->info()->hash_for_piece(j.piece) == h)?0:-2;
-					if (ret == -2) j.storage->mark_failed(j.piece);
-
-					ptime done = time_now_hires();
-					m_hash_time.add_sample(total_microseconds(done - hash_start));
-					m_cache_stats.cumulative_hash_time += total_milliseconds(done - hash_start);
-					break;
-				}
-				case disk_io_job::move_storage:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " move" << std::endl;
-#endif
-					TORRENT_ASSERT(j.buffer == 0);
-					ret = j.storage->move_storage_impl(j.str);
-					if (ret != 0)
-					{
-						test_error(j);
-						break;
-					}
-					j.str = j.storage->save_path();
-					break;
-				}
-				case disk_io_job::release_files:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " release" << std::endl;
-#endif
-					TORRENT_ASSERT(j.buffer == 0);
-
-					mutex::scoped_lock l(m_piece_mutex);
-					INVARIANT_CHECK;
-
-					for (cache_t::iterator i = m_pieces.begin(); i != m_pieces.end();)
-					{
-						if (i->storage == j.storage)
-						{
-							flush_range(const_cast<cached_piece_entry&>(*i), 0, INT_MAX, l);
-							i = m_pieces.erase(i);
-						}
-						else
-						{
-							++i;
-						}
-					}
-					l.unlock();
-					release_memory();
-
-					ret = j.storage->release_files_impl();
-					if (ret != 0) test_error(j);
-					break;
-				}
-				case disk_io_job::clear_read_cache:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " clear-cache" << std::endl;
-#endif
-					TORRENT_ASSERT(j.buffer == 0);
-
-					mutex::scoped_lock l(m_piece_mutex);
-					INVARIANT_CHECK;
-
-					for (cache_t::iterator i = m_read_pieces.begin();
-						i != m_read_pieces.end();)
-					{
-						if (i->storage == j.storage)
-						{
-							free_piece(const_cast<cached_piece_entry&>(*i), l);
-							i = m_read_pieces.erase(i);
-						}
-						else
-						{
-							++i;
-						}
-					}
-					l.unlock();
-					release_memory();
-					ret = 0;
-					break;
-				}
-				case disk_io_job::delete_files:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " delete" << std::endl;
-#endif
-					TORRENT_ASSERT(j.buffer == 0);
-
-					mutex::scoped_lock l(m_piece_mutex);
-					INVARIANT_CHECK;
-
- 					// delete all write cache entries for this storage
-					cache_piece_index_t& idx = m_pieces.get<0>();
-					cache_piece_index_t::iterator start = idx.lower_bound(std::pair<void*, int>(j.storage.get(), 0));
-					cache_piece_index_t::iterator end = idx.upper_bound(std::pair<void*, int>(j.storage.get(), INT_MAX));
-
-					// build a vector of all the buffers we need to free
-					// and free them all in one go
-					std::vector<char*> buffers;
-					torrent_info const& ti = *j.storage->info();
-					for (cache_piece_index_t::iterator i = start; i != end; ++i)
-					{
-						int blocks_in_piece = (ti.piece_size(i->piece) + m_block_size - 1) / m_block_size;
-						cached_piece_entry& e = const_cast<cached_piece_entry&>(*i);
-						for (int j = 0; j < blocks_in_piece; ++j)
-						{
-							if (i->blocks[j].buf == 0) continue;
-							buffers.push_back(i->blocks[j].buf);
-							i->blocks[j].buf = 0;
-							--m_cache_stats.cache_size;
-							TORRENT_ASSERT(e.num_blocks > 0);
-							--e.num_blocks;
-						}
-						TORRENT_ASSERT(i->num_blocks == 0);
-					}
-					idx.erase(start, end);
-					l.unlock();
-					if (!buffers.empty()) free_multiple_buffers(&buffers[0], buffers.size());
-					release_memory();
-
-					ret = j.storage->delete_files_impl();
-					if (ret != 0) test_error(j);
-					break;
-				}
-				case disk_io_job::check_fastresume:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " check_fastresume" << std::endl;
-#endif
-					lazy_entry const* rd = (lazy_entry const*)j.buffer;
-					TORRENT_ASSERT(rd != 0);
-					ret = j.storage->check_fastresume(*rd, j.error);
-					test_error(j);
-					break;
-				}
-				case disk_io_job::check_files:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " check_files" << std::endl;
-#endif
-					int piece_size = j.storage->info()->piece_length();
-					for (int processed = 0; processed < 4 * 1024 * 1024; processed += piece_size)
-					{
-						ptime now = time_now_hires();
-						TORRENT_ASSERT(now >= m_last_file_check);
-						// this happens sometimes on windows for some reason
-						if (now < m_last_file_check) now = m_last_file_check;
-
-#if BOOST_VERSION > 103600
-						if (now - m_last_file_check < milliseconds(m_settings.file_checks_delay_per_block))
-						{
-							int sleep_time = m_settings.file_checks_delay_per_block
-								* (piece_size / (16 * 1024))
-								- total_milliseconds(now - m_last_file_check);
-							if (sleep_time < 0) sleep_time = 0;
-							TORRENT_ASSERT(sleep_time < 5 * 1000);
-	
-							sleep(sleep_time);
-						}
-						m_last_file_check = time_now_hires();
-#endif
-
-						ptime hash_start = time_now_hires();
-						if (m_waiting_to_shutdown) break;
-
-						ret = j.storage->check_files(j.piece, j.offset, j.error);
-
-						ptime done = time_now_hires();
-						m_hash_time.add_sample(total_microseconds(done - hash_start));
-						m_cache_stats.cumulative_hash_time += total_milliseconds(done - hash_start);
-
-						TORRENT_TRY {
-							TORRENT_ASSERT(j.callback);
-							if (j.callback && ret == piece_manager::need_full_check)
-								post_callback(j, ret);
-						} TORRENT_CATCH(std::exception&) {}
-						if (ret != piece_manager::need_full_check) break;
-					}
-					if (test_error(j))
-					{
-						ret = piece_manager::fatal_disk_error;
-						break;
-					}
-					TORRENT_ASSERT(ret != -2 || j.error);
-					
-					// if the check is not done, add it at the end of the job queue
-					if (ret == piece_manager::need_full_check)
-					{
-						// offset needs to be reset to 0 so that the disk
-						// job sorting can be done correctly
-						j.offset = 0;
-						add_job(j, j.callback);
-						continue;
-					}
-					break;
-				}
-				case disk_io_job::save_resume_data:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " save_resume_data" << std::endl;
-#endif
-					j.resume_data.reset(new entry(entry::dictionary_t));
-					j.storage->write_resume_data(*j.resume_data);
-					ret = 0;
-					break;
-				}
-				case disk_io_job::rename_file:
-				{
-#ifdef TORRENT_DISK_STATS
-					m_log << log_time() << " rename_file" << std::endl;
-#endif
-					ret = j.storage->rename_file_impl(j.piece, j.str);
-					if (ret != 0)
-					{
-						test_error(j);
-						break;
-					}
-				}
-				}
-			}
-			TORRENT_CATCH(std::exception& e)
-			{
-				TORRENT_DECLARE_DUMMY(std::exception, e);
-				ret = -1;
-				TORRENT_TRY {
-					j.str = e.what();
-				} TORRENT_CATCH(std::exception&) {}
+					if (num_events > 0) n -= num_events;
+				} while (num_events == max_events);
 			}
 
-			TORRENT_ASSERT(!j.storage || !j.storage->error());
+#elif TORRENT_USE_AIO_SIGNALFD
+			// wait either for a signal coming in through the 
+			// signalfd or an add-job even coming in through
+			// the eventfd
+			fd_set set;
+			FD_ZERO(&set);
+			FD_SET(m_signal_fd[0], &set);
+			FD_SET(m_signal_fd[1], &set);
+			FD_SET(m_job_event_fd, &set);
+			DLOG(stderr, "[%p] select(m_signal_fd, m_job_event_fd)\n", this);
+			int ret = select((std::max)((std::max)(m_signal_fd[0], m_signal_fd[1]), m_job_event_fd) + 1, &set, 0, 0, 0);
+			DLOG(stderr, "[%p]  = %d\n", this, ret);
+			if (FD_ISSET(m_job_event_fd, &set))
+			{
+				// yes, there's a new job available
+				boost::uint64_t dummy;
+				int len = read(m_job_event_fd, &dummy, sizeof(dummy));
+				TORRENT_ASSERT(len == sizeof(dummy));
+				new_job = true;
+			}
+			for (int i = 0; i < 2; ++i) {
+			if (FD_ISSET(m_signal_fd[i], &set))
+			{
+				int len = 0;
+				signalfd_siginfo sigbuf[30];
+				do
+				{
+					len = read(m_signal_fd[i], sigbuf, sizeof(sigbuf));
+					if (len <= 0)
+					{
+						error_code ec(errno, get_system_category());
+						DLOG(stderr, "[%p] read() = %d %s\n", this, len, ec.message().c_str());
+						break;
+					}
+					DLOG(stderr, "[%p] read() = %d\n", this, len);
+					TORRENT_ASSERT((len % sizeof(signalfd_siginfo)) == 0);
+					for (int i = 0; i < len / sizeof(signalfd_siginfo); ++i)
+					{
+						signalfd_siginfo* siginfo = &sigbuf[i];
+						// this is not an AIO signal.
+						if (siginfo->ssi_signo != TORRENT_AIO_SIGNAL) continue;
+						// the userdata pointer in our iocb requests is the pointer
+						// to our aiocb_t link
+						file::aiocb_t* aio = (file::aiocb_t*)siginfo->ssi_ptr;
+						TORRENT_ASSERT_VALID_AIOCB(aio);
+						file::aiocb_t* next = aio->next;
+						bool removed = reap_aio(aio, m_aiocb_pool);
+						if (removed) ++m_cache_stats.cumulative_completed_aiocbs;
+						iocbs_reaped = removed;
+						if (removed && m_in_progress == aio) m_in_progress = next;
+						DLOG(stderr, "[%p]  removed = %d\n", this, removed);
+					}
+					// if we filled our signal buffer, read again
+					// until we read less than our max
+				} while (len == sizeof(sigbuf));
+			}
+			}
+#elif TORRENT_USE_AIO_PORTS
+			const int max_events = 300;
+			uint_t num_events = 1;
+			port_event_t events[max_events];
+			// if there are no events in 5 seconds, return anyway in order to
+			// flush write blocks
+			timespec sp = { 5, 0 };
+			DLOG(stderr, "[%p] port_getn()\n", this);
+			int ret = port_getn(m_port, events, max_events, &num_events, &sp);
+			DLOG(stderr, "[%p]  = %d nget: %d\n", this, ret, num_events);
 
-			ptime done = time_now_hires();
-			m_job_time.add_sample(total_microseconds(done - operation_start));
-			m_cache_stats.cumulative_job_time += total_milliseconds(done - operation_start);
+			for (int i = 0; i < num_events; ++i)
+			{
+				if (events[i].portev_source == PORT_SOURCE_USER)
+				{
+					new_job = true;
+					continue;
+				}
+				if (events[i].portev_source != PORT_SOURCE_AIO)
+				{
+					TORRENT_ASSERT(false);
+					continue;
+				}
+				// at this point, event[i] refers to an AIO event
+				// and the user-data pointer points to our aiocb_t
 
-//			if (!j.callback) std::cerr << "DISK THREAD: no callback specified" << std::endl;
-//			else std::cerr << "DISK THREAD: invoking callback" << std::endl;
-			TORRENT_TRY {
-				TORRENT_ASSERT(ret != -2 || j.error
-					|| j.action == disk_io_job::hash);
-#if TORRENT_DISK_STATS
-				if ((j.action == disk_io_job::read || j.action == disk_io_job::read_and_hash)
-					&& j.buffer != 0)
-					rename_buffer(j.buffer, "posted send buffer");
-#endif
-				post_callback(j, ret);
-			} TORRENT_CATCH(std::exception&) {
+				file::aiocb_t* aio = (file::aiocb_t*)events[i].portev_user;
+
+				TORRENT_ASSERT_VALID_AIOCB(aio);
+				file::aiocb_t* next = aio->next;
+				bool removed = reap_aio(aio, m_aiocb_pool);
+				if (removed) ++m_cache_stats.cumulative_completed_aiocbs;
+				iocbs_reaped = removed;
+				if (removed && m_in_progress == aio) m_in_progress = next;
+				DLOG(stderr, "[%p]  removed = %d\n", this, removed);
+			}
+
+#elif TORRENT_USE_AIO_KQUEUE
+			const int max_events = 300;
+			struct kevent events[max_events];
+			// if there are no events in 5 seconds, return anyway in order to
+			// flush write blocks
+			timespec sp = { 5, 0 };
+			DLOG(stderr, "[%p] kevent()\n", this);
+			int num_events = kevent(m_queue, 0, 0, events, max_events, &sp);
+			DLOG(stderr, "[%p]  = %d\n", this, num_events);
+
+			for (int i = 0; i < num_events; ++i)
+			{
+				struct kevent& e = events[i];
+				if (e.filter == EVFILT_READ && e.ident == m_job_pipe[1])
+				{
+					new_job = true;
+					continue;
+				}
+				if (e.filter == EVFILT_AIO)
+				{
+					// at this point, event[i] refers to an AIO event
+					// and the user-data pointer points to our aiocb_t
+
+					file::aiocb_t* aio = (file::aiocb_t*)e.udata;
+					TORRENT_ASSERT((void*)e.data == (void*)&aio->cb);
+
+					TORRENT_ASSERT_VALID_AIOCB(aio);
+					file::aiocb_t* next = aio->next;
+					bool removed = reap_aio(aio, m_aiocb_pool);
+					if (removed) ++m_cache_stats.cumulative_completed_aiocbs;
+					iocbs_reaped = removed;
+					if (removed && m_in_progress == aio) m_in_progress = next;
+					DLOG(stderr, "[%p]  removed = %d\n", this, removed);
+					continue;
+				}
+				DLOG(stderr, "[%p] unknown event [ filter: %d ident: %p flags: %d fflags: %d data: %p udata: %p ]\n"
+					, this, int(e.filter), e.ident, int(e.flags), int(e.fflags), e.data, e.udata);
 				TORRENT_ASSERT(false);
 			}
-		}
-		TORRENT_ASSERT(false);
+
+#else
+			// always time out after half a second, since the global nature of the semaphore
+			// makes it unreliable when there are multiple instances of the disk_io_thread
+			// object. There might also a potential race condition if the semaphore is signalled
+			// right before we start waiting on it
+			if (last_completed_aios == g_completed_aios)
+			{
+//				DLOG(stderr, "[%p] sem_wait()\n", this);
+				g_job_sem.timed_wait(500);
+//				DLOG(stderr, "[%p] sem_wait() returned\n", this);
+			}
+
+			// more jobs might complete as we go through
+			// the list. In which case m_completed_aios
+			// would have incremented again. It's incremented
+			// in the aio signal handler
+			int complete_aios = g_completed_aios;
+			while (complete_aios != last_completed_aios)
+			{
+				DLOG(stderr, "[%p] m_completed_aios %d last_completed_aios: %d\n"
+					, this, complete_aios, last_completed_aios);
+
+				// this needs to be atomic for the signal handler
+				int tmp = g_completed_aios;
+				last_completed_aios = complete_aios;
+				complete_aios = tmp;
+				// go through all outstanding disk operations
+				// and potentially dispatch ones that are complete
+				DLOG(stderr, "[%p] reap in progress aios (%p)\n", this, m_in_progress);
+				m_in_progress = reap_aios(m_in_progress, m_aiocb_pool);
+				DLOG(stderr, "[%p] new in progress aios (%p)\n", this, m_in_progress);
+				m_cache_stats.cumulative_completed_aiocbs = g_completed_aios;
+			}
+			new_job = true;
+			iocbs_reaped = true;
+#endif
+
+			ptime now = time_now_hires();
+			if (now > m_last_cache_expiry + seconds(5))
+			{
+				m_last_cache_expiry = now;
+				flush_expired_write_blocks();
+			}
+
+#if TORRENT_USE_SUBMIT_THREADS
+			if (iocbs_reaped)
+			{
+				m_submit_queue.kick();
+			}
+#endif
+
+			// if didn't receive a message waking us up because we have new jobs
+			// another reason to keep going is if we just reaped some aiocbs and
+			// we have outstanding iocbs waiting to be submitted
+			// go back to sleep waiting for more io completion events
+			if (!new_job && (!iocbs_reaped || m_to_issue == 0))
+			{
+				if (!m_completed_jobs.empty())
+				{
+					disk_io_job* j = (disk_io_job*)m_completed_jobs.get_all();
+					m_ios.post(boost::bind(&complete_job, m_userdata, &m_aiocb_pool, j));
+				}
+
+				continue;
+			}
+
+			// keep the mutex locked for as short as possible
+			// while we swap out all the jobs in the queue
+			// we can then go through the queue without having
+			// to block the mutex
+			mutex::scoped_lock l(m_job_mutex);
+			disk_io_job* j = (disk_io_job*)m_queued_jobs.get_all();
+			l.unlock();
+			if (j)
+			{
+				DLOG(stderr, "[%p] new jobs\n", this);
+			}
+
+			// go through list of newly submitted jobs
+			// and perform the appropriate action
+			while (j)
+			{
+				if (j->action == disk_io_job::write)
+				{
+					mutex::scoped_lock l(m_job_mutex);
+					TORRENT_ASSERT(m_queue_buffer_size >= j->d.io.buffer_size);
+					m_queue_buffer_size -= j->d.io.buffer_size;
+					l.unlock();
+				}
+	
+				disk_io_job* job = j;
+				j = (disk_io_job*)j->next;
+				job->next = 0;
+				perform_async_job(job);
+			}
+
+			int evict = m_disk_cache.num_to_evict(0);
+			if (evict > 0)
+			{
+				evict = m_disk_cache.try_evict_blocks(evict, 1);
+				if (evict > 0) try_flush_write_blocks(evict);
+			}
+
+			if (!m_completed_jobs.empty())
+			{
+				disk_io_job* j = (disk_io_job*)m_completed_jobs.get_all();
+				m_ios.post(boost::bind(&complete_job, m_userdata, &m_aiocb_pool, j));
+			}
+
+			// tell the kernel about the async disk I/O jobs we want to perform
+
+			// if we're on a system that doesn't do async. I/O, we should only perform
+			// one at a time in case new jobs are issued that should take priority (such
+			// as asking for stats)
+			if (m_to_issue)
+			{
+				ptime start = time_now_hires();
+#if TORRENT_USE_SYNCIO
+				if (!same_sign(m_to_issue->phys_offset - m_last_phys_off, m_elevator_direction))
+				{
+					m_elevator_direction *= -1;
+					++m_elevator_turns;
+				}
+
+				m_last_phys_off = m_to_issue->phys_offset;
+
+				DLOG(stderr, "[%p] issue aios (%p) phys_offset=%"PRId64" elevator=%d\n"
+					, this, m_to_issue, m_to_issue->phys_offset, m_elevator_direction);
+#else
+				DLOG(stderr, "[%p] issue aios (%p)\n", this, m_to_issue);
+#endif
+
+
+				file::aiocb_t* pending;
+				int num_issued = 0;
+#if TORRENT_USE_SUBMIT_THREADS
+				// #error move this into issue_aios, or just get rid of it
+				num_issued = m_submit_queue.submit(m_to_issue);
+				pending = m_to_issue;
+				m_to_issue = 0;
+#else
+				boost::tie(pending, m_to_issue) = issue_aios(m_to_issue, m_aiocb_pool
+					, num_issued);
+#endif
+				if (m_to_issue == 0) m_to_issue_end = 0;
+				TORRENT_ASSERT(m_num_to_issue >= num_issued);
+				m_num_to_issue -= num_issued;
+				TORRENT_ASSERT(m_num_to_issue == count_aios(m_to_issue));
+				DLOG(stderr, "[%p] prepend aios (%p) to m_in_progress (%p)\n"
+					, this, pending, m_in_progress);
+
+				prepend_aios(m_in_progress, pending);
+
+				int issue_time = total_microseconds(time_now_hires() - start);
+				m_issue_time.add_sample(issue_time);
+				m_cache_stats.cumulative_issue_time += issue_time;
+
+#if !TORRENT_USE_SYNCIO
+				if (m_to_issue)
+				{
+					ptime now = time_now();
+					if (now - m_last_disk_aio_performance_warning > seconds(10))
+					{
+						// there were some jobs that couldn't be posted
+						// the the kernel. This limits the performance of
+						// the disk throughput, issue a performance warning
+						m_ios.post(boost::bind(m_post_alert, new performance_alert(
+							torrent_handle(), performance_alert::aio_limit_reached)));
+						m_last_disk_aio_performance_warning = now;
+					}
+				}
+#endif
+				if (num_issued == 0)
+				{
+					// we did not issue a single job! avoid spinning
+					// and pegging the CPU
+					TORRENT_ASSERT(iocbs_reaped);
+					sleep(10);
+				}
+			}
+
+			// now, we may have received the abort thread
+			// message, and m_abort may have been set to
+			// true, but we still need to wait for the outstanding
+			// jobs, that's why we'll keep looping while m_in_progress
+			// is has jobs in it as well
+		
+		} while (!m_abort || m_in_progress || m_to_issue
+			|| m_hash_thread.num_pending_jobs() || m_disk_cache.pinned_blocks() > 0);
+
+		m_hash_thread.stop();
+
+		m_disk_cache.clear();
+
+		// release the io_service to allow the run() call to return
+		// we do this once we stop posting new callbacks to it.
+		m_work.reset();
+		DLOG(stderr, "[%p] exiting disk thread\n", this);
+
+#ifdef TORRENT_DISK_STATS
+		fclose(m_aiocb_pool.file_access_log);
+		m_aiocb_pool.file_access_log = 0;
+#endif
+#if defined TORRENT_DEBUG && defined BOOST_HAS_PTHREADS
+		m_file_pool.clear_thread_owner();
+#endif
 	}
+
+	char* disk_io_thread::allocate_buffer(bool& exceeded
+		, boost::function<void()> const& cb
+		, char const* category)
+	{
+		bool trigger_trim = false;
+		char* ret = m_disk_cache.allocate_buffer(exceeded, trigger_trim, cb, category);
+		if (trigger_trim)
+		{
+			// we just exceeded the cache size limit. Trigger a trim job
+			disk_io_job* j = m_aiocb_pool.allocate_job(disk_io_job::trim_cache);
+			add_job(j, true);
+		}
+		return ret;
+	}
+
+#ifdef TORRENT_DEBUG
+	void disk_io_thread::check_invariant() const
+	{
+	}
+#endif
+		
 }
 

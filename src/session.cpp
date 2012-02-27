@@ -105,6 +105,19 @@ namespace libtorrent
 	{
 		session_settings set;
 
+		// receive data directly into disk buffers
+		// this yields more system calls to read() and
+		// kqueue(), but saves RAM.
+		set.contiguous_recv_buffer = false;
+
+		// keep 2 blocks outstanding when hashing
+		set.checking_mem_usage = 2;
+
+		// don't use any extra threads to do SHA-1 hashing
+		set.hashing_threads = 0;
+		set.network_threads = 0;
+		set.aio_threads = 0;
+
 		set.alert_queue_size = 100;
 
 		// setting this to a low limit, means more
@@ -226,19 +239,28 @@ namespace libtorrent
 		// use 1 GB of cache
 		set.cache_size = 32768 * 2;
 		set.use_read_cache = true;
-		set.cache_buffer_chunk_size = 128;
+		set.cache_buffer_chunk_size = 0;
 		set.read_cache_line_size = 32;
 		set.write_cache_line_size = 32;
 		set.low_prio_disk = false;
-		// one hour expiration
-		set.cache_expiry = 60 * 60;
+		// 30 seconds expiration to save cache
+		// space for active pieces
+		set.cache_expiry = 30;
 		// this is expensive and could add significant
 		// delays when freeing a large number of buffers
 		set.lock_disk_cache = false;
 
+		// in case the OS we're running on doesn't support
+		// readv/writev, allocate contiguous buffers for
+		// reads and writes
+		// disable, since it uses a lot more RAM and a significant
+		// amount of CPU to copy it around
+		set.coalesce_reads = false;
+		set.coalesce_writes = false;
+
 		// the max number of bytes pending write before we throttle
 		// download rate
-		set.max_queued_disk_bytes = 10 * 1024 * 1024;
+		set.max_queued_disk_bytes = 7 * 1024 * 1024;;
 		// flush write cache in a way to minimize the amount we need to
 		// read back once we want to hash-check the piece. i.e. try to
 		// flush all blocks in-order
@@ -249,7 +271,7 @@ namespace libtorrent
 		// since we unchoke everyone, we don't need fast pieces anyway
 		set.allowed_fast_set_size = 0;
 		// suggest pieces in the read cache for higher cache hit rate
-		set.suggest_mode = session_settings::suggest_read_cache;
+//		set.suggest_mode = session_settings::suggest_read_cache;
 
 		set.close_redundant_connections = true;
 
@@ -269,11 +291,8 @@ namespace libtorrent
 
 		set.choking_algorithm = session_settings::fixed_slots_choker;
 
-		// in order to be able to deliver very high
-		// upload rates, this should be able to cover
-		// the bandwidth delay product. Assuming an RTT
-		// of 500 ms, and a send rate of 20 MB/s, the upper
-		// limit should be 10 MB
+		// of 500 ms, and a send rate of 4 MB/s, the upper
+		// limit should be 2 MB
 		set.send_buffer_watermark = 2 * 1024 * 1024;
 
 		// put 1.5 seconds worth of data in the send buffer
@@ -287,6 +306,22 @@ namespace libtorrent
 
 		// allow the buffer size to grow for the uTP socket
 		set.utp_dynamic_sock_buf = true;
+
+		// we're likely to have more than 4 cores on a high
+		// performance machine. One core is needed for the
+		// network thread
+		set.hashing_threads = 4;
+
+		// the number of threads to use to call async_write_some
+		// on peer sockets
+		set.network_threads = 3;
+
+		// number of disk threads for low level file operations
+		set.aio_threads = 4;
+
+		// keep 5 MiB outstanding when checking hashes
+		// of a resumed file
+		set.checking_mem_usage = 320;
 
 		return set;
 	}
@@ -754,15 +789,31 @@ namespace libtorrent
 		return r;
 	}
 
+#ifndef TORRENT_NO_DEPRECATE
 	void session::get_cache_info(sha1_hash const& ih
 		, std::vector<cached_piece_info>& ret) const
 	{
-		m_impl->m_disk_thread.get_cache_info(ih, ret);
+		cache_status st;
+		get_cache_info(ih, &st);
+		ret.swap(st.pieces);
 	}
 
 	cache_status session::get_cache_status() const
 	{
-		return m_impl->m_disk_thread.status();
+		cache_status st;
+		get_cache_info(sha1_hash(0), &st);
+		return st;
+	}
+#endif
+
+	void session::get_cache_info(sha1_hash const& ih
+		, cache_status* ret, int flags) const
+	{
+		bool done = false;
+		mutex::scoped_lock l(m_impl->mut);
+		m_impl->m_io_service.post(boost::bind(&session_impl::get_cache_info
+			, m_impl.get(), ih, ret, flags, &done, &m_impl->cond, &m_impl->mut));
+		do { m_impl->cond.wait(l); } while(!done);
 	}
 
 #ifndef TORRENT_DISABLE_DHT

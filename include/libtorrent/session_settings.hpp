@@ -119,7 +119,7 @@ namespace libtorrent
 			, peer_connect_timeout(15)
 			, ignore_limits_on_local_network(true)
 			, connection_speed(6)
-			, send_redundant_have(false)
+			, send_redundant_have(true)
 			, lazy_bitfields(true)
 			, inactivity_timeout(600)
 			, unchoke_interval(15)
@@ -129,7 +129,10 @@ namespace libtorrent
 			, allowed_fast_set_size(10)
 			, suggest_mode(no_piece_suggestions)
 			, max_queued_disk_bytes(1024 * 1024)
+#ifndef TORRENT_NO_DEPRECATE
+			// this is no longer used
 			, max_queued_disk_bytes_low_watermark(0)
+#endif
 			, handshake_timeout(10)
 #ifndef TORRENT_DISABLE_DHT
 			, use_dht_as_fallback(false)
@@ -147,9 +150,10 @@ namespace libtorrent
 			, seed_choking_algorithm(round_robin)
 			, use_parole_mode(true)
 			, cache_size(1024)
-			, cache_buffer_chunk_size(16)
+			, cache_buffer_chunk_size(0)
 			, cache_expiry(300)
 			, use_read_cache(true)
+			, dont_flush_write_cache(false)
 			, explicit_read_cache(0)
 			, explicit_cache_interval(30)
 			, disk_io_write_mode(0)
@@ -202,10 +206,14 @@ namespace libtorrent
 			, file_checks_delay_per_block(0)
 			, disk_cache_algorithm(avoid_readback)
 			, read_cache_line_size(32)
-			, write_cache_line_size(32)
+			, write_cache_line_size(16)
 			, optimistic_disk_retry(10 * 60)
 			, disable_hash_checks(false)
+#if TORRENT_USE_AIO || TORRENT_USE_OVERLAPPED
+			, allow_reordered_disk_operations(false)
+#else
 			, allow_reordered_disk_operations(true)
+#endif
 			, allow_i2p_mixed(false)
 			, max_suggest_pieces(10)
 			, drop_skipped_requests(false)
@@ -268,6 +276,13 @@ namespace libtorrent
 			, read_job_every(10)
 			, use_disk_read_ahead(true)
 			, lock_files(false)
+			, hashing_threads(1)
+			, checking_mem_usage(200)
+			, predictive_piece_announce(0)
+			, contiguous_recv_buffer(true)
+			, aio_threads(2)
+			, aio_max(300)
+			, network_threads(0)
 			, ssl_listen(4433)
 		{}
 
@@ -435,24 +450,17 @@ namespace libtorrent
 		enum { no_piece_suggestions = 0, suggest_read_cache = 1 };
 		int suggest_mode;
 
-		// the maximum number of bytes a connection may have
-		// pending in the disk write queue before its download
-		// rate is being throttled. This prevents fast downloads
-		// to slow medias to allocate more and more memory
-		// indefinitely. This should be set to at least 16 kB
-		// to not completely disrupt normal downloads. If it's
-		// set to 0, you will be starving the disk thread and
-		// nothing will be written to disk.
-		// this is a per session setting.
+		// this is used to determine how many cache blocks to evict
+		// at a time once the limit is reached. The faster peers are
+		// downloading, and the more peers that are downloading, the
+		// larger this value should be to be efficient. It's specified
+		// in bytes, even though it's rounded to an even block (16kiB)
 		int max_queued_disk_bytes;
 
-		// this is the low watermark for the disk buffer queue.
-		// whenever the number of queued bytes exceed the
-		// max_queued_disk_bytes, libtorrent will wait for
-		// it to drop below this value before issuing more
-		// reads from the sockets. If set to 0, the
-		// low watermark will be half of the max queued disk bytes
+#ifndef TORRENT_NO_DEPRECATE
+		// not used anymore
 		int max_queued_disk_bytes_low_watermark;
+#endif
 
 		// the number of seconds to wait for a handshake
 		// response from a peer. If no response is received
@@ -536,6 +544,8 @@ namespace libtorrent
 		// that should be allocated at a time. It must be
 		// at least 1. Lower number saves memory at the expense
 		// of more heap allocations
+		// setting this to zero means 'automatic', i.e. proportional
+		// to the total disk cache size
 		int cache_buffer_chunk_size;
 
 		// the number of seconds a write cache entry sits
@@ -546,6 +556,11 @@ namespace libtorrent
 		// when true, the disk I/O thread uses the disk
 		// cache for caching blocks read from disk too
 		bool use_read_cache;
+
+		// this will make the disk cache never flush a write
+		// piece if it would cause is to have to re-read it
+		// once we want to calculate the piece hash
+		bool dont_flush_write_cache;
 
 		// don't implicitly cache pieces in the read cache,
 		// only cache pieces that are explicitly asked to be
@@ -565,6 +580,9 @@ namespace libtorrent
 		int disk_io_write_mode;
 		int disk_io_read_mode;
 
+		// allocate separate, contiguous, buffers for read and
+		// write calls. Only used where writev/readv cannot be used
+		// will use more RAM but may improve performance
 		bool coalesce_reads;
 		bool coalesce_writes;
 
@@ -779,14 +797,15 @@ namespace libtorrent
 		// disabled_storage)
 		bool disable_hash_checks;
 
-		// if this is true, disk read operations may
-		// be re-ordered based on their physical disk
-		// read offset. This greatly improves throughput
-		// when uploading to many peers. This assumes
-		// a traditional hard drive with a read head
-		// and spinning platters. If your storage medium
-		// is a solid state drive, this optimization
-		// doesn't give you an benefits
+		// if this is true, disk read operations are
+		// sorted by their physical offset on disk before
+		// issued to the operating system. This is useful
+		// if async I/O is not supported. It defaults to
+		// true if async I/O is not supported and fals
+		// otherwise.
+		// disk I/O operations are likely to be reordered
+		// regardless of this setting when async I/O
+		// is supported by the OS.
 		bool allow_reordered_disk_operations;
 
 		// if this is true, i2p torrents are allowed
@@ -1076,6 +1095,47 @@ namespace libtorrent
 		// if set to true, files will be locked when opened.
 		// preventing any other process from modifying them
 		bool lock_files;
+
+		// the number of threads to use for hash checking of pieces
+		// defaults to 1. If set to 0, the disk thread is used for hashing
+		int hashing_threads;
+
+		// the number of blocks to keep outstanding at any given time when
+		// checking torrents. Higher numbers give faster re-checks but uses
+		// more memory. Specified in number of 16 kiB blocks
+		int checking_mem_usage;
+
+		// if set to > 0, pieces will be announced to other peers before they
+		// are fully downloaded (and before they are hash checked). The intention
+		// is to gain 1.5 potential round trip times per downloaded piece. When
+		// non-zero, this indicates how many milliseconds in advance pieces
+		// should be announced, before they are expected to be completed.
+		int predictive_piece_announce;
+
+		// when false, bytes off the socket is received directly into the disk
+		// buffer. This requires many more calls to recv(). When using a
+		// contiguous recv buffer, the download rate can be much higher
+		bool contiguous_recv_buffer;
+
+		//#error this should not be an option, it should depend on whether or not we're seeding or downloading
+
+		// for some aio back-ends, the number of io-threads to use
+		int aio_threads;
+		// for some aio back-ends, the max number of outstanding jobs
+		int aio_max;
+
+		// the number of threads to use to call async_write_some on
+		// peer sockets. When seeding at extremely high speeds, using
+		// 2 or more threads here may make sense. Also when using SSL
+		// peer connections
+		int network_threads;
+
+		// if this is set, it is interpreted as a file path to
+		// where to create an mmaped file to back the disk cache.
+		// this is mostly useful to introduce another caching layer
+		// between RAM and hard drives. Typically you would point
+		// this to an SSD drive.
+		std::string mmap_cache;
 
 		// open an ssl listen socket for ssl torrents on this port
 		int ssl_listen;

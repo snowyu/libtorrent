@@ -119,7 +119,8 @@ namespace libtorrent {
 			"send buffer watermark too low (upload rate will suffer)",
 			"too many optimistic unchoke slots",
 			"using bittyrant unchoker with no upload rate limit set",
-			"the disk queue limit is too high compared to the cache size. The disk queue eats into the cache size"
+			"the disk queue limit is too high compared to the cache size. The disk queue eats into the cache size",
+			"outstanding AIO operations limit reached"
 		};
 
 		return torrent_alert::message() + ": performance warning: "
@@ -618,6 +619,13 @@ namespace libtorrent {
 	{
 		char msg[600];
 		snprintf(msg, sizeof(msg), "state updates for %d torrents", int(status.size()));
+		return msg;
+	}
+
+	std::string mmap_cache_alert::message() const
+	{
+		char msg[600];
+		snprintf(msg, sizeof(msg), "mmap cache failed: (%d) %s", error.value(), error.message().c_str());
 		return msg;
 	}
 

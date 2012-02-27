@@ -45,6 +45,8 @@ struct sliding_average
 
 	void add_sample(int s)
 	{
+		TORRENT_ASSERT(s >= 0);
+		if (s < 0) s = 0;
 		if (m_mean == -1)
 		{
 			m_mean = s;
@@ -88,9 +90,12 @@ struct average_accumulator
 	{
 		int ret;
 		if (m_num_samples == 0) ret = 0;
-		else ret = m_sample_sum / m_num_samples;
-		m_num_samples = 0;
-		m_sample_sum = 0;
+		else ret = int(m_sample_sum / m_num_samples);
+		// in case we don't get any more samples, at least
+		// let the average roll over, but only be worth a
+		// single sample
+		m_num_samples = 1;
+		m_sample_sum = ret;
 		return ret;
 	}
 

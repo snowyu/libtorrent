@@ -226,6 +226,7 @@ namespace libtorrent
 		void write_cancel(peer_request const& r);
 		void write_bitfield();
 		void write_have(int index);
+		void write_dont_have(int index);
 		void write_piece(peer_request const& r, disk_buffer_holder& buffer);
 		void write_handshake();
 #ifndef TORRENT_DISABLE_EXTENSIONS
@@ -293,18 +294,13 @@ public:
 		// these functions encrypt the send buffer if m_rc4_encrypted
 		// is true, otherwise it passes the call to the
 		// peer_connection functions of the same names
-		virtual void append_const_send_buffer(char const* buffer, int size);
+		virtual void append_const_send_buffer(char const* buffer, int size
+			, boost::function<void(char*)> const& destructor = &nop);
+
 		virtual void send_buffer(char const* begin, int size, int flags = 0
 			, void (*fun)(char*, int, void*) = 0, void* userdata = 0);
-		template <class Destructor>
-		void append_send_buffer(char* buffer, int size, Destructor const& destructor)
-		{
-#ifndef TORRENT_DISABLE_ENCRYPTION
-			if (m_rc4_encrypted)
-				m_enc_handler->encrypt(buffer, size);
-#endif
-			peer_connection::append_send_buffer(buffer, size, destructor, true);
-		}
+		virtual void append_send_buffer(char* buffer, int size, boost::function<void(char*)> const& destructor
+			, bool encrypted = false);
 
 private:
 
