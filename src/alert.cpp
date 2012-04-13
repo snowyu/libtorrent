@@ -120,6 +120,7 @@ namespace libtorrent {
 			"too many optimistic unchoke slots",
 			"using bittyrant unchoker with no upload rate limit set",
 			"the disk queue limit is too high compared to the cache size. The disk queue eats into the cache size",
+			"outstanding AIO operations limit reached",
 			"too few ports allowed for outgoing connections",
 			"too few file descriptors are allowed for this process. connection limit lowered"
 		};
@@ -620,6 +621,13 @@ namespace libtorrent {
 	{
 		char msg[600];
 		snprintf(msg, sizeof(msg), "state updates for %d torrents", int(status.size()));
+		return msg;
+	}
+
+	std::string mmap_cache_alert::message() const
+	{
+		char msg[600];
+		snprintf(msg, sizeof(msg), "mmap cache failed: (%d) %s", error.value(), error.message().c_str());
 		return msg;
 	}
 

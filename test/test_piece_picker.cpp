@@ -101,16 +101,16 @@ boost::shared_ptr<piece_picker> setup_picker(
 			TEST_CHECK(!p->is_finished(piece_block(i, j)));
 			if ((blocks & (1 << j)) == 0) continue;
 			++counter;
-			bool ret = p->mark_as_downloading(piece_block(i, j), 0, piece_picker::slow);
+			bool ret = p->mark_as_downloading(piece_block(i, j), (void*)1, piece_picker::slow);
 			TEST_CHECK(ret == true);
 			TEST_CHECK(p->is_requested(piece_block(i, j)) == bool(blocks & (1 << j)));
-			p->mark_as_writing(piece_block(i, j), 0);
+			p->mark_as_writing(piece_block(i, j), (void*)1);
 			TEST_CHECK(!p->is_finished(piece_block(i, j)));
 			// trying to mark a block as requested after it has been completed
 			// should fail (return false)
-			ret = p->mark_as_downloading(piece_block(i, j), 0, piece_picker::slow);
+			ret = p->mark_as_downloading(piece_block(i, j), (void*)1, piece_picker::slow);
 			TEST_CHECK(ret == false);
-			p->mark_as_finished(piece_block(i, j), 0);
+			p->mark_as_finished(piece_block(i, j), (void*)1);
 
 			TEST_CHECK(p->is_downloaded(piece_block(i, j)) == bool(blocks & (1 << j)));
 			TEST_CHECK(p->is_finished(piece_block(i, j)) == bool(blocks & (1 << j)));
@@ -203,8 +203,13 @@ std::vector<piece_block> pick_pieces(boost::shared_ptr<piece_picker> const& p, c
 	, int options, std::vector<int> const& suggested_pieces)
 {
 	std::vector<piece_block> picked;
+	int loop_counter = 0;
 	p->pick_pieces(string2vec(availability), picked, num_blocks, prefer_whole_pieces, peer_struct
-		, state, options, suggested_pieces, 20);
+		, state, options, suggested_pieces, 20
+#ifdef TORRENT_STATS
+		, loop_counter
+#endif
+		);
 	print_pick(picked);
 	TEST_CHECK(verify_pick(p, picked));
 	return picked;
@@ -221,22 +226,18 @@ int test_pick(boost::shared_ptr<piece_picker> const& p, int options = piece_pick
 
 int test_main()
 {
+
+	int tmp1;
+	int tmp2;
+	int tmp3;
 	tcp::endpoint endp;
 	piece_picker::downloading_piece st;
-	policy::ipv4_peer tmp1(endp, false, 0);
-	policy::ipv4_peer tmp2(endp, false, 0);
-	policy::ipv4_peer tmp3(endp, false, 0);
 	policy::ipv4_peer peer_struct(endp, true, 0);
-#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
-	tmp1.in_use = true;
-	tmp2.in_use = true;
-	tmp3.in_use = true;
-	peer_struct.in_use = true;
-#endif
 	std::vector<piece_block> picked;
 	boost::shared_ptr<piece_picker> p;
 	const std::vector<int> empty_vector;
 	int options = piece_picker::rarest_first;
+	std::pair<int, int> dc;
 
 // ========================================================
 
@@ -308,23 +309,23 @@ int test_main()
 	TEST_CHECK(p->is_requested(piece_block(0, 0)) == false);
 	TEST_CHECK(std::find(picked.begin(), picked.end(), piece_block(0,0)) != picked.end());
 
-	p->mark_as_downloading(piece_block(0, 2), &tmp1, piece_picker::fast);
-	p->mark_as_writing(piece_block(0, 2), &tmp1);
-	p->abort_download(piece_block(0, 2), &tmp1);
-	p->mark_as_downloading(piece_block(0, 2), &tmp2, piece_picker::fast);
-	p->mark_as_writing(piece_block(0, 2), &tmp2);
+	p->mark_as_downloading(piece_block(0, 2), (void*)1337, piece_picker::fast);
+	p->mark_as_writing(piece_block(0, 2), (void*)1337);
+	p->abort_download(piece_block(0, 2), (void*)1337);
+	p->mark_as_downloading(piece_block(0, 2), (void*)7, piece_picker::fast);
+	p->mark_as_writing(piece_block(0, 2), (void*)7);
 
 	std::vector<void*> d;
 	p->get_downloaders(d, 0);
-	TEST_CHECK(d[2] == &tmp2);
+	TEST_CHECK(d[2] == (void*)7);
 
-	p->mark_as_downloading(piece_block(0, 3), &tmp1, piece_picker::fast);
-	p->abort_download(piece_block(0, 3), &tmp1);
-	p->mark_as_downloading(piece_block(0, 3), &tmp2, piece_picker::fast);
-	p->mark_as_writing(piece_block(0, 3), &tmp2);
+	p->mark_as_downloading(piece_block(0, 3), (void*)1337, piece_picker::fast);
+	p->abort_download(piece_block(0, 3), (void*)1337);
+	p->mark_as_downloading(piece_block(0, 3), (void*)7, piece_picker::fast);
+	p->mark_as_writing(piece_block(0, 3), (void*)7);
 
 	p->get_downloaders(d, 0);
-	TEST_CHECK(d[3] == &tmp2);
+	TEST_CHECK(d[3] == (void*)7);
 
 // ========================================================
 
@@ -405,7 +406,7 @@ int test_main()
 	// there are 2 pieces with availability 2 and 5 with availability 3
 	print_title("test distributed copies");
 	p = setup_picker("1233333", "*      ", "", "");
-	std::pair<int, int> dc = p->distributed_copies();
+	dc = p->distributed_copies();
 	TEST_CHECK(dc == std::make_pair(2, 5000 / 7));
 
 // ========================================================
@@ -715,8 +716,13 @@ int test_main()
 	p->mark_as_downloading(piece_block(1,2), &tmp1, piece_picker::slow);
 
 	picked.clear();
+	int loop_counter = 0;
 	p->pick_pieces(string2vec("*******"), picked, 7 * blocks_per_piece, 0, 0
-		, piece_picker::fast, piece_picker::prioritize_partials, empty_vector, 20);
+		, piece_picker::fast, piece_picker::prioritize_partials, empty_vector, 20
+#ifdef TORRENT_STATS
+		, loop_counter
+#endif
+		);
 	TEST_CHECK(verify_pick(p, picked, true));
 	print_pick(picked);
 	// don't pick both busy pieces, just one
@@ -725,14 +731,22 @@ int test_main()
 	picked.clear();
 	p->pick_pieces(string2vec("*******"), picked, 7 * blocks_per_piece, 0, 0
 		, piece_picker::fast, piece_picker::prioritize_partials
-		| piece_picker::rarest_first, empty_vector, 20);
+		| piece_picker::rarest_first, empty_vector, 20
+#ifdef TORRENT_STATS
+		, loop_counter
+#endif
+		);
 	TEST_CHECK(verify_pick(p, picked, true));
 	print_pick(picked);
 	TEST_EQUAL(picked.size(), 7 * blocks_per_piece - 1);
 
 	picked.clear();
 	p->pick_pieces(string2vec("*******"), picked, 7 * blocks_per_piece, 0, 0
-		, piece_picker::fast, piece_picker::rarest_first, empty_vector, 20);
+		, piece_picker::fast, piece_picker::rarest_first, empty_vector, 20
+#ifdef TORRENT_STATS
+		, loop_counter
+#endif
+		);
 	TEST_CHECK(verify_pick(p, picked, true));
 	print_pick(picked);
 	TEST_EQUAL(picked.size(), 7 * blocks_per_piece - 1);
@@ -837,9 +851,9 @@ int test_main()
 	print_title("test unverified blocks");
 	p = setup_picker("1111111", "       ", "", "0300700");
 	TEST_CHECK(p->unverified_blocks() == 2 + 3);
-	TEST_CHECK(p->get_downloader(piece_block(4, 0)) == 0);
-	TEST_CHECK(p->get_downloader(piece_block(4, 1)) == 0);
-	TEST_CHECK(p->get_downloader(piece_block(4, 2)) == 0);
+	TEST_CHECK(p->get_downloader(piece_block(4, 0)) == (void*)1);
+	TEST_CHECK(p->get_downloader(piece_block(4, 1)) == (void*)1);
+	TEST_CHECK(p->get_downloader(piece_block(4, 2)) == (void*)1);
 	TEST_CHECK(p->get_downloader(piece_block(4, 3)) == 0);
 	p->mark_as_downloading(piece_block(4, 3), &peer_struct, piece_picker::fast);
 	TEST_CHECK(p->get_downloader(piece_block(4, 3)) == &peer_struct);

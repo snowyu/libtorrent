@@ -3,6 +3,7 @@ project(libtorrent)
 
 set(sources
 	web_connection_base
+	aiocb_pool
 	alert
 	allocator
 	asio
@@ -11,6 +12,7 @@ set(sources
 	bandwidth_limit
 	bandwidth_manager
 	bandwidth_queue_entry
+	block_cache
 	bloom_filter
 	chained_buffer
 	connection_queue
@@ -64,6 +66,7 @@ set(sources
 	logger
 	file_pool
 	lsd
+	disk_io_job
 	disk_buffer_pool
 	disk_io_thread
 	enum_net

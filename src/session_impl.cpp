@@ -183,9 +183,15 @@ namespace libtorrent {
 	mutex _async_ops_mutex;
 #endif
 
+void network_thread_pool::process_job(write_some_job const& j, bool post)
+{
+	j.peer->get_socket()->async_write_some(
+		*j.vec, j.peer->make_write_handler(boost::bind(
+			&peer_connection::on_send_data, j.peer, _1, _2)));
+}
+
 namespace detail
 {
-
 	std::string generate_auth_string(std::string const& user
 		, std::string const& passwd)
 	{
@@ -197,20 +203,26 @@ namespace detail
 namespace aux {
 
 #ifdef TORRENT_STATS
-	void get_vm_stats(vm_statistics_data_t* vm_stat)
+	void get_vm_stats(vm_statistics_data_t* vm_stat, error_code& ec)
 	{
 		memset(vm_stat, 0, sizeof(*vm_stat));
 #if defined __MACH__
+		ec.clear();
 		mach_port_t host_port = mach_host_self();
 		mach_msg_type_number_t host_count = HOST_VM_INFO_COUNT;
 		kern_return_t error = host_statistics(host_port, HOST_VM_INFO,
 			(host_info_t)vm_stat, &host_count);
 #elif defined TORRENT_LINUX
-		char buffer[4096];
-		char string[1024];
+		ec.clear();
+		char string[4096];
 		boost::uint32_t value;
 		FILE* f = fopen("/proc/vmstat", "r");
 		int ret = 0;
+		if (f == 0)
+		{
+			ec.assign(errno, boost::system::get_system_category());
+			return;
+		}
 		while ((ret = fscanf(f, "%s %u\n", string, &value)) != EOF)
 		{
 			if (ret != 2) continue;
@@ -225,6 +237,8 @@ namespace aux {
 			else if (strcmp(string, "pgfault") == 0) vm_stat->faults = value;
 		}
 		fclose(f);
+#else
+		ec = asio::error::operation_not_supported;
 #endif
 // TOOD: windows?
 	}
@@ -267,7 +281,8 @@ namespace aux {
 		tu->system_time = min_time() + microsec(stime / 10);
 #endif
 	}
-#endif //TORRENT_STATS
+		
+#endif // TORRENT_STATS
 
 	struct seed_random_generator
 	{
@@ -314,7 +329,6 @@ namespace aux {
 		TORRENT_SETTING(integer, allowed_fast_set_size)
 		TORRENT_SETTING(integer, suggest_mode)
 		TORRENT_SETTING(integer, max_queued_disk_bytes)
-		TORRENT_SETTING(integer, max_queued_disk_bytes_low_watermark)
 		TORRENT_SETTING(integer, handshake_timeout)
 #ifndef TORRENT_DISABLE_DHT
 		TORRENT_SETTING(boolean, use_dht_as_fallback)
@@ -441,6 +455,10 @@ namespace aux {
 		TORRENT_SETTING(integer, read_job_every)
 		TORRENT_SETTING(boolean, use_disk_read_ahead)
 		TORRENT_SETTING(boolean, lock_files)
+		TORRENT_SETTING(integer, hashing_threads)
+		TORRENT_SETTING(integer, checking_mem_usage)
+		TORRENT_SETTING(integer, predictive_piece_announce)
+		TORRENT_SETTING(boolean, contiguous_recv_buffer)
 		TORRENT_SETTING(integer, ssl_listen)
 		TORRENT_SETTING(integer, tracker_backoff)
 	};
@@ -588,20 +606,22 @@ namespace aux {
 		, std::string const& logpath
 #endif
 		)
-		: m_ipv4_peer_pool(500)
+		: m_num_finished(0)
+		, m_num_downloaders(0)
+		, m_ipv4_peer_pool(500)
 #if TORRENT_USE_IPV6
 		, m_ipv6_peer_pool(500)
 #endif
 #ifndef TORRENT_DISABLE_POOL_ALLOCATOR
 		, m_send_buffers(send_buffer_size)
 #endif
-		, m_files(40)
 		, m_io_service()
 #ifdef TORRENT_USE_OPENSSL
 		, m_ssl_ctx(m_io_service, asio::ssl::context::sslv23)
 #endif
 		, m_alerts(m_io_service, m_settings.alert_queue_size, alert_mask)
-		, m_disk_thread(m_io_service, boost::bind(&session_impl::on_disk_queue, this), m_files)
+		, m_disk_thread(m_io_service
+			, boost::bind(&session_impl::disk_performance_warning, this, _1), this)
 		, m_half_open(m_io_service)
 		, m_download_rate(peer_connection::download_channel)
 #ifdef TORRENT_VERBOSE_BANDWIDTH_LIMIT
@@ -610,6 +630,9 @@ namespace aux {
 		, m_upload_rate(peer_connection::upload_channel)
 #endif
 		, m_tracker_manager(*this, m_proxy)
+		, m_work(io_service::work(m_io_service))
+		, m_max_queue_pos(-1)
+		, m_key(0)
 		, m_listen_port_retries(listen_port_range.second - listen_port_range.first)
 #if TORRENT_USE_I2P
 		, m_i2p_conn(m_io_service)
@@ -625,6 +648,8 @@ namespace aux {
 		, m_auto_scrape_time_scaler(180)
 		, m_next_explicit_cache_torrent(0)
 		, m_cache_rotation_timer(0)
+		, m_next_suggest_torrent(0)
+		, m_suggest_timer(0)
 		, m_peak_up_rate(0)
 		, m_peak_down_rate(0)
 		, m_incoming_connection(false)
@@ -660,6 +685,7 @@ namespace aux {
 #endif
 		, m_total_failed_bytes(0)
 		, m_total_redundant_bytes(0)
+		, m_writing_bytes(0)
 #if (defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS) && defined BOOST_HAS_PTHREADS
 		, m_network_thread(0)
 #endif
@@ -685,6 +711,10 @@ namespace aux {
 		(*m_logger) << time_now_string() << "\n";
 #endif
 
+#if defined TORRENT_REQUEST_LOGGING
+		m_request_logger = fopen("requests.log", "w+");
+#endif
+
 		error_code ec;
 #ifdef TORRENT_USE_OPENSSL
 		m_ssl_ctx.set_verify_mode(asio::ssl::context::verify_none, ec);
@@ -700,7 +730,8 @@ namespace aux {
 		m_next_dht_torrent = m_torrents.begin();
 #endif
 		m_next_lsd_torrent = m_torrents.begin();
-		m_next_connect_torrent = m_torrents.begin();
+		m_next_connect_torrent = 0;
+		m_next_scrape_torrent = 0;
 		m_next_disk_peer = m_connections.begin();
 
 		if (!listen_interface) listen_interface = "0.0.0.0";
@@ -812,6 +843,19 @@ namespace aux {
 		int temp = 0;
 		int prev_size = 0;
 
+		PRINT_SIZEOF(piece_picker::piece_pos)
+
+		PRINT_SIZEOF(cached_piece_entry)
+		PRINT_OFFSETOF(cached_piece_entry, prev)
+		PRINT_OFFSETOF(cached_piece_entry, next)
+		PRINT_OFFSETOF(cached_piece_entry, storage)
+		PRINT_OFFSETOF(cached_piece_entry, hash)
+		PRINT_OFFSETOF(cached_piece_entry, blocks)
+		PRINT_OFFSETOF(cached_piece_entry, jobs)
+		PRINT_OFFSETOF(cached_piece_entry, expire)
+		PRINT_OFFSETOF(cached_piece_entry, refcount)
+		PRINT_OFFSETOF_END(cached_piece_entry)
+
 		PRINT_SIZEOF(announce_entry)
 		PRINT_OFFSETOF(announce_entry, url)
 		PRINT_OFFSETOF(announce_entry, trackerid)
@@ -856,6 +900,26 @@ namespace aux {
 		PRINT_OFFSETOF(internal_file_entry, name)
 		PRINT_OFFSETOF(internal_file_entry, path_index)
 		PRINT_OFFSETOF_END(internal_file_entry)
+
+		PRINT_SIZEOF(disk_io_job)
+		PRINT_OFFSETOF(disk_io_job, next)
+		PRINT_OFFSETOF(disk_io_job, start_time)
+		PRINT_OFFSETOF(disk_io_job, buffer)
+		PRINT_OFFSETOF(disk_io_job, storage)
+		PRINT_OFFSETOF(disk_io_job, callback)
+		PRINT_OFFSETOF(disk_io_job, error.ec)
+//		PRINT_OFFSETOF(disk_io_job, error.file)
+//		PRINT_OFFSETOF(disk_io_job, error.operation)
+		PRINT_OFFSETOF(disk_io_job, d.io.ref.storage)
+		PRINT_OFFSETOF(disk_io_job, d.io.ref.piece)
+		PRINT_OFFSETOF(disk_io_job, d.io.ref.block)
+		PRINT_OFFSETOF(disk_io_job, d.io.offset)
+		PRINT_OFFSETOF(disk_io_job, d.io.buffer_size)
+		PRINT_OFFSETOF(disk_io_job, d.io.max_cache_line)
+//		PRINT_OFFSETOF(disk_io_job, piece)
+//		PRINT_OFFSETOF(disk_io_job, action)
+		PRINT_OFFSETOF(disk_io_job, flags)
+		PRINT_OFFSETOF_END(disk_io_job)
 
 		PRINT_SIZEOF(file_storage)
 		PRINT_OFFSETOF(file_storage, m_files)
@@ -904,8 +968,6 @@ namespace aux {
 		PRINT_OFFSETOF(policy::peer, last_optimistically_unchoked)
 		PRINT_OFFSETOF(policy::peer, last_connected)
 		PRINT_OFFSETOF(policy::peer, port)
-		PRINT_OFFSETOF(policy::peer, upload_rate_limit)
-		PRINT_OFFSETOF(policy::peer, download_rate_limit)
 		PRINT_OFFSETOF(policy::peer, hashfails)
 		PRINT_OFFSETOF_END(policy::peer)
 
@@ -1004,7 +1066,9 @@ namespace aux {
 		m_stats_logging_enabled = true;
 
 		memset(&m_last_cache_status, 0, sizeof(m_last_cache_status));
-		get_vm_stats(&m_last_vm_stat);
+		vm_statistics_data_t vst;
+		get_vm_stats(&vst, ec);
+		if (!ec) m_last_vm_stat = vst;
 
 		m_last_failed = 0;
 		m_last_redundant = 0;
@@ -1015,13 +1079,13 @@ namespace aux {
 		reset_stat_counters();
 		rotate_stats_log();
 #endif
-#ifdef TORRENT_DISK_STATS
+#ifdef TORRENT_BUFFER_STATS
 		m_buffer_usage_logger.open("buffer_stats.log", std::ios::trunc);
 		m_buffer_allocations = 0;
 #endif
 
-#if defined TORRENT_BSD || defined TORRENT_LINUX
-		// ---- auto-cap open files ----
+#if TORRENT_USE_RLIMIT
+		// ---- auto-cap max connections ----
 
 		struct rlimit rl;
 		if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
@@ -1029,22 +1093,20 @@ namespace aux {
 #if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_LOGGING || defined TORRENT_ERROR_LOGGING
 			(*m_logger) << time_now_string() << " max number of open files: " << rl.rlim_cur << "\n";
 #endif
-
 			// deduct some margin for epoll/kqueue, log files,
 			// futexes, shared objects etc.
 			rl.rlim_cur -= 20;
 
-			// 80% of the available file descriptors should go
+			// 80% of the available file descriptors should go to connections
 			m_settings.connections_limit = (std::min)(m_settings.connections_limit
 				, int(rl.rlim_cur * 8 / 10));
-			// 20% goes towards regular files
-			m_files.resize((std::min)(m_files.size_limit(), int(rl.rlim_cur * 2 / 10)));
+			// 20% goes towards regular files (see disk_io_thread)
 #if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_LOGGING || defined TORRENT_ERROR_LOGGING
 			(*m_logger) << time_now_string() << "   max connections: " << m_settings.connections_limit << "\n";
-			(*m_logger) << time_now_string() << "   max files: " << m_files.size_limit() << "\n";
+			(*m_logger) << time_now_string() << "   max files: " << int(rl.rlim_cur * 2 / 10) << "\n";
 #endif
 		}
-#endif // TORRENT_BSD || TORRENT_LINUX
+#endif // TORRENT_USE_RLIMIT
 
 
 		// ---- generate a peer id ----
@@ -1115,35 +1177,67 @@ namespace aux {
 		create_directory("session_stats", ec);
 		snprintf(filename, sizeof(filename), "session_stats/%d.%04d.log", int(getpid()), m_log_seq);
 		m_stats_logger = fopen(filename, "w+");
+		m_last_log_rotation = time_now();
 		if (m_stats_logger == 0)
 		{
 			fprintf(stderr, "Failed to create session stats log file \"%s\": (%d) %s\n"
 				, filename, errno, strerror(errno));
 			return;
 		}
-		m_last_log_rotation = time_now();
 			
-		fputs("second:uploaded bytes:downloaded bytes:downloading torrents:seeding torrents"
-			":peers:connecting peers:disk block buffers:num list peers"
-			":peer allocations:peer storage bytes"
+		fputs("second"
+			":uploaded bytes"
+			":downloaded bytes"
+			":downloading torrents"
+			":seeding torrents"
+			":peers"
+			":connecting peers"
+			":disk block buffers"
+			":num list peers"
+			":peer allocations"
+			":peer storage bytes"
 			":checking torrents"
 			":stopped torrents"
 			":upload-only torrents"
 			":queued seed torrents"
 			":queued download torrents"
-			":peers bw-up:peers bw-down:peers disk-up:peers disk-down"
-			":upload rate:download rate:disk write queued bytes"
-			":peers down 0:peers down 0-2:peers down 2-5:peers down 5-10:peers down 10-50"
-			":peers down 50-100:peers down 100-"
-			":peers up 0:peers up 0-2:peers up 2-5:peers up 5-10:peers up 10-50:peers up 50-100"
-			":peers up 100-:error peers"
-			":peers down interesting:peers down unchoked:peers down requests"
-			":peers up interested:peers up unchoked:peers up requests"
-			":peer disconnects:peers eof:peers connection reset"
-			":outstanding requests:outstanding end-game requests"
+			":peers bw-up"
+			":peers bw-down"
+			":peers disk-up"
+			":peers disk-down"
+			":upload rate"
+			":download rate"
+			":disk write queued bytes"
+			":peers down 0"
+			":peers down 0-2"
+			":peers down 2-5"
+			":peers down 5-10"
+			":peers down 10-50"
+			":peers down 50-100"
+			":peers down 100-"
+			":peers up 0"
+			":peers up 0-2"
+			":peers up 2-5"
+			":peers up 5-10"
+			":peers up 10-50"
+			":peers up 50-100"
+			":peers up 100-"
+			":error peers"
+			":peers down interesting"
+			":peers down unchoked"
+			":peers down requests"
+			":peers up interested"
+			":peers up unchoked"
+			":peers up requests"
+			":peer disconnects"
+			":peers eof"
+			":peers connection reset"
+			":outstanding requests"
+			":outstanding end-game requests"
 			":outstanding writing blocks"
 			":end game piece picker blocks"
 			":piece picker blocks"
+			":piece picker loops"
 			":piece picks"
 			":reject piece picks"
 			":unchoke piece picks"
@@ -1161,7 +1255,7 @@ namespace aux {
 			":disk write time"
 			":disk queue time"
 			":disk queue size"
-			":disk queued bytes"
+			":queued disk bytes"
 			":read cache hits"
 			":disk block read"
 			":disk block written"
@@ -1174,25 +1268,25 @@ namespace aux {
 			":disk hash time"
 			":disk job time"
 			":disk sort time"
+			":disk issue time"
 			":connection attempts"
 			":banned peers"
 			":banned for hash failure"
 			":cache size"
 			":max connections"
 			":connect candidates"
-			":disk queue limit"
-			":disk queue low watermark"
+			":cache trim low watermark"
 			":% read time"
 			":% write time"
 			":% hash time"
 			":% sort time"
+			":% issue time"
 			":disk read back"
 			":% read back"
 			":disk read queue size"
 			":tick interval"
 			":tick residual"
 			":max unchoked"
-			":read job queue size limit"
 			":smooth upload rate"
 			":smooth download rate"
 			":num end-game peers"
@@ -1217,6 +1311,16 @@ namespace aux {
 			":page faults"
 			":smooth read ops/s"
 			":smooth write ops/s"
+			":pinned blocks"
+			":num partial pieces"
+			":num downloading partial pieces"
+			":num full partial pieces"
+			":num finished partial pieces"
+			":completed aio jobs"
+			":in progress aio jobs"
+			":allocated jobs"
+			":allocated read jobs"
+			":allocated write jobs"
 			":pending reading bytes"
 			":read_counter"
 			":write_counter"
@@ -1226,8 +1330,7 @@ namespace aux {
 			":udp_counter"
 			":accept_counter"
 			":disk_queue_counter"
-			":disk_read_counter"
-			":disk_write_counter"
+			":disk_counter"
 			":up 8:up 16:up 32:up 64:up 128:up 256:up 512:up 1024:up 2048:up 4096:up 8192:up 16384:up 32768:up 65536:up 131072:up 262144:up 524288:up 1048576"
 			":down 8:down 16:down 32:down 64:down 128:down 256:down 512:down 1024:down 2048:down 4096:down 8192:down 16384:down 32768:down 65536:down 131072:down 262144:down 524288:down 1048576"
 			":network thread system time"
@@ -1242,6 +1345,12 @@ namespace aux {
 			":no memory peer errors"
 			":too many peers"
 			":transport timeout peers"
+			
+			":arc LRU pieces"
+			":arc LRU ghost pieces"
+			":arc LFU pieces"
+			":arc LFU ghost pieces"
+
 			":uTP idle"
 			":uTP syn-sent"
 			":uTP connected"
@@ -1486,7 +1595,7 @@ namespace aux {
 
  		if (m_settings.connection_speed < 0) m_settings.connection_speed = 200;
 
-		update_disk_thread_settings();
+		m_disk_thread.set_settings(m_settings);
 
 		settings = e->dict_find_list("feeds");
 		if (settings)
@@ -1728,7 +1837,7 @@ namespace aux {
 		{
 			torrent& t = *i->second;
 			t.do_resume();
-			if (t.should_check_files()) t.queue_torrent_check();
+			if (t.should_check_files()) t.start_checking();
 		}
 	}
 	
@@ -1746,7 +1855,6 @@ namespace aux {
 #if TORRENT_USE_I2P
 		m_i2p_conn.close(ec);
 #endif
-		m_queued_for_checking.clear();
 		stop_lsd();
 		stop_upnp();
 		stop_natpmp();
@@ -1758,7 +1866,6 @@ namespace aux {
 		}
 		m_dht_announce_timer.cancel(ec);
 #endif
-		m_timer.cancel(ec);
 		m_lsd_announce_timer.cancel(ec);
 
 		// close the listen sockets
@@ -1840,6 +1947,33 @@ namespace aux {
 		m_disk_thread.abort();
 	}
 
+	void get_cache_info_done(int ret, mutex* m, condition* e, bool* done)
+	{
+		mutex::scoped_lock l(*m);
+		*done = true;
+		e->signal_all(l);
+	}
+
+	// #error should this be a function on torrent_handle?
+	void session_impl::get_cache_info(sha1_hash const& ih, cache_status* ret
+		, int flags, bool* done, condition* e, mutex* m)
+	{
+		boost::shared_ptr<torrent> t = find_torrent(ih).lock();
+		if (!t || !t->valid_storage())
+		{
+			*ret = cache_status();
+			get_cache_info_done(0, m, e, done);
+			return;
+		}
+		piece_manager* st = &t->filesystem();
+		disk_io_job* j = m_disk_thread.aiocbs()->allocate_job(disk_io_job::get_cache_info);
+		j->storage = st;
+		j->buffer = (char*)ret;
+		j->flags = (flags & session::disk_cache_no_pieces) ? disk_io_job::no_pieces : 0;
+		j->callback = boost::bind(&get_cache_info_done, _1, m, e, done);
+		m_disk_thread.add_job(j);
+	}
+
 	void session_impl::set_port_filter(port_filter const& f)
 	{
 		m_port_filter = f;
@@ -1862,14 +1996,6 @@ namespace aux {
 	ip_filter const& session_impl::get_ip_filter() const
 	{
 		return m_ip_filter;
-	}
-
-	void session_impl::update_disk_thread_settings()
-	{
-		disk_io_job j;
-		j.buffer = (char*)new session_settings(m_settings);
-		j.action = disk_io_job::update_settings;
-		m_disk_thread.add_job(j);
 	}
 
 	void session_impl::set_settings(session_settings const& s)
@@ -1895,7 +2021,6 @@ namespace aux {
 			|| m_settings.coalesce_writes != s.coalesce_writes
 			|| m_settings.coalesce_reads != s.coalesce_reads
 			|| m_settings.max_queued_disk_bytes != s.max_queued_disk_bytes
-			|| m_settings.max_queued_disk_bytes_low_watermark != s.max_queued_disk_bytes_low_watermark
 			|| m_settings.disable_hash_checks != s.disable_hash_checks
 			|| m_settings.explicit_read_cache != s.explicit_read_cache
 #ifndef TORRENT_DISABLE_MLOCK
@@ -1911,7 +2036,9 @@ namespace aux {
 			|| m_settings.ignore_resume_timestamps != s.ignore_resume_timestamps
 			|| m_settings.no_recheck_incomplete_resume != s.no_recheck_incomplete_resume
 			|| m_settings.low_prio_disk != s.low_prio_disk
-			|| m_settings.lock_files != s.lock_files)
+			|| m_settings.lock_files != s.lock_files
+			|| m_settings.mmap_cache != s.mmap_cache
+			|| m_settings.hashing_threads != s.hashing_threads)
 			update_disk_io_thread = true;
 
 		bool connections_limit_changed = m_settings.connections_limit != s.connections_limit;
@@ -2003,6 +2130,9 @@ namespace aux {
 		if (m_settings.dht_upload_rate_limit != s.dht_upload_rate_limit)
 			m_udp_socket.set_rate_limit(s.dht_upload_rate_limit);
 
+		if (m_settings.network_threads != s.network_threads)
+			m_net_thread_pool.set_num_threads(s.network_threads);
+
 		if (m_settings.peer_tos != s.peer_tos)
 		{
 			error_code ec;
@@ -2044,7 +2174,7 @@ namespace aux {
  		if (m_settings.connection_speed < 0) m_settings.connection_speed = 200;
  
 		if (update_disk_io_thread)
-			update_disk_thread_settings();
+			m_disk_thread.set_settings(m_settings);
 
 		if (m_settings.num_optimistic_unchoke_slots >= m_allowed_upload_slots / 2)
 		{
@@ -2856,10 +2986,16 @@ namespace aux {
 		incoming_connection(s);
 	}
 
-	void session_impl::close_connection(peer_connection const* p
+	void session_impl::close_connection(peer_connection* p
 		, error_code const& ec)
 	{
 		TORRENT_ASSERT(is_network_thread());
+
+		// someone else is holding a reference, it's important that
+		// it's destructed from the network thread. Make sure the
+		// last reference is held by the network thread.
+		if (p->refcount() > 1)
+			m_undead_peers.push_back(boost::intrusive_ptr<peer_connection>(p));
 
 // too expensive
 //		INVARIANT_CHECK;
@@ -2886,6 +3022,13 @@ namespace aux {
 		if (m_next_disk_peer == i) ++m_next_disk_peer;
 		if (i != m_connections.end()) m_connections.erase(i);
 		if (m_next_disk_peer == m_connections.end()) m_next_disk_peer = m_connections.begin();
+	}
+
+	void session_impl::disk_performance_warning(alert* a)
+	{
+		if (m_alerts.should_post(a))
+			m_alerts.post_alert(*a);
+		delete a;
 	}
 
 	void session_impl::set_peer_id(peer_id const& id)
@@ -2932,40 +3075,6 @@ namespace aux {
 		return port;
 	}
 
-	// this function is called from the disk-io thread
-	// when the disk queue is low enough to post new
-	// write jobs to it. It will go through all peer
-	// connections that are blocked on the disk and
-	// wake them up
-	void session_impl::on_disk_queue()
-	{
-#ifdef TORRENT_STATS
-		++m_num_messages[on_disk_queue_counter];
-#endif
-		TORRENT_ASSERT(is_network_thread());
-
-		// just to play it safe
-		if (m_next_disk_peer == m_connections.end()) m_next_disk_peer = m_connections.begin();
-
-		// never loop more times than there are connections
-		// keep in mind that connections may disconnect
-		// while we're looping, that's why this is a reliable
-		// way of limiting it
-		int limit = m_connections.size();
-
-		while (m_next_disk_peer != m_connections.end() && limit > 0 && can_write_to_disk())
-		{
-			--limit;
-			peer_connection* p = m_next_disk_peer->get();
-			++m_next_disk_peer;
-			if (m_next_disk_peer == m_connections.end()) m_next_disk_peer = m_connections.begin();
-			if ((p->m_channel_state[peer_connection::download_channel]
-				& peer_info::bw_disk) == 0) continue;
-			p->on_disk();
-		}
-
-	}
-
 	// used to cache the current time
 	// every 100 ms. This is cheaper
 	// than a system call and can be
@@ -2989,6 +3098,9 @@ namespace aux {
 
 		TORRENT_ASSERT(is_network_thread());
 
+		// submit all disk jobs when we leave this function
+		deferred_submit_jobs sj(m_disk_thread);
+
 		ptime now = time_now_hires();
 		aux::g_current_time = now;
 // too expensive
@@ -3000,12 +3112,13 @@ namespace aux {
 
 		// we have to keep ticking the utp socket manager
 		// until they're all closed
-		if (m_abort && m_utp_socket_manager.num_sockets() == 0)
+		if (m_abort)
 		{
+			if (m_utp_socket_manager.num_sockets() == 0)
+				return;
 #if defined TORRENT_ASIO_DEBUGGING
 			fprintf(stderr, "uTP sockets left: %d\n", m_utp_socket_manager.num_sockets());
 #endif
-			return;
 		}
 
 		if (e == asio::error::operation_aborted) return;
@@ -3035,6 +3148,11 @@ namespace aux {
 
 		// only tick the following once per second
 		if (now - m_last_second_tick < seconds(1)) return;
+
+		// remove undead peers that only have this list as their reference keeping them alive
+		std::vector<intrusive_ptr<peer_connection> >::iterator i = std::remove_if(
+			m_undead_peers.begin(), m_undead_peers.end(), boost::bind(&peer_connection::refcount, _1) < 2);
+		m_undead_peers.erase(i, m_undead_peers.end());
 
 		int tick_interval_ms = total_milliseconds(now - m_last_second_tick);
 		m_last_second_tick = now;
@@ -3169,78 +3287,24 @@ namespace aux {
 		}
 
 		// --------------------------------------------------------------
-		// second_tick every torrent
+		// second_tick every torrent (that wants it)
 		// --------------------------------------------------------------
 
-		int congested_torrents = 0;
-		int uncongested_torrents = 0;
-
-		// count the number of seeding torrents vs. downloading
-		// torrents we are running
-		int num_seeds = 0;
-		int num_downloads = 0;
-
-		// count the number of peers of downloading torrents
-		int num_downloads_peers = 0;
-
-		torrent_map::iterator least_recently_scraped = m_torrents.end();
-		int num_paused_auto_managed = 0;
-
-		int num_checking = 0;
-		int num_queued = 0;
-		for (torrent_map::iterator i = m_torrents.begin();
-			i != m_torrents.end();)
+		std::vector<torrent*>& want_tick = m_torrent_lists[torrent_want_tick];
+		for (int i = 0; i < int(want_tick.size()); ++i)
 		{
-			torrent& t = *i->second;
+			torrent& t = *want_tick[i];
+			TORRENT_ASSERT(t.want_tick());
 			TORRENT_ASSERT(!t.is_aborted());
-			if (t.statistics().upload_rate() * 11 / 10 > t.upload_limit())
-				++congested_torrents;
-			else
-				++uncongested_torrents;
 
-			if (t.state() == torrent_status::checking_files) ++num_checking;
-			else if (t.state() == torrent_status::queued_for_checking && !t.is_paused()) ++num_queued;
-
-			if (t.is_auto_managed() && t.is_paused() && !t.has_error())
-			{
-				++num_paused_auto_managed;
-				if (least_recently_scraped == m_torrents.end()
-					|| least_recently_scraped->second->seconds_since_last_scrape()
-						< t.seconds_since_last_scrape())
-				{
-					least_recently_scraped = i;
-				}
-			}
-
-			if (t.is_finished())
-			{
-				++num_seeds;
-			}
-			else
-			{
-				++num_downloads;
-				num_downloads_peers += t.num_peers();
-			}
-
+			size_t size = want_tick.size();
 			t.second_tick(m_stat, tick_interval_ms);
-			++i;
-		}
 
-		// some people claim that there sometimes can be cases where
-		// there is no torrent being checked, but there are torrents
-		// waiting to be checked. I have never seen this, and I can't 
-		// see a way for it to happen. But, if it does, start one of
-		// the queued torrents
-		if (num_checking == 0 && num_queued > 0 && !m_paused)
-		{
-			TORRENT_ASSERT(false);
-			check_queue_t::iterator i = std::min_element(m_queued_for_checking.begin()
-				, m_queued_for_checking.end(), boost::bind(&torrent::queue_position, _1)
-				< boost::bind(&torrent::queue_position, _2));
-			if (i != m_queued_for_checking.end())
-			{
-				(*i)->start_checking();
-			}
+			// if the call to second_tick caused the torrent
+			// to no longer want to be ticked (i.e. it was
+			// removed from the list) we need to back up the counter
+			// to not miss the torrent after it
+			if (size > want_tick.size()) --i;
 		}
 
 #ifndef TORRENT_DISABLE_DHT
@@ -3293,12 +3357,7 @@ namespace aux {
 	
 		m_stat.second_tick(tick_interval_ms);
 
-		TORRENT_ASSERT(least_recently_scraped == m_torrents.end()
-			|| (least_recently_scraped->second->is_paused()
-			&& least_recently_scraped->second->is_auto_managed()));
-
 #ifdef TORRENT_STATS
-
 		if (m_stats_logging_enabled)
 		{
 			print_log_line(tick_interval_ms, now);
@@ -3314,16 +3373,48 @@ namespace aux {
 			--m_auto_scrape_time_scaler;
 			if (m_auto_scrape_time_scaler <= 0)
 			{
+				std::vector<torrent*>& want_scrape = m_torrent_lists[torrent_want_scrape];
 				m_auto_scrape_time_scaler = m_settings.auto_scrape_interval
-					/ (std::max)(1, num_paused_auto_managed);
+					/ (std::max)(1, int(want_scrape.size()));
 				if (m_auto_scrape_time_scaler < m_settings.auto_scrape_min_interval)
 					m_auto_scrape_time_scaler = m_settings.auto_scrape_min_interval;
 
-				if (least_recently_scraped != m_torrents.end())
+				if (!want_scrape.empty() && !m_abort)
 				{
-					least_recently_scraped->second->scrape_tracker();
+					if (m_next_scrape_torrent >= int(want_scrape.size()))
+						m_next_scrape_torrent = 0;
+
+					torrent& t = *want_scrape[m_next_scrape_torrent];
+					TORRENT_ASSERT(t.is_paused() && t.is_auto_managed());
+
+					t.scrape_tracker();
+
+					++m_next_scrape_torrent;
+					if (m_next_scrape_torrent >= int(want_scrape.size()))
+						m_next_scrape_torrent = 0;
+
 				}
 			}
+		}
+
+		// --------------------------------------------------------------
+		// refresh torrent suggestions
+		// --------------------------------------------------------------
+		--m_suggest_timer;
+		if (m_settings.suggest_mode != session_settings::no_piece_suggestions
+			&& m_suggest_timer <= 0)
+		{
+			m_suggest_timer = 10;
+
+			torrent_map::iterator least_recently_refreshed = m_torrents.begin();
+			if (m_next_suggest_torrent >= int(m_torrents.size()))
+				m_next_suggest_torrent = 0;
+
+			std::advance(least_recently_refreshed, m_next_suggest_torrent);
+
+			if (least_recently_refreshed != m_torrents.end())
+				least_recently_refreshed->second->refresh_suggest_pieces();
+			++m_next_suggest_torrent;
 		}
 
 		// --------------------------------------------------------------
@@ -3374,7 +3465,11 @@ namespace aux {
 		// equally likely to connect to a peer
 
 		int free_slots = m_half_open.free_slots();
+
+		// this is the maximum number of connections we will
+		// attempt this tick
 		int max_connections = m_settings.connection_speed;
+
 		// boost connections are connections made by torrent connection
 		// boost, which are done immediately on a tracker response. These
 		// connections needs to be deducted from this second
@@ -3399,7 +3494,8 @@ namespace aux {
 		if (m_settings.smooth_connects && max_connections > (limit+1) / 2)
 			max_connections = (limit+1) / 2;
 
-		if (!m_torrents.empty()
+		std::vector<torrent*>& want_peers = m_torrent_lists[torrent_want_peers];
+		if (!want_peers.empty()
 			&& free_slots > -m_half_open.limit()
 			&& num_connections() < m_settings.connections_limit
 			&& !m_abort
@@ -3408,19 +3504,25 @@ namespace aux {
 		{
 			// this is the maximum number of connections we will
 			// attempt this tick
+			// approximate the average number of peers per torrent
+			// as the total number of connections divided by the
+			// number of torrents that are interested in connecting
+			// to more peers (i.e. not idle)
 			int average_peers = 0;
-			if (num_downloads > 0)
-				average_peers = num_downloads_peers / num_downloads;
+			if (want_peers.size() > 0)
+				average_peers = m_connections.size() / want_peers.size();
 
-			if (m_next_connect_torrent == m_torrents.end())
-				m_next_connect_torrent = m_torrents.begin();
+			if (m_next_connect_torrent >= int(want_peers.size()))
+				m_next_connect_torrent = 0;
 
 			int steps_since_last_connect = 0;
-			int num_torrents = int(m_torrents.size());
+			int num_torrents = int(want_peers.size());
 			for (;;)
 			{
-				torrent& t = *m_next_connect_torrent->second;
-				if (t.want_more_peers())
+				torrent& t = *want_peers[m_next_connect_torrent];
+				TORRENT_ASSERT(t.want_more_peers());
+
+				TORRENT_TRY
 				{
 					// have a bias to give more connection attempts
 					// to downloading torrents than seed, and even
@@ -3461,12 +3563,22 @@ namespace aux {
 						if (num_connections() >= m_settings.connections_limit) break;
 					}
 				}
+				TORRENT_CATCH(std::bad_alloc&)
+				{
+					// we ran out of memory trying to connect to a peer
+					// lower the global limit to the number of peers
+					// we already have
+					m_settings.connections_limit = num_connections();
+					if (m_settings.connections_limit < 2) m_settings.connections_limit = 2;
+				}
 
 				++m_next_connect_torrent;
 				++steps_since_last_connect;
-				if (m_next_connect_torrent == m_torrents.end())
-					m_next_connect_torrent = m_torrents.begin();
+				if (m_next_connect_torrent >= int(want_peers.size()))
+					m_next_connect_torrent = 0;
 
+				// there are no more torrents that want peers
+				if (want_peers.empty()) break;
 				// if we have gone a whole loop without
 				// handing out a single connection, break
 				if (steps_since_last_connect > num_torrents + 1) break;
@@ -3487,8 +3599,7 @@ namespace aux {
 		if (m_unchoke_time_scaler <= 0 && !m_connections.empty())
 		{
 			m_unchoke_time_scaler = settings().unchoke_interval;
-			recalculate_unchoke_slots(congested_torrents
-				, uncongested_torrents);
+			recalculate_unchoke_slots();
 		}
 
 		// --------------------------------------------------------------
@@ -3551,7 +3662,7 @@ namespace aux {
 	}
 
 #ifdef TORRENT_STATS
-		
+
 	void session_impl::enable_stats_logging(bool s)
 	{
 		if (m_stats_logging_enabled == s) return;
@@ -3575,6 +3686,7 @@ namespace aux {
 	{
 		m_end_game_piece_picker_blocks = 0;
 		m_piece_picker_blocks = 0;
+		m_piece_picker_loops = 0;
 		m_piece_picks = 0;
 		m_reject_piece_picks = 0;
 		m_unchoke_piece_picks = 0;
@@ -3626,6 +3738,11 @@ namespace aux {
 		int peers_down_requests = 0;
 		int peers_up_send_buffer = 0;
 
+		int partial_pieces = 0;
+		int partial_downloading_pieces = 0;
+		int partial_full_pieces = 0;
+		int partial_finished_pieces = 0;
+
 		// number of torrents that want more peers
 		int num_want_more_peers = 0;
 
@@ -3639,6 +3756,7 @@ namespace aux {
 			, end(m_torrents.end()); i != end; ++i)
 		{
 			torrent* t = i->second.get();
+
 			int connection_slots = (std::max)(t->max_connections() - t->num_peers(), 0);
 			int candidates = t->get_policy().num_connect_candidates();
 			connect_candidates += (std::min)(candidates, connection_slots);
@@ -3681,8 +3799,19 @@ namespace aux {
 				}
 			}
 
+			if (t->has_picker())
+			{
+				piece_picker& p = t->picker();
+				partial_pieces += p.get_download_queue_size();
+				int a, b, c;
+				p.get_download_queue_sizes(&a, &b, &c);
+				partial_downloading_pieces += a;
+				partial_full_pieces += b;
+				partial_finished_pieces += c;
+			}
+
 			dq.clear();
-			i->second->get_download_queue(&dq);
+			t->get_download_queue(&dq);
 			for (std::vector<partial_piece_info>::iterator j = dq.begin()
 				, end(dq.end()); j != end; ++j)
 			{
@@ -3805,23 +3934,20 @@ namespace aux {
 
 		}
 
-		int low_watermark = m_settings.max_queued_disk_bytes_low_watermark == 0
-			|| m_settings.max_queued_disk_bytes_low_watermark >= m_settings.max_queued_disk_bytes
-			? size_type(m_settings.max_queued_disk_bytes) * 7 / 8
-			: m_settings.max_queued_disk_bytes_low_watermark;
-
 		if (now - m_last_log_rotation > hours(1))
 			rotate_stats_log();
 
 		// system memory stats
+		error_code vm_ec;
 		vm_statistics_data_t vm_stat;
-		get_vm_stats(&vm_stat);
+		get_vm_stats(&vm_stat, vm_ec);
 		thread_cpu_usage cur_cpu_usage;
 		get_thread_cpu_usage(&cur_cpu_usage);
 
 		if (m_stats_logger)
 		{
-			cache_status cs = m_disk_thread.status();
+			cache_status cs;
+			m_disk_thread.get_disk_metrics(cs);
 			session_status sst = status();
 
 			m_read_ops.add_sample((cs.reads - m_last_cache_status.reads) * 1000.0 / float(tick_interval_ms));
@@ -3840,7 +3966,7 @@ namespace aux {
 			STAT_LOG(d, seeding_torrents);
 			STAT_LOG(d, num_complete_connections);
 			STAT_LOG(d, num_half_open);
-			STAT_LOG(d, m_disk_thread.disk_allocations());
+			STAT_LOG(d, cs.total_used_buffers);
 			STAT_LOG(d, num_peers);
 			STAT_LOG(d, logging_allocator::allocations);
 			STAT_LOG(d, logging_allocator::allocated_bytes);
@@ -3855,7 +3981,7 @@ namespace aux {
 			STAT_LOG(d, m_disk_queues[peer_connection::download_channel]);
 			STAT_LOG(d, m_stat.upload_rate());
 			STAT_LOG(d, m_stat.download_rate());
-			STAT_LOG(d, int(m_disk_thread.queue_buffer_size()));
+			STAT_LOG(d, int(m_writing_bytes));
 			STAT_LOG(d, peer_dl_rate_buckets[0]);
 			STAT_LOG(d, peer_dl_rate_buckets[1]);
 			STAT_LOG(d, peer_dl_rate_buckets[2]);
@@ -3885,6 +4011,7 @@ namespace aux {
 			STAT_LOG(d, outstanding_write_blocks);
 			STAT_LOG(d, m_end_game_piece_picker_blocks);
 			STAT_LOG(d, m_piece_picker_blocks);
+			STAT_LOG(d, m_piece_picker_loops);
 			STAT_LOG(d, m_piece_picks);
 			STAT_LOG(d, m_reject_piece_picks);
 			STAT_LOG(d, m_unchoke_piece_picks);
@@ -3901,7 +4028,7 @@ namespace aux {
 			STAT_LOG(f, float(cs.average_read_time) / 1000000.f);
 			STAT_LOG(f, float(cs.average_write_time) / 1000000.f);
 			STAT_LOG(f, float(cs.average_queue_time) / 1000000.f);
-			STAT_LOG(d, int(cs.job_queue_length));
+			STAT_LOG(d, int(cs.pending_jobs + cs.queued_jobs));
 			STAT_LOG(d, int(cs.queued_bytes));
 			STAT_LOG(d, int(cs.blocks_read_hit - m_last_cache_status.blocks_read_hit));
 			STAT_LOG(d, int(cs.blocks_read - m_last_cache_status.blocks_read));
@@ -3910,30 +4037,30 @@ namespace aux {
 			STAT_LOG(d, int(m_total_redundant_bytes - m_last_redundant));
 			STAT_LOG(d, error_torrents);
 			STAT_LOG(d, cs.read_cache_size);
-			STAT_LOG(d, cs.cache_size);
+			STAT_LOG(d, cs.write_cache_size + cs.read_cache_size);
 			STAT_LOG(d, cs.total_used_buffers);
 			STAT_LOG(f, float(cs.average_hash_time) / 1000000.f);
 			STAT_LOG(f, float(cs.average_job_time) / 1000000.f);
 			STAT_LOG(f, float(cs.average_sort_time) / 1000000.f);
+			STAT_LOG(f, float(cs.average_issue_time) / 1000000.f);
 			STAT_LOG(d, m_connection_attempts);
 			STAT_LOG(d, m_num_banned_peers);
 			STAT_LOG(d, m_banned_for_hash_failure);
 			STAT_LOG(d, m_settings.cache_size);
 			STAT_LOG(d, m_settings.connections_limit);
 			STAT_LOG(d, connect_candidates);
-			STAT_LOG(d, int(m_settings.max_queued_disk_bytes));
-			STAT_LOG(d, low_watermark);
+			STAT_LOG(d, int(m_settings.cache_size - m_settings.max_queued_disk_bytes / 0x4000));
 			STAT_LOG(f, float(cs.cumulative_read_time * 100.f / total_job_time));
 			STAT_LOG(f, float(cs.cumulative_write_time * 100.f / total_job_time));
 			STAT_LOG(f, float(cs.cumulative_hash_time * 100.f / total_job_time));
 			STAT_LOG(f, float(cs.cumulative_sort_time * 100.f / total_job_time));
+			STAT_LOG(f, float(cs.cumulative_issue_time * 100.f / total_job_time));
 			STAT_LOG(d, int(cs.total_read_back - m_last_cache_status.total_read_back));
 			STAT_LOG(f, float(cs.total_read_back * 100.f / (cs.blocks_written == 0 ? 1: cs.blocks_written)));
 			STAT_LOG(d, cs.read_queue_size);
 			STAT_LOG(f, float(tick_interval_ms) / 1000.f);
 			STAT_LOG(f, float(m_tick_residual) / 1000.f);
 			STAT_LOG(d, m_allowed_upload_slots);
-			STAT_LOG(d, m_settings.unchoke_slots_limit * 2);
 			STAT_LOG(d, m_stat.low_pass_upload_rate());
 			STAT_LOG(d, m_stat.low_pass_download_rate());
 			STAT_LOG(d, num_end_game_peers);
@@ -3960,6 +4087,19 @@ namespace aux {
 
 			STAT_LOG(d, m_read_ops.mean());
 			STAT_LOG(d, m_write_ops.mean());
+			STAT_LOG(d, cs.pinned_blocks);
+
+			STAT_LOG(d, partial_pieces);
+			STAT_LOG(d, partial_downloading_pieces);
+			STAT_LOG(d, partial_full_pieces);
+			STAT_LOG(d, partial_finished_pieces);
+
+			STAT_LOG(d, int(cs.cumulative_completed_aiocbs - m_last_cache_status.cumulative_completed_aiocbs));
+			STAT_LOG(d, cs.num_aiocb);
+
+			STAT_LOG(d, cs.num_jobs);
+			STAT_LOG(d, cs.num_read_jobs);
+			STAT_LOG(d, cs.num_write_jobs);
 
 			STAT_LOG(d, reading_bytes);
 
@@ -3986,6 +4126,11 @@ namespace aux {
 			STAT_LOG(d, m_no_memory_peers);
 			STAT_LOG(d, m_too_many_peers);
 			STAT_LOG(d, m_transport_timeout_peers);
+
+			STAT_LOG(d, cs.arc_mru_size);
+			STAT_LOG(d, cs.arc_mru_size + cs.arc_mru_ghost_size);
+			STAT_LOG(d, -cs.arc_mfu_size);
+			STAT_LOG(d, -cs.arc_mfu_size - cs.arc_mfu_ghost_size);
 
 			STAT_LOG(d, sst.utp_stats.num_idle);
 			STAT_LOG(d, sst.utp_stats.num_syn_sent);
@@ -4035,7 +4180,7 @@ namespace aux {
 #undef STAT_LOG
 
 			m_last_cache_status = cs;
-			m_last_vm_stat = vm_stat;
+			if (!vm_ec) m_last_vm_stat = vm_stat;
 			m_network_thread_cpu_usage = cur_cpu_usage;
 			m_last_failed = m_total_failed_bytes;
 			m_last_redundant = m_total_redundant_bytes;
@@ -4153,17 +4298,25 @@ namespace aux {
 	}
 	
 	void session_impl::auto_manage_torrents(std::vector<torrent*>& list
-		, int& dht_limit, int& tracker_limit, int& lsd_limit
-		, int& hard_limit, int type_limit)
+		, int& checking_limit, int& dht_limit, int& tracker_limit
+		, int& lsd_limit, int& hard_limit, int type_limit)
 	{
 		for (std::vector<torrent*>::iterator i = list.begin()
 			, end(list.end()); i != end; ++i)
 		{
 			torrent* t = *i;
 
-			if ((t->state() == torrent_status::checking_files
-				|| t->state() == torrent_status::queued_for_checking))
+			if (t->state() == torrent_status::checking_files)
+			{
+				if (checking_limit <= 0) t->pause();
+				else
+				{
+					t->resume();
+					t->start_checking();
+					--checking_limit;
+				}
 				continue;
+			}
 
 			--dht_limit;
 			--lsd_limit;
@@ -4183,14 +4336,14 @@ namespace aux {
 			{
 				--hard_limit;
 				--type_limit;
-#if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_ERROR_LOGGING || defined TORRENT_LOGGING
+#if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_LOGGING
 				t->log_to_all_peers(("AUTO MANAGER STARTING TORRENT: " + t->torrent_file().name()).c_str());
 #endif
 				t->set_allow_peers(true);
 			}
 			else
 			{
-#if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_ERROR_LOGGING || defined TORRENT_LOGGING
+#if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_LOGGING
 				t->log_to_all_peers(("AUTO MANAGER PAUSING TORRENT: " + t->torrent_file().name()).c_str());
 #endif
 				// use graceful pause for auto-managed torrents
@@ -4202,6 +4355,12 @@ namespace aux {
 	void session_impl::recalculate_auto_managed_torrents()
 	{
 		// these vectors are filled with auto managed torrents
+
+		// TODO: these vectors could be copied from m_torrent_lists,
+		// if we would maintain them. That way the first pass over
+		// all torrents could be avoided. It would be especially
+		// efficient if most torrents are not auto-managed
+		std::vector<torrent*> checking;
 		std::vector<torrent*> downloaders;
 		downloaders.reserve(m_torrents.size());
 		std::vector<torrent*> seeds;
@@ -4211,6 +4370,7 @@ namespace aux {
 		// of each kind we're allowed to have active
 		int num_downloaders = settings().active_downloads;
 		int num_seeds = settings().active_seeds;
+		int checking_limit = 1;
 		int dht_limit = settings().active_dht_limit;
 		int tracker_limit = settings().active_tracker_limit;
 		int lsd_limit = settings().active_lsd_limit;
@@ -4229,15 +4389,14 @@ namespace aux {
 			torrent* t = i->second.get();
 			TORRENT_ASSERT(t);
 
-			// checking torrents are not subject to auto-management
-			if (t->state() == torrent_status::checking_files
-				|| t->state() == torrent_status::queued_for_checking)
-			{
-				if (t->is_auto_managed() && t->is_paused()) t->resume();
-				continue;
-			}
 			if (t->is_auto_managed() && !t->has_error())
 			{
+				if (t->state() == torrent_status::checking_files)
+				{
+					checking.push_back(t);
+					continue;
+				}
+
 				TORRENT_ASSERT(t->m_resume_data_loaded || !t->valid_metadata());
 				// this torrent is auto managed, add it to
 				// the list (depending on if it's a seed or not)
@@ -4248,6 +4407,11 @@ namespace aux {
 			}
 			else if (!t->is_paused())
 			{
+				if (t->state() == torrent_status::checking_files)
+				{
+					if (checking_limit > 0) --checking_limit;
+					continue;
+				}
 				TORRENT_ASSERT(t->m_resume_data_loaded || !t->valid_metadata());
 				--hard_limit;
 			  	if (is_active(t, settings()))
@@ -4279,21 +4443,23 @@ namespace aux {
 				> boost::bind(&torrent::seed_rank, _2, boost::ref(m_settings)));
 		}
 
+		auto_manage_torrents(checking, checking_limit, dht_limit, tracker_limit, lsd_limit
+			, hard_limit, num_downloaders);
+
 		if (settings().auto_manage_prefer_seeds)
 		{
-			auto_manage_torrents(seeds, dht_limit, tracker_limit, lsd_limit
+			auto_manage_torrents(seeds, checking_limit, dht_limit, tracker_limit, lsd_limit
 				, hard_limit, num_seeds);
-			auto_manage_torrents(downloaders, dht_limit, tracker_limit, lsd_limit
+			auto_manage_torrents(downloaders, checking_limit, dht_limit, tracker_limit, lsd_limit
 				, hard_limit, num_downloaders);
 		}
 		else
 		{
-			auto_manage_torrents(downloaders, dht_limit, tracker_limit, lsd_limit
+			auto_manage_torrents(downloaders, checking_limit, dht_limit, tracker_limit, lsd_limit
 				, hard_limit, num_downloaders);
-			auto_manage_torrents(seeds, dht_limit, tracker_limit, lsd_limit
+			auto_manage_torrents(seeds, checking_limit, dht_limit, tracker_limit, lsd_limit
 				, hard_limit, num_seeds);
 		}
-            
 	}
 
 	void session_impl::recalculate_optimistic_unchoke_slots()
@@ -4310,7 +4476,6 @@ namespace aux {
 			TORRENT_ASSERT(p);
 			policy::peer* pi = p->peer_info_struct();
 			if (!pi) continue;
-			if (pi->web_seed) continue;
 			torrent* t = p->associated_torrent().lock().get();
 			if (!t) continue;
 			if (t->is_paused()) continue;
@@ -4387,8 +4552,7 @@ namespace aux {
 		}
 	}
 
-	void session_impl::recalculate_unchoke_slots(int congested_torrents
-		, int uncongested_torrents)
+	void session_impl::recalculate_unchoke_slots()
 	{
 		TORRENT_ASSERT(is_network_thread());
 		INVARIANT_CHECK;
@@ -4409,8 +4573,7 @@ namespace aux {
 			torrent* t = p->associated_torrent().lock().get();
 			policy::peer* pi = p->peer_info_struct();
 
-			if (p->ignore_unchoke_slots() || t == 0 || pi == 0 || pi->web_seed || t->is_paused())
-				continue;
+			if (p->ignore_unchoke_slots() || t == 0 || pi == 0 || t->is_paused()) continue;
 
 			if (m_settings.choking_algorithm == session_settings::bittyrant_choker)
 			{
@@ -4433,9 +4596,7 @@ namespace aux {
 
 			if (!p->is_peer_interested()
 				|| p->is_disconnecting()
-				|| p->is_connecting()
-				|| (p->share_diff() < -free_upload_amount
-					&& !t->is_seed()))
+				|| p->is_connecting())
 			{
 				// this peer is not unchokable. So, if it's unchoked
 				// already, make sure to choke it.
@@ -4521,12 +4682,9 @@ namespace aux {
 			&& upload_limit > 0)
 		{
 			// if our current upload rate is less than 90% of our 
-			// limit AND most torrents are not "congested", i.e.
-			// they are not holding back because of a per-torrent
 			// limit
 			if (m_stat.upload_rate() < upload_limit * 0.9f
 				&& m_allowed_upload_slots <= m_num_unchoked + 1
-				&& congested_torrents < uncongested_torrents
 				&& m_upload_rate.queue_size() < 2)
 			{
 				++m_allowed_upload_slots;
@@ -4624,6 +4782,25 @@ namespace aux {
 					++m_num_unchoked;
 			}
 		}
+	}
+
+	void session_impl::cork_burst(peer_connection* p)
+	{
+		TORRENT_ASSERT(is_network_thread());
+		if (p->is_corked()) return;
+		p->cork_socket();
+		m_delayed_uncorks.push_back(p);
+	}
+
+	void session_impl::do_delayed_uncork()
+	{
+		TORRENT_ASSERT(is_network_thread());
+		for (std::vector<peer_connection*>::iterator i = m_delayed_uncorks.begin()
+			, end(m_delayed_uncorks.end()); i != end; ++i)
+		{
+			(*i)->uncork_socket();
+		}
+		m_delayed_uncorks.clear();
 	}
 
 	void session_impl::main_thread()
@@ -4755,18 +4932,21 @@ namespace aux {
 		TORRENT_ASSERT(is_network_thread());
 
 		std::auto_ptr<state_update_alert> alert(new state_update_alert());
-		alert->status.reserve(m_state_updates.size());
+		std::vector<torrent*>& state_updates
+			= m_torrent_lists[aux::session_impl::torrent_state_updates];
 
-		for (std::vector<boost::weak_ptr<torrent> >::iterator i = m_state_updates.begin()
-			, end(m_state_updates.end()); i != end; ++i)
+		alert->status.reserve(state_updates.size());
+
+		for (std::vector<torrent*>::iterator i = state_updates.begin()
+			, end(state_updates.end()); i != end; ++i)
 		{
-			boost::shared_ptr<torrent> t = i->lock();
-			if (!t) continue;
+			torrent* t = *i;
+			TORRENT_ASSERT(t->m_links[aux::session_impl::torrent_state_updates].in_list());
 			alert->status.push_back(torrent_status());
 			t->status(&alert->status.back(), 0xffffffff);
 			t->clear_in_state_update();
 		}
-		m_state_updates.clear();
+		state_updates.clear();
 
 		m_alerts.post_alert_ptr(alert.release());
 	}
@@ -4878,13 +5058,7 @@ namespace aux {
 			return torrent_handle();
 		}
 
-		int queue_pos = 0;
-		for (torrent_map::const_iterator i = m_torrents.begin()
-			, end(m_torrents.end()); i != end; ++i)
-		{
-			int pos = i->second->queue_position();
-			if (pos >= queue_pos) queue_pos = pos + 1;
-		}
+		int queue_pos = ++m_max_queue_pos;
 
 		torrent_ptr.reset(new torrent(*this, m_listen_interface
 			, 16 * 1024, queue_pos, params, *ih));
@@ -4917,7 +5091,30 @@ namespace aux {
 		}
 #endif
 
+#if TORRENT_HAS_BOOST_UNORDERED
+		sha1_hash next_lsd(0);
+		sha1_hash next_dht(0);
+		if (m_next_lsd_torrent != m_torrents.end())
+			next_lsd = m_next_lsd_torrent->first;
+		if (m_next_dht_torrent != m_torrents.end())
+			next_dht = m_next_dht_torrent->first;
+		float load_factor = m_torrents.load_factor();
+#endif
+
 		m_torrents.insert(std::make_pair(*ih, torrent_ptr));
+
+#if TORRENT_HAS_BOOST_UNORDERED
+		// if this insert made the hash grow, the iterators became invalid
+		// we need to reset them
+		if (m_torrents.load_factor() < load_factor)
+		{
+			// this indicates the hash table re-hashed
+			if (!next_lsd.is_all_zeros())
+				m_next_lsd_torrent = m_torrents.find(next_lsd);
+			if (!next_dht.is_all_zeros())
+				m_next_dht_torrent = m_torrents.find(next_dht);
+		}
+#endif
 		if (!params.uuid.empty() || !params.url.empty())
 			m_uuids.insert(std::make_pair(params.uuid.empty()
 				? params.url : params.uuid, torrent_ptr));
@@ -4934,56 +5131,6 @@ namespace aux {
 			m_auto_manage_time_scaler = 2;
 
 		return torrent_handle(torrent_ptr);
-	}
-
-	void session_impl::queue_check_torrent(boost::shared_ptr<torrent> const& t)
-	{
-		if (m_abort) return;
-		TORRENT_ASSERT(t->should_check_files());
-		TORRENT_ASSERT(t->state() != torrent_status::checking_files);
-		if (m_queued_for_checking.empty()) t->start_checking();
-		else t->set_state(torrent_status::queued_for_checking);
-		TORRENT_ASSERT(std::find(m_queued_for_checking.begin()
-			, m_queued_for_checking.end(), t) == m_queued_for_checking.end());
-		m_queued_for_checking.push_back(t);
-	}
-
-	void session_impl::dequeue_check_torrent(boost::shared_ptr<torrent> const& t)
-	{
-		INVARIANT_CHECK;
-		TORRENT_ASSERT(t->state() == torrent_status::checking_files
-			|| t->state() == torrent_status::queued_for_checking);
-
-		if (m_queued_for_checking.empty()) return;
-
-		boost::shared_ptr<torrent> next_check = *m_queued_for_checking.begin();
-		check_queue_t::iterator done = m_queued_for_checking.end();
-		for (check_queue_t::iterator i = m_queued_for_checking.begin()
-			, end(m_queued_for_checking.end()); i != end; ++i)
-		{
-			// the reason m_paused is in there is because when the session
-			// is paused, all torrents  that are queued ar all of a sudden
-			// not supposed to be queued anymore. The first torrent that gets
-			// removed from the queue will hence trigger this assert, without
-			// the m_paused exception
-			TORRENT_ASSERT(*i == t || (*i)->should_check_files() || m_paused);
-			if (*i == t) done = i;
-			else if (next_check == t || next_check->queue_position() > (*i)->queue_position())
-				next_check = *i;
-		}
-		TORRENT_ASSERT(next_check != t || m_queued_for_checking.size() == 1);
-		// only start a new one if we removed the one that is checking
-		TORRENT_ASSERT(done != m_queued_for_checking.end());
-		if (done == m_queued_for_checking.end()) return;
-
-		if (next_check != t
-			&& t->state() == torrent_status::checking_files
-			&& !m_paused)
-		{
-			next_check->start_checking();
-		}
-
-		m_queued_for_checking.erase(done);
 	}
 
 	void session_impl::remove_torrent(const torrent_handle& h, int options)
@@ -5038,8 +5185,6 @@ namespace aux {
 #endif
 		if (i == m_next_lsd_torrent)
 			++m_next_lsd_torrent;
-		if (i == m_next_connect_torrent)
-			++m_next_connect_torrent;
 
 		m_torrents.erase(i);
 
@@ -5049,12 +5194,7 @@ namespace aux {
 #endif
 		if (m_next_lsd_torrent == m_torrents.end())
 			m_next_lsd_torrent = m_torrents.begin();
-		if (m_next_connect_torrent == m_torrents.end())
-			m_next_connect_torrent = m_torrents.begin();
 
-		std::list<boost::shared_ptr<torrent> >::iterator k
-			= std::find(m_queued_for_checking.begin(), m_queued_for_checking.end(), tptr);
-		if (k != m_queued_for_checking.end()) m_queued_for_checking.erase(k);
 		TORRENT_ASSERT(m_torrents.find(i_hash) == m_torrents.end());
 	}
 
@@ -5178,6 +5318,7 @@ namespace aux {
 			<< ": added peer from local discovery: " << peer << "\n";
 #endif
 		t->get_policy().add_peer(peer, peer_id(0), peer_info::lsd, 0);
+		t->update_want_more_peers();
 		if (m_alerts.should_post<lsd_peer_alert>())
 			m_alerts.post_alert(lsd_peer_alert(t->get_handle(), peer));
 	}
@@ -5252,7 +5393,8 @@ namespace aux {
 		s.optimistic_unchoke_counter = m_optimistic_unchoke_time_scaler;
 		s.unchoke_counter = m_unchoke_time_scaler;
 
-		s.num_peers = (int)m_connections.size();
+		s.num_peers = int(m_connections.size());
+		s.num_dead_peers = int(m_undead_peers.size());
 		s.num_unchoked = m_num_unchoked;
 		s.allowed_upload_slots = m_allowed_upload_slots;
 
@@ -5339,6 +5481,8 @@ namespace aux {
 
 		m_utp_socket_manager.get_status(s.utp_stats);
 
+		// this loop is potentially expensive. It could be optimized by
+		// simply keeping a global counter
 		int peerlist_size = 0;
 		for (torrent_map::const_iterator i = m_torrents.begin()
 			, end(m_torrents.end()); i != end; ++i)
@@ -5490,6 +5634,9 @@ namespace aux {
 
 	session_impl::~session_impl()
 	{
+#if defined TORRENT_REQUEST_LOGGING
+		fclose(m_request_logger);
+#endif
 		m_io_service.post(boost::bind(&session_impl::abort, this));
 
 		// we need to wait for the disk-io thread to
@@ -5499,6 +5646,13 @@ namespace aux {
 		// the main thread has handled all the outstanding requests
 		// we know it's safe to destruct the disk thread.
 		m_disk_thread.join();
+
+		// clear the undead peer list in the network thread
+		m_io_service.post(boost::bind(&std::vector<intrusive_ptr<peer_connection> >::clear
+			, &m_undead_peers));
+
+		// now it's OK for the network thread to exit
+		m_work.reset();
 
 #if defined TORRENT_ASIO_DEBUGGING
 		int counter = 0;
@@ -5973,16 +6127,30 @@ namespace aux {
 		m_disk_thread.free_buffer(buf);
 	}
 
+	// decrement the refcount of the block in the disk cache
+	// since the network thread doesn't need it anymore
+	void session_impl::reclaim_block(block_cache_reference ref)
+	{
+		m_disk_thread.reclaim_block(ref);
+	}
+
 	char* session_impl::allocate_disk_buffer(char const* category)
 	{
 		return m_disk_thread.allocate_buffer(category);
+	}
+	
+	char* session_impl::allocate_disk_buffer(bool& exceeded
+		, boost::function<void()> const& cb
+		, char const* category)
+	{
+		return m_disk_thread.allocate_buffer(exceeded, cb, category);
 	}
 	
 	char* session_impl::allocate_buffer()
 	{
 		TORRENT_ASSERT(is_network_thread());
 
-#ifdef TORRENT_DISK_STATS
+#ifdef TORRENT_BUFFER_STATS
 		TORRENT_ASSERT(m_buffer_allocations >= 0);
 		m_buffer_allocations++;
 		m_buffer_usage_logger << log_time() << " protocol_buffer: "
@@ -5996,7 +6164,7 @@ namespace aux {
 #endif
 	}
 
-#ifdef TORRENT_DISK_STATS
+#ifdef TORRENT_BUFFER_STATS
 	void session_impl::log_buffer_usage()
 	{
 		TORRENT_ASSERT(is_network_thread());
@@ -6021,7 +6189,7 @@ namespace aux {
 	{
 		TORRENT_ASSERT(is_network_thread());
 
-#ifdef TORRENT_DISK_STATS
+#ifdef TORRENT_BUFFER_STATS
 		m_buffer_allocations--;
 		TORRENT_ASSERT(m_buffer_allocations >= 0);
 		m_buffer_usage_logger << log_time() << " protocol_buffer: "
@@ -6039,22 +6207,16 @@ namespace aux {
 	{
 		TORRENT_ASSERT(is_network_thread());
 
-		int num_checking = 0;
-		int num_queued_for_checking = 0;
-		for (check_queue_t::const_iterator i = m_queued_for_checking.begin()
-			, end(m_queued_for_checking.end()); i != end; ++i)
+		for (int l = 0; l < num_torrent_lists; ++l)
 		{
-			if ((*i)->state() == torrent_status::checking_files) ++num_checking;
-			else if ((*i)->state() == torrent_status::queued_for_checking)
+			std::vector<torrent*> const& list = m_torrent_lists[l];
+			for (std::vector<torrent*>::const_iterator i = list.begin()
+				, end(list.end()); i != end; ++i)
 			{
-				++num_queued_for_checking;
+				TORRENT_ASSERT((*i)->m_links[l].in_list());
 			}
 		}
-
-		// the queue is either empty, or it has exactly one checking torrent in it
-		TORRENT_ASSERT(m_queued_for_checking.empty() || num_checking == 1 || (m_paused && num_checking == 0));
-//		TORRENT_ASSERT(m_queued_for_checking.size() == num_queued_for_checking);
-
+	
 		std::set<int> unique;
 		int total_downloaders = 0;
 		for (torrent_map::const_iterator i = m_torrents.begin()

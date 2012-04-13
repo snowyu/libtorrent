@@ -87,7 +87,8 @@
 <li><a class="reference internal" href="#storage-allocation" id="id42">storage allocation</a></li>
 <li><a class="reference internal" href="#extensions" id="id43">extensions</a></li>
 <li><a class="reference internal" href="#piece-picker" id="id44">piece picker</a></li>
-<li><a class="reference internal" href="#ssl-torrents" id="id45">SSL torrents</a></li>
+<li><a class="reference internal" href="#predictive-piece-announce" id="id45">predictive piece announce</a></li>
+<li><a class="reference internal" href="#ssl-torrents" id="id46">SSL torrents</a></li>
 </ul>
 </div>
 <div class="section" id="overview">
@@ -280,7 +281,6 @@ class session: public boost::noncopyable
         ip_filter get_ip_filter() const;
 
         session_status status() const;
-        cache_status get_cache_status() const;
 
         bool is_listening() const;
         unsigned short listen_port() const;
@@ -917,80 +917,17 @@ particular DHT lookup. This represents roughly the amount of memory used
 by the DHT.</p>
 <p><tt class="docutils literal"><span class="pre">utp_stats</span></tt> contains statistics on the uTP sockets.</p>
 </div>
-<div class="section" id="get-cache-status">
-<h2>get_cache_status()</h2>
-<blockquote>
-<pre class="literal-block">
-cache_status get_cache_status() const;
-</pre>
-</blockquote>
-<p>Returns status of the disk cache for this session.</p>
-<blockquote>
-<pre class="literal-block">
-struct cache_status
-{
-        size_type blocks_written;
-        size_type writes;
-        size_type blocks_read;
-        size_type blocks_read_hit;
-        size_type reads;
-        int cache_size;
-        int read_cache_size;
-        int total_used_buffers;
-        int average_queue_time;
-        int average_read_time;
-        int average_write_time;
-        int average_hash_time;
-        int average_cache_time;
-        int job_queue_length;
-};
-</pre>
-</blockquote>
-<p><tt class="docutils literal"><span class="pre">blocks_written</span></tt> is the total number of 16 KiB blocks written to disk
-since this session was started.</p>
-<p><tt class="docutils literal"><span class="pre">writes</span></tt> is the total number of write operations performed since this
-session was started.</p>
-<p>The ratio (<tt class="docutils literal"><span class="pre">blocks_written</span></tt> - <tt class="docutils literal"><span class="pre">writes</span></tt>) / <tt class="docutils literal"><span class="pre">blocks_written</span></tt> represents
-the number of saved write operations per total write operations. i.e. a kind
-of cache hit ratio for the write cahe.</p>
-<p><tt class="docutils literal"><span class="pre">blocks_read</span></tt> is the number of blocks that were requested from the
-bittorrent engine (from peers), that were served from disk or cache.</p>
-<p><tt class="docutils literal"><span class="pre">blocks_read_hit</span></tt> is the number of blocks that were served from cache.</p>
-<p>The ratio <tt class="docutils literal"><span class="pre">blocks_read_hit</span></tt> / <tt class="docutils literal"><span class="pre">blocks_read</span></tt> is the cache hit ratio
-for the read cache.</p>
-<p><tt class="docutils literal"><span class="pre">cache_size</span></tt> is the number of 16 KiB blocks currently in the disk cache.
-This includes both read and write cache.</p>
-<p><tt class="docutils literal"><span class="pre">read_cache_size</span></tt> is the number of 16KiB blocks in the read cache.</p>
-<p><tt class="docutils literal"><span class="pre">total_used_buffers</span></tt> is the total number of buffers currently in use.
-This includes the read/write disk cache as well as send and receive buffers
-used in peer connections.</p>
-<p><tt class="docutils literal"><span class="pre">average_queue_time</span></tt> is the number of microseconds an average disk I/O job
-has to wait in the job queue before it get processed.</p>
-<p><tt class="docutils literal"><span class="pre">average_read_time</span></tt> is the time read jobs takes on average to complete
-(not including the time in the queue), in microseconds. This only measures
-read cache misses.</p>
-<p><tt class="docutils literal"><span class="pre">average_write_time</span></tt> is the time write jobs takes to complete, on average,
-in microseconds. This does not include the time the job sits in the disk job
-queue or in the write cache, only blocks that are flushed to disk.</p>
-<p><tt class="docutils literal"><span class="pre">average_hash_time</span></tt> is the time hash jobs takes to complete on average, in
-microseconds. Hash jobs include running SHA-1 on the data (which for the most
-part is done incrementally) and sometimes reading back parts of the piece. It
-also includes checking files without valid resume data.</p>
-<p><tt class="docutils literal"><span class="pre">average_cache_time</span></tt> is the average amuount of time spent evicting cached
-blocks that have expired from the disk cache.</p>
-<p><tt class="docutils literal"><span class="pre">job_queue_length</span></tt> is the number of jobs in the job queue.</p>
-</div>
 <div class="section" id="get-cache-info">
 <h2>get_cache_info()</h2>
 <blockquote>
 <pre class="literal-block">
-void get_cache_info(sha1_hash const&amp; ih
-        , std::vector&lt;cached_piece_info&gt;&amp; ret) const;
+enum { disk_cache_no_pieces = 1 };
+void get_cache_info(sha1_hash const&amp; ih, cache_status* ret, int flags) const;
 </pre>
 </blockquote>
-<p><tt class="docutils literal"><span class="pre">get_cache_info()</span></tt> fills out the supplied vector with information for
-each piece that is currently in the disk cache for the torrent with the
-specified info-hash (<tt class="docutils literal"><span class="pre">ih</span></tt>).</p>
+<p>Fills in the cache_status struct with information about the given info-hash (<tt class="docutils literal"><span class="pre">ih</span></tt>).
+If <tt class="docutils literal"><span class="pre">flags</span></tt> is <tt class="docutils literal"><span class="pre">session::disk_cache_no_pieces</span></tt> the <tt class="docutils literal"><span class="pre">cache_status::pieces</span></tt> field
+will not be set. This may significantly reduce the cost of this call.</p>
 <blockquote>
 <pre class="literal-block">
 struct cached_piece_info
@@ -1009,6 +946,103 @@ the data for that block being in the disk cache and <tt class="docutils literal"
 <p><tt class="docutils literal"><span class="pre">last_use</span></tt> is the time when a block was last written to this piece. The older
 a piece is, the more likely it is to be flushed to disk.</p>
 <p><tt class="docutils literal"><span class="pre">kind</span></tt> specifies if this piece is part of the read cache or the write cache.</p>
+<blockquote>
+<pre class="literal-block">
+struct cache_status
+{
+        std::vector&lt;cached_piece_info&gt; pieces;
+        size_type blocks_written;
+        size_type writes;
+        size_type blocks_read;
+        size_type blocks_read_hit;
+        size_type reads;
+        size_type queued_bytes;
+        int write_cache_size;
+        int read_cache_size;
+        int pinned_blocks;
+        int total_used_buffers;
+        int average_queue_time;
+        int average_read_time;
+        int average_write_time;
+        int average_hash_time;
+        int average_cache_time;
+        int average_job_time;
+        int average_sort_time;
+        int average_issue_time;
+        int total_read_back;
+        int read_queue_size;
+        int blocked_jobs;
+        int queued_jobs;
+        int peak_queued;
+        int pending_jobs;
+        int peak_pending;
+        int num_aiocb;
+        int peak_aiocb;
+        size_type cumulative_completed_aiocbs;
+};
+</pre>
+</blockquote>
+<p><tt class="docutils literal"><span class="pre">blocks_written</span></tt> is the total number of 16 KiB blocks written to disk
+since this session was started.</p>
+<p><tt class="docutils literal"><span class="pre">writes</span></tt> is the total number of write operations performed since this
+session was started.</p>
+<p>The ratio (<tt class="docutils literal"><span class="pre">blocks_written</span></tt> - <tt class="docutils literal"><span class="pre">writes</span></tt>) / <tt class="docutils literal"><span class="pre">blocks_written</span></tt> represents
+the number of saved write operations per total write operations. i.e. a kind
+of cache hit ratio for the write cahe.</p>
+<p><tt class="docutils literal"><span class="pre">blocks_read</span></tt> is the number of blocks that were requested from the
+bittorrent engine (from peers), that were served from disk or cache.</p>
+<p><tt class="docutils literal"><span class="pre">blocks_read_hit</span></tt> is the number of blocks that were served from cache.</p>
+<p>The ratio <tt class="docutils literal"><span class="pre">blocks_read_hit</span></tt> / <tt class="docutils literal"><span class="pre">blocks_read</span></tt> is the cache hit ratio
+for the read cache.</p>
+<p><tt class="docutils literal"><span class="pre">reads</span></tt> is the total number of read operations called this session.</p>
+<p><tt class="docutils literal"><span class="pre">queued_bytes</span></tt> is the total number of bytes queued for writing, including
+bytes passed on to the operating system but have not yet completed.</p>
+<p><tt class="docutils literal"><span class="pre">write_cache_size</span></tt> is the number of 16 KiB blocks currently in the disk
+write cache.</p>
+<p><tt class="docutils literal"><span class="pre">read_cache_size</span></tt> is the number of 16KiB blocks in the read cache.</p>
+<p><tt class="docutils literal"><span class="pre">pinned_blocks</span></tt> is the number of blocks that have more than 0 references
+to them, forcing them to stay in RAM.</p>
+<p><tt class="docutils literal"><span class="pre">total_used_buffers</span></tt> is the total number of buffers currently in use.
+This includes the read/write disk cache as well as send and receive buffers
+used in peer connections. It only counts disk buffers.</p>
+<p><tt class="docutils literal"><span class="pre">average_queue_time</span></tt> is the number of microseconds an average disk I/O job
+has to wait in the job queue before it get processed.</p>
+<p><tt class="docutils literal"><span class="pre">average_read_time</span></tt> is the time read jobs takes on average to complete
+(not including the time in the queue), in microseconds. This only measures
+read cache misses.</p>
+<p><tt class="docutils literal"><span class="pre">average_write_time</span></tt> is the time write jobs takes to complete, on average,
+in microseconds. This does not include the time the job sits in the disk job
+queue or in the write cache, only blocks that are flushed to disk.</p>
+<p><tt class="docutils literal"><span class="pre">average_hash_time</span></tt> is the time hash jobs takes to complete on average, in
+microseconds. Hash jobs include running SHA-1 on the data (which for the most
+part is done incrementally) and sometimes reading back parts of the piece. It
+also includes checking files without valid resume data.</p>
+<p><tt class="docutils literal"><span class="pre">average_job_time</span></tt> is the average time it takes for any disk job to complete,
+in microseconds.</p>
+<p><tt class="docutils literal"><span class="pre">average_sort_time</span></tt> is the time spent sorting disk jobs, when using synchronous
+I/O.</p>
+<p><tt class="docutils literal"><span class="pre">average_issue_time</span></tt> is the time spent actually issuing the jobs to the OS. If
+this is high, it might indicate a problem with the asynchronous disk API, not being
+very asynchronous.</p>
+<p><tt class="docutils literal"><span class="pre">cumulative_job_time</span></tt>, <tt class="docutils literal"><span class="pre">cumulative_read_time</span></tt>, <tt class="docutils literal"><span class="pre">cumulative_write_time</span></tt>,
+<tt class="docutils literal"><span class="pre">cumulative_hash_time</span></tt>, <tt class="docutils literal"><span class="pre">cumulative_sort_time</span></tt>, <tt class="docutils literal"><span class="pre">cumulative_issue_time</span></tt>
+are the cumulative time, in microseconds, spent in each category of disk I/O
+function.</p>
+<p><tt class="docutils literal"><span class="pre">total_read_back</span></tt> is the total number of (16 kiB) blocks read this session.</p>
+<p><tt class="docutils literal"><span class="pre">read_queue_size</span></tt> is the number of read jobs in the disk job queue.</p>
+<p><tt class="docutils literal"><span class="pre">blocked_jobs</span></tt> is the number of jobs blocked because of one or more jobs that
+need exclusive access to the file storage. For instance renaming files or closing
+files.</p>
+<p><tt class="docutils literal"><span class="pre">queued_jobs</span></tt> is the total number of jobs in the queue.</p>
+<p><tt class="docutils literal"><span class="pre">pending_jobs</span></tt> is the number of jobs that have been issued to the OS, but have not
+yet completed.</p>
+<p><tt class="docutils literal"><span class="pre">num_aiocb</span></tt> is the number of async. disk I/O request objects currently in use.</p>
+<p><tt class="docutils literal"><span class="pre">peak_aiocb</span></tt> is the peak number of aiocb's that's ever been in use this session.</p>
+<p><tt class="docutils literal"><span class="pre">cumulative_completed_aiocbs</span></tt> is the total number of low-level AIO jobs that has
+completed. This can be used as an accurate job completion rate counter, by comparing
+consecutive values. Keep in mind that one low level job is typically 16 kiB, however,
+some back-ends support vector I/O, in which case a job may represent a lot more than
+that.</p>
 </div>
 <div class="section" id="is-listening-listen-port-listen-on">
 <h2>is_listening() listen_port() listen_on()</h2>
@@ -2132,6 +2166,7 @@ struct torrent_handle
 
         torrent_status status(boost::uint32_t flags = 0xffffffff);
         void file_progress(std::vector&lt;size_type&gt;&amp; fp, int flags = 0);
+        void file_status(std::vector&lt;pool_file_status&gt;&amp; status);
         void get_download_queue(std::vector&lt;partial_piece_info&gt;&amp; queue) const;
         void get_peer_info(std::vector&lt;peer_info&gt;&amp; v) const;
         torrent_info const&amp; get_torrent_info() const;
@@ -2146,7 +2181,7 @@ struct torrent_handle
         void force_dht_announce() const;
         void force_reannounce(boost::posix_time::time_duration) const;
         void scrape_tracker() const;
-        void connect_peer(asio::ip::tcp::endpoint const&amp; adr, int source = 0) const;
+        void connect_peer(asio::ip::tcp::endpoint const&amp; adr, int source = 0, int flags = 0) const;
 
         void set_tracker_login(std::string const&amp; username
                 , std::string const&amp; password) const;
@@ -2382,6 +2417,49 @@ fully downloaded and passed the hash check count. When specifying piece granular
 the operation is a lot cheaper, since libtorrent already keeps track of this internally
 and no calculation is required.</p>
 </div>
+<div class="section" id="file-status">
+<h2>file_status()</h2>
+<blockquote>
+<pre class="literal-block">
+void file_status(std::vector&lt;pool_file_status&gt;&amp; status);
+</pre>
+</blockquote>
+<p>This function fills in the passed in vector with status about files that are open
+for this torrent. Any file that is not open in this torrent, will not be reported
+in the vector, i.e. it's possible that the vector is empty when returning, if none
+of the files in the torrent are currently open.</p>
+<p>The <tt class="docutils literal"><span class="pre">pool_file_status</span></tt> is defined as:</p>
+<pre class="literal-block">
+struct pool_file_status
+{
+        int file_index;
+        ptime last_use;
+        int open_mode;
+};
+</pre>
+<p><tt class="docutils literal"><span class="pre">file_index</span></tt> is the index of the file this entry refers to into the <tt class="docutils literal"><span class="pre">file_storage</span></tt>
+file list of this torrent. This starts indexing at 0.</p>
+<p><tt class="docutils literal"><span class="pre">last_use</span></tt> is a (high precision) timestamp of when the file was last used.</p>
+<p><tt class="docutils literal"><span class="pre">open_mode</span></tt> is a bitmask of the file flags this file is currently opened with. These
+are the flags used in the <tt class="docutils literal"><span class="pre">file::open()</span></tt> function. This enum is defined as a member
+of the <tt class="docutils literal"><span class="pre">file</span></tt> class.</p>
+<pre class="literal-block">
+enum
+{
+        read_only = 0,
+        write_only = 1,
+        read_write = 2,
+        rw_mask = 3,
+        no_buffer = 4,
+        sparse = 8,
+        no_atime = 16,
+        random_access = 32,
+        lock_file = 64,
+};
+</pre>
+<p>Note that the read/write mode is not a bitmask. The two least significant bits are used
+to represent the read/write mode. Those bits can be masked out using the <tt class="docutils literal"><span class="pre">rw_mask</span></tt> constant.</p>
+</div>
 <div class="section" id="save-path">
 <h2>save_path()</h2>
 <blockquote>
@@ -2520,7 +2598,7 @@ the <a class="reference internal" href="#torrent-status">torrent_status</a> stru
 <h2>connect_peer()</h2>
 <blockquote>
 <pre class="literal-block">
-void connect_peer(asio::ip::tcp::endpoint const&amp; adr, int source = 0) const;
+void connect_peer(asio::ip::tcp::endpoint const&amp; adr, int source = 0, int flags = 0) const;
 </pre>
 </blockquote>
 <p><tt class="docutils literal"><span class="pre">connect_peer()</span></tt> is a way to manually connect to peers that one believe is a part of the
@@ -2530,6 +2608,32 @@ attempt is made. If the torrent is uninitialized or in queued or checking mode, 
 will throw <a class="reference internal" href="#libtorrent-exception">libtorrent_exception</a>. The second (optional) argument will be bitwised ORed into
 the source mask of this peer. Typically this is one of the source flags in <a class="reference internal" href="#peer-info">peer_info</a>.
 i.e. <tt class="docutils literal"><span class="pre">tracker</span></tt>, <tt class="docutils literal"><span class="pre">pex</span></tt>, <tt class="docutils literal"><span class="pre">dht</span></tt> etc.</p>
+<p><tt class="docutils literal"><span class="pre">flags</span></tt> are the same flags that are passed along with the <tt class="docutils literal"><span class="pre">ut_pex</span></tt> extension.</p>
+<table border="1" class="docutils">
+<colgroup>
+<col width="9%" />
+<col width="91%" />
+</colgroup>
+<tbody valign="top">
+<tr><td>0x01</td>
+<td>peer supports encryption</td>
+</tr>
+<tr><td>0x02</td>
+<td>peer is a seed</td>
+</tr>
+<tr><td>0x04</td>
+<td>supports uTP. This is only a positive flags
+passing 0 doesn't mean the peer doesn't
+support uTP</td>
+</tr>
+<tr><td>0x08</td>
+<td>supports holepunching protocol. If this
+flag is received from a peer, it can be
+used as a rendezvous point in case direct
+connections to the peer fail</td>
+</tr>
+</tbody>
+</table>
 </div>
 <div class="section" id="name">
 <h2>name()</h2>
@@ -3191,7 +3295,7 @@ struct torrent_status
 {
         enum state_t
         {
-                queued_for_checking,
+                queued_for_checking, // deprecated
                 checking_files,
                 downloading_metadata,
                 downloading,
@@ -3329,9 +3433,14 @@ completed in a fraction of a second, but if you add a
 large number of torrents at once, they will queue up.</td>
 </tr>
 <tr><td><tt class="docutils literal"><span class="pre">queued_for_checking</span></tt></td>
-<td>The torrent is in the queue for being checked. But there
+<td><p class="first"><strong>THIS STATE IS DEPRECATED</strong>
+A torrent that is queued for checking is now in the
+<tt class="docutils literal"><span class="pre">checking_files</span></tt> state, and paused and auto-managed.</p>
+<p class="last">The previous semantic for this state was:
+The torrent is in the queue for being checked. But there
 currently is another torrent that are being checked.
-This torrent will wait for its turn.</td>
+This torrent will wait for its turn.</p>
+</td>
 </tr>
 <tr><td><tt class="docutils literal"><span class="pre">checking_files</span></tt></td>
 <td>The torrent has not started its download yet, and is
@@ -3621,8 +3730,6 @@ struct peer_info
         std::string inet_as_name;
         int inet_as;
 
-        size_type load_balancing;
-
         int requests_in_buffer;
         int download_queue_length;
         int upload_queue_length;
@@ -3850,11 +3957,6 @@ remain set to 0 unless the torrent is set to resolve countries, see <a class="re
 <p><tt class="docutils literal"><span class="pre">inet_as_name</span></tt> is the name of the AS this peer is located in. This might be
 an empty string if there is no name in the geo ip database.</p>
 <p><tt class="docutils literal"><span class="pre">inet_as</span></tt> is the AS number the peer is located in.</p>
-<p><tt class="docutils literal"><span class="pre">load_balancing</span></tt> is a measurement of the balancing of free download (that we get)
-and free upload that we give. Every peer gets a certain amount of free upload, but
-this member says how much <em>extra</em> free upload this peer has got. If it is a negative
-number it means that this was a peer from which we have got this amount of free
-download.</p>
 <p><tt class="docutils literal"><span class="pre">requests_in_buffer</span></tt> is the number of requests messages that are currently in the
 send buffer waiting to be sent.</p>
 <p><tt class="docutils literal"><span class="pre">download_queue_length</span></tt> is the number of piece-requests we have sent to this peer
@@ -3906,8 +4008,7 @@ string.</p>
 <p><tt class="docutils literal"><span class="pre">remote_dl_rate</span></tt> is an estimate of the rate this peer is downloading at, in
 bytes per second.</p>
 <p><tt class="docutils literal"><span class="pre">pending_disk_bytes</span></tt> is the number of bytes this peer has pending in the
-disk-io thread. Downloaded and waiting to be written to disk. This is what
-is capped by <tt class="docutils literal"><span class="pre">session_settings::max_queued_disk_bytes</span></tt>.</p>
+disk-io thread. Downloaded and waiting to be written to disk.</p>
 <p><tt class="docutils literal"><span class="pre">send_quota</span></tt> and <tt class="docutils literal"><span class="pre">receive_quota</span></tt> are the number of bytes this peer has been
 assigned to be allowed to send and receive until it has to request more quota
 from the bandwidth manager.</p>
@@ -4297,12 +4398,15 @@ struct session_settings
         int read_job_every;
         bool use_disk_read_ahead;
         bool lock_files;
+        int hashing_threads;
+        int contiguous_recv_buffer;
+        int network_threads;
+
+        std::string mmap_cache;
 
         int ssl_listen;
 
         int tracker_backoff;
-
-        bool ban_web_seeds;
 };
 </pre>
 <p><tt class="docutils literal"><span class="pre">version</span></tt> is automatically set to the libtorrent version you're using
@@ -4524,8 +4628,10 @@ of physical RAM available in the machine divided by 8. If the amount of physical
 RAM cannot be determined, it's set to 1024 (= 16 MiB).</p>
 <p>Disk buffers are allocated using a pool allocator, the number of blocks that
 are allocated at a time when the pool needs to grow can be specified in
-<tt class="docutils literal"><span class="pre">cache_buffer_chunk_size</span></tt>. This defaults to 16 blocks. Lower numbers
-saves memory at the expense of more heap allocations. It must be at least 1.</p>
+<tt class="docutils literal"><span class="pre">cache_buffer_chunk_size</span></tt>. Lower numbers saves memory at the expense of more
+heap allocations. If it is set to 0, the effective chunk size is proportional
+to the total cache size, attempting to strike a good balance between performance
+and memory usage. It defaults to 0.</p>
 <p><tt class="docutils literal"><span class="pre">cache_expiry</span></tt> is the number of seconds from the last cached write to a piece
 in the write cache, to when it's forcefully flushed to disk. Default is 60 second.</p>
 <p><tt class="docutils literal"><span class="pre">use_read_cache</span></tt>, is set to true (default), the disk cache is also used to
@@ -5036,6 +5142,42 @@ in the disk job queue. This gives a significant performance boost for seeding.</
 to or seeding from. This is implemented using <tt class="docutils literal"><span class="pre">fcntl(F_SETLK)</span></tt> on unix systems and
 by not passing in <tt class="docutils literal"><span class="pre">SHARE_READ</span></tt> and <tt class="docutils literal"><span class="pre">SHARE_WRITE</span></tt> on windows. This might prevent
 3rd party processes from corrupting the files under libtorrent's feet.</p>
+<p><tt class="docutils literal"><span class="pre">hashing_threads</span></tt> is the number of threads to use for piece hash verification. It
+defaults to 1. For very high download rates, on machines with multiple cores, this
+could be incremented. Setting it higher than the number of CPU cores would presumably
+not provide any benefit of setting it to the number of cores. If it's set to 0,
+hashing is done in the disk thread.</p>
+<p><tt class="docutils literal"><span class="pre">contiguous_recv_buffer</span></tt> determines whether or not libtorrent should receive
+data from peers into a contiguous intermediate buffer, to then copy blocks into
+disk buffers from, or to make many smaller calls to <tt class="docutils literal"><span class="pre">read()</span></tt>, each time passing
+in the specific buffer the data belongs in. When downloading at high rates, the latter
+may save some time copying data. When seeding at high rates, all incoming traffic
+consists of a very large number of tiny packets, and enabling <tt class="docutils literal"><span class="pre">contiguous_recv_buffer</span></tt>
+will provide higher performance. When this is enabled, it will only be used when
+seeding to peers, since that's when it provides performance improvements.</p>
+<p><tt class="docutils literal"><span class="pre">network_threads</span></tt> is the number of threads to use to call <tt class="docutils literal"><span class="pre">async_write_some</span></tt>
+(i.e. send) on peer connection sockets. When seeding at extremely high rates,
+this may become a bottleneck, and setting this to 2 or more may parallelize
+that cost. When using SSL torrents, all encryption for outgoing traffic is
+done withint the socket send functions, and this will help parallelizing the
+cost of SSL encryption as well.</p>
+<p><tt class="docutils literal"><span class="pre">mmap_cache</span></tt> may be set to a filename where the disk cache will be mmapped
+to. This could be useful, for instance, to map the disk cache from regular
+rotating hard drives onto an SSD drive. Doing that effectively introduces
+a second layer of caching, allowing the disk cache to be as big as can
+fit on an SSD drive (probably about one order of magnitude more than the
+available RAM). The intention of this setting is to set it up once at the
+start up and not change it while running. The setting may not be changed
+as long as there are any disk buffers in use. This default to the empty
+string, which means use regular RAM allocations for the disk cache. The file
+specified will be created and truncated to the disk cache size (<tt class="docutils literal"><span class="pre">cache_size</span></tt>).
+Any existing file with the same name will be replaced.</p>
+<p>Since this setting sets a hard upper limit on cache usage, it cannot be combined
+with <tt class="docutils literal"><span class="pre">session_settings::contiguous_recv_buffer</span></tt>, since that feature treats the
+<tt class="docutils literal"><span class="pre">cache_size</span></tt> setting as a soft (but still pretty hard) limit. The result of combining
+the two is peers being disconnected after failing to allocate more disk buffers.</p>
+<p>This feature requires the <tt class="docutils literal"><span class="pre">mmap</span></tt> system call, on systems that don't have <tt class="docutils literal"><span class="pre">mmap</span></tt>
+this setting is ignored.</p>
 <p><tt class="docutils literal"><span class="pre">ssl_listen</span></tt> sets the listen port for SSL connections. If this is set to 0,
 no SSL listen port is opened. Otherwise a socket is opened on this port. This
 setting is only taken into account when opening the regular listen port, and
@@ -5049,8 +5191,6 @@ delay = 5 + 5 * x / 100 * fails^2</blockquote>
 <p>It defaults to 250.</p>
 <p>This setting may be useful to make libtorrent more or less aggressive in hitting
 trackers.</p>
-<p><tt class="docutils literal"><span class="pre">ban_web_seeds</span></tt> enables banning web seeds. By default, web seeds that send
-corrupt data are banned.</p>
 </div>
 </div>
 <div class="section" id="pe-settings">
@@ -5998,12 +6138,15 @@ struct portmap_log_alert: alert
 generated and the torrent is paused.</p>
 <p><tt class="docutils literal"><span class="pre">file</span></tt> is the path to the file that was accessed when the error occurred.</p>
 <p><tt class="docutils literal"><span class="pre">error</span></tt> is the error code describing the error.</p>
+<p><tt class="docutils literal"><span class="pre">operation</span></tt> is a NULL-terminated string of the low-level operation that failed, or NULL if
+there was no low level disk operation.</p>
 <pre class="literal-block">
 struct file_error_alert: torrent_alert
 {
         // ...
         std::string file;
         error_code error;
+        char const* operation;
 };
 </pre>
 </div>
@@ -6547,11 +6690,16 @@ if (h.is_valid()) {
 <p>This alert is generated when a fastresume file has been passed to <tt class="docutils literal"><span class="pre">add_torrent</span></tt> but the
 files on disk did not match the fastresume file. The <tt class="docutils literal"><span class="pre">error_code</span></tt> explains the reason why the
 resume file was rejected.</p>
+<p>If the error happend to a specific file, <tt class="docutils literal"><span class="pre">file</span></tt> is the path to it. If the error happened
+in a disk operation, <tt class="docutils literal"><span class="pre">operation</span></tt> is a NULL-terminated string of the name of that operation.
+<tt class="docutils literal"><span class="pre">operation</span></tt> is NULL otherwise.</p>
 <pre class="literal-block">
 struct fastresume_rejected_alert: torrent_alert
 {
         // ...
         error_code error;
+        std::string file;
+        char const* operation;
 };
 </pre>
 </div>
@@ -6585,11 +6733,16 @@ struct storage_moved_alert: torrent_alert
 <h2>storage_moved_failed_alert</h2>
 <p>The <tt class="docutils literal"><span class="pre">storage_moved_failed_alert</span></tt> is generated when an attempt to move the storage
 (via torrent_handle::move_storage()) fails.</p>
+<p>If the error happened for a speific file, <tt class="docutils literal"><span class="pre">file</span></tt> is its path. If the error
+happened in a specific disk operation, <tt class="docutils literal"><span class="pre">operation</span></tt> is a NULL terminated string
+naming which one, otherwise it's NULL.</p>
 <pre class="literal-block">
 struct storage_moved_failed_alert: torrent_alert
 {
         // ...
         error_code error;
+        std::string file;
+        char const* operation;
 };
 </pre>
 </div>
@@ -7897,55 +8050,66 @@ reads garbage. It's useful mostly for benchmarking and profiling purpose.</p>
 <pre class="literal-block">
 struct storage_interface
 {
-        virtual bool initialize(bool allocate_files) = 0;
-        virtual bool has_any_file() = 0;
+        virtual void initialize(bool allocate_files, storage_error&amp; ec) = 0;
+        virtual bool has_any_file(storage_error&amp; ec) = 0;
         virtual void hint_read(int slot, int offset, int len);
-        virtual int readv(file::iovec_t const* bufs, int slot, int offset, int num_bufs) = 0;
-        virtual int writev(file::iovec_t const* bufs, int slot, int offset, int num_bufs) = 0;
         virtual int sparse_end(int start) const;
-        virtual bool move_storage(fs::path save_path) = 0;
-        virtual bool verify_resume_data(lazy_entry const&amp; rd, error_code&amp; error) = 0;
-        virtual bool write_resume_data(entry&amp; rd) const = 0;
-        virtual bool move_slot(int src_slot, int dst_slot) = 0;
-        virtual bool swap_slots(int slot1, int slot2) = 0;
-        virtual bool swap_slots3(int slot1, int slot2, int slot3) = 0;
-        virtual bool rename_file(int file, std::string const&amp; new_name) = 0;
-        virtual bool release_files() = 0;
-        virtual bool delete_files() = 0;
-        virtual void finalize_file(int index) {}
+        virtual void move_storage(std::string const&amp; save_path, storage_error&amp; ec) = 0;
+        virtual bool verify_resume_data(lazy_entry const&amp; rd, storage_error&amp; error) = 0;
+        virtual bool write_resume_data(entry&amp; rd, storage_error&amp; ec) const = 0;
+        virtual void rename_file(int file, std::string const&amp; new_name, storage_error&amp; ec) = 0;
+        virtual void release_files(storage_error&amp; ec) = 0;
+        virtual void delete_files(storage_error&amp; ec) = 0;
+        virtual void finalize_file(int index, storage_error&amp; ec) {}
         virtual ~storage_interface() {}
+
+        virtual file::aiocb_t* async_readv(file::iovec_t const* bufs, int num_bufs
+                , int piece, int offset, int flags, async_handler* a) = 0;
+        virtual file::aiocb_t* async_writev(file::iovec_t const* bufs, int num_bufs
+                , int piece, int offset, int flags, async_handler* a) = 0;
+
+        virtual void readv_done(file::iovec_t const* bufs, int num_bufs, int piece, int offset);
 
         // non virtual functions
 
         disk_buffer_pool* disk_pool();
-        void set_error(std::string const&amp; file, error_code const&amp; ec) const;
-        error_code const&amp; error() const;
-        std::string const&amp; error_file() const;
-        void clear_error();
+};
+
+struct storage_error
+{
+        // the actual error code
+        error_code ec;
+        // the index of the file the error occurred on
+        int file;
+        // the operation that failed
+        // this must be a string literal, it
+        // should never be freed
+        char const* operation;
 };
 </pre>
 <div class="section" id="initialize">
 <h2>initialize()</h2>
 <blockquote>
 <pre class="literal-block">
-bool initialize(bool allocate_files) = 0;
+virtual void initialize(bool allocate_files, storage_error&amp; ec) = 0;
 </pre>
 </blockquote>
 <p>This function is called when the storage is to be initialized. The default storage
 will create directories and empty files at this point. If <tt class="docutils literal"><span class="pre">allocate_files</span></tt> is true,
 it will also <tt class="docutils literal"><span class="pre">ftruncate</span></tt> all files to their target size.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">true</span></tt> indicates an error occurred.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="has-any-file">
 <h2>has_any_file()</h2>
 <blockquote>
 <pre class="literal-block">
-virtual bool has_any_file() = 0;
+virtual bool has_any_file(storage_error&amp; ec) = 0;
 </pre>
 </blockquote>
 <p>This function is called when first checking (or re-checking) the storage for a torrent.
 It should return true if any of the files that is used in this storage exists on disk.
 If so, the storage will be checked for existing pieces before starting the download.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="hint-read">
 <h2>hint_read()</h2>
@@ -7958,17 +8122,20 @@ void hint_read(int slot, int offset, int len);
 opportunity to hint the operating system about this coming read. For instance, the
 storage may call <tt class="docutils literal"><span class="pre">posix_fadvise(POSIX_FADV_WILLNEED)</span></tt> or <tt class="docutils literal"><span class="pre">fcntl(F_RDADVISE)</span></tt>.</p>
 </div>
-<div class="section" id="readv-writev">
-<h2>readv() writev()</h2>
+<div class="section" id="async-readv-async-writev">
+<h2>async_readv() async_writev()</h2>
 <blockquote>
 <pre class="literal-block">
-int readv(file::iovec_t const* buf, int slot, int offset, int num_bufs) = 0;
-int write(const char* buf, int slot, int offset, int size) = 0;
+virtual file::aiocb_t* async_readv(file::iovec_t const* bufs, int num_bufs
+        , int piece, int offset, int flags, async_handler* a) = 0;
+virtual file::aiocb_t* async_writev(file::iovec_t const* bufs, int num_bufs
+        , int piece, int offset, int flags, async_handler* a) = 0;
 </pre>
 </blockquote>
-<p>These functions should read or write the data in or to the given <tt class="docutils literal"><span class="pre">slot</span></tt> at the given <tt class="docutils literal"><span class="pre">offset</span></tt>.
-It should read or write <tt class="docutils literal"><span class="pre">num_bufs</span></tt> buffers sequentially, where the size of each buffer
-is specified in the buffer array <tt class="docutils literal"><span class="pre">bufs</span></tt>. The <a class="reference external" href="file::iovec_t">file::iovec_t</a> type has the following members:</p>
+<p>These functions should produce I/O jobs (<tt class="docutils literal"><span class="pre">aiocb_t</span></tt>) to read or write the data in
+or to the given <tt class="docutils literal"><span class="pre">piece</span></tt> at the given <tt class="docutils literal"><span class="pre">offset</span></tt>. It should read or write <tt class="docutils literal"><span class="pre">num_bufs</span></tt>
+buffers sequentially, where the size of each buffer is specified in the buffer array
+<tt class="docutils literal"><span class="pre">bufs</span></tt>. The <a class="reference external" href="file::iovec_t">file::iovec_t</a> type has the following members:</p>
 <pre class="literal-block">
 struct iovec_t
 {
@@ -7976,16 +8143,51 @@ struct iovec_t
         size_t iov_len;
 };
 </pre>
-<p>The return value is the number of bytes actually read or written, or -1 on failure. If
-it returns -1, the error code is expected to be set to</p>
+<p>The return value is a <em>chain</em> (linked list) of <tt class="docutils literal"><span class="pre">aiocb_t</span></tt> objects representing all jobs
+required to satisfy the read or write request. The <tt class="docutils literal"><span class="pre">aiocb_t</span></tt> objects are produced by
+the async. operations of the <tt class="docutils literal"><span class="pre">file</span></tt> class.</p>
+<p>Each <tt class="docutils literal"><span class="pre">aiocb</span></tt> object that is returned, must also have its handler set to the
+passed in <tt class="docutils literal"><span class="pre">async_handler</span></tt> object. The <tt class="docutils literal"><span class="pre">async_handler</span></tt> object, must in turn
+have its references member incremented for each <tt class="docutils literal"><span class="pre">aiocb_t</span></tt> object that references it.</p>
+<p>The <tt class="docutils literal"><span class="pre">file::async_handler</span></tt> class has the following definition:</p>
+<pre class="literal-block">
+struct async_handler
+{
+        async_handler(ptime now);
+        boost::function&lt;void(async_handler*)&gt; handler;
+        storage_error error;
+        size_t transferred;
+        int references;
+        ptime started;
+
+        void done(storage_error const&amp; ec, size_t bytes_transferred
+                , file::aiocb_t const* aio, aiocb_pool* pool);
+};
+</pre>
 <p>Every buffer in <tt class="docutils literal"><span class="pre">bufs</span></tt> can be assumed to be page aligned and be of a page aligned size,
 except for the last buffer of the torrent. The allocated buffer can be assumed to fit a
 fully page aligned number of bytes though. This is useful when reading and writing the
 last piece of a file in unbuffered mode.</p>
 <p>The <tt class="docutils literal"><span class="pre">offset</span></tt> is aligned to 16 kiB boundries  <em>most of the time</em>, but there are rare
 exceptions when it's not. Specifically if the read cache is disabled/or full and a
-client requests unaligned data, or the file itself is not aligned in the torrent.
-Most clients request aligned data.</p>
+client requests unaligned data. Most clients request aligned data.</p>
+<p>If the function returns NULL, no disk operation is assumed to  be required, and the
+completion handler is called immediately. This is a special case that can be used by
+storage implementations that stores the data in RAM for instance.</p>
+</div>
+<div class="section" id="readv-done">
+<h2>readv_done()</h2>
+<blockquote>
+<pre class="literal-block">
+void readv_done(file::iovec_t const* bufs, int num_bufs, int piece, int offset);
+</pre>
+</blockquote>
+<p>This function is called when all asynchronous disk operations complete from a previous
+call to <tt class="docutils literal"><span class="pre">async_readv()</span></tt>. It is not called for <tt class="docutils literal"><span class="pre">async_readv</span></tt> invocations that don't
+return any async disk jobs. It passes in the same buffers that were passed in to the read
+call.</p>
+<p>The intention of this hook is to allow the storage to do any post processing on the data
+that was just read from disk.</p>
 </div>
 <div class="section" id="sparse-end">
 <h2>sparse_end()</h2>
@@ -8003,110 +8205,72 @@ zeros when checking files.</p>
 <h2>move_storage()</h2>
 <blockquote>
 <pre class="literal-block">
-bool move_storage(fs::path save_path) = 0;
+void move_storage(fs::path save_path, storage_error&amp; ec) = 0;
 </pre>
 </blockquote>
 <p>This function should move all the files belonging to the storage to the new save_path.
 The default storage moves the single file or the directory of the torrent.</p>
 <p>Before moving the files, any open file handles may have to be closed, like
 <tt class="docutils literal"><span class="pre">release_files()</span></tt>.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">false</span></tt> indicates an error occurred.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="verify-resume-data">
 <h2>verify_resume_data()</h2>
 <blockquote>
 <pre class="literal-block">
-bool verify_resume_data(lazy_entry const&amp; rd, error_code&amp; error) = 0;
+bool verify_resume_data(lazy_entry const&amp; rd, storage_error&amp; error) = 0;
 </pre>
 </blockquote>
 <p>This function should verify the resume data <tt class="docutils literal"><span class="pre">rd</span></tt> with the files
 on disk. If the resume data seems to be up-to-date, return true. If
 not, set <tt class="docutils literal"><span class="pre">error</span></tt> to a description of what mismatched and return false.</p>
 <p>The default storage may compare file sizes and time stamps of the files.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">false</span></tt> indicates an error occurred.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="write-resume-data">
 <h2>write_resume_data()</h2>
 <blockquote>
 <pre class="literal-block">
-bool write_resume_data(entry&amp; rd) const = 0;
+bool write_resume_data(entry&amp; rd, storage_error&amp; ec) const = 0;
 </pre>
 </blockquote>
 <p>This function should fill in resume data, the current state of the
 storage, in <tt class="docutils literal"><span class="pre">rd</span></tt>. The default storage adds file timestamps and
 sizes.</p>
 <p>Returning <tt class="docutils literal"><span class="pre">true</span></tt> indicates an error occurred.</p>
-</div>
-<div class="section" id="move-slot">
-<h2>move_slot()</h2>
-<blockquote>
-<pre class="literal-block">
-bool move_slot(int src_slot, int dst_slot) = 0;
-</pre>
-</blockquote>
-<p>This function should copy or move the data in slot <tt class="docutils literal"><span class="pre">src_slot</span></tt> to
-the slot <tt class="docutils literal"><span class="pre">dst_slot</span></tt>. This is only used in compact mode.</p>
-<p>If the storage caches slots, this could be implemented more
-efficient than reading and writing the data.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">true</span></tt> indicates an error occurred.</p>
-</div>
-<div class="section" id="swap-slots">
-<h2>swap_slots()</h2>
-<blockquote>
-<pre class="literal-block">
-bool swap_slots(int slot1, int slot2) = 0;
-</pre>
-</blockquote>
-<p>This function should swap the data in <tt class="docutils literal"><span class="pre">slot1</span></tt> and <tt class="docutils literal"><span class="pre">slot2</span></tt>. The default
-storage uses a scratch buffer to read the data into, then moving the other
-slot and finally writing back the temporary slot's data</p>
-<p>This is only used in compact mode.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">true</span></tt> indicates an error occurred.</p>
-</div>
-<div class="section" id="swap-slots3">
-<h2>swap_slots3()</h2>
-<blockquote>
-<pre class="literal-block">
-bool swap_slots3(int slot1, int slot2, int slot3) = 0;
-</pre>
-</blockquote>
-<p>This function should do a 3-way swap, or shift of the slots. <tt class="docutils literal"><span class="pre">slot1</span></tt>
-should move to <tt class="docutils literal"><span class="pre">slot2</span></tt>, which should be moved to <tt class="docutils literal"><span class="pre">slot3</span></tt> which in turn
-should be moved to <tt class="docutils literal"><span class="pre">slot1</span></tt>.</p>
-<p>This is only used in compact mode.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">true</span></tt> indicates an error occurred.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="id11">
 <h2>rename_file()</h2>
 <blockquote>
 <pre class="literal-block">
-bool rename_file(int file, std::string const&amp; new_name) = 0;
+void rename_file(int file, std::string const&amp; new_name, storage_error&amp; ec) = 0;
 </pre>
 </blockquote>
-<p>Rename file with index <tt class="docutils literal"><span class="pre">file</span></tt> to the thame <tt class="docutils literal"><span class="pre">new_name</span></tt>. If there is an error,
-<tt class="docutils literal"><span class="pre">true</span></tt> should be returned.</p>
+<p>Rename file with index <tt class="docutils literal"><span class="pre">file</span></tt> to the thame <tt class="docutils literal"><span class="pre">new_name</span></tt>.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="release-files">
 <h2>release_files()</h2>
 <blockquote>
 <pre class="literal-block">
-bool release_files() = 0;
+void release_files(storage_error&amp; ec) = 0;
 </pre>
 </blockquote>
 <p>This function should release all the file handles that it keeps open to files
 belonging to this storage. The default implementation just calls
 <tt class="docutils literal"><span class="pre">file_pool::release_files(this)</span></tt>.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">true</span></tt> indicates an error occurred.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="delete-files">
 <h2>delete_files()</h2>
 <blockquote>
 <pre class="literal-block">
-bool delete_files() = 0;
+void delete_files(storage_error&amp; ec) = 0;
 </pre>
 </blockquote>
 <p>This function should delete all files and directories belonging to this storage.</p>
-<p>Returning <tt class="docutils literal"><span class="pre">true</span></tt> indicates an error occurred.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 <p>The <tt class="docutils literal"><span class="pre">disk_buffer_pool</span></tt> is used to allocate and free disk buffers. It has the
 following members:</p>
 <pre class="literal-block">
@@ -8128,7 +8292,7 @@ struct disk_buffer_pool : boost::noncopyable
 <h2>finalize_file()</h2>
 <blockquote>
 <pre class="literal-block">
-virtual void finalize_file(int index);
+virtual void finalize_file(int index, storage_error&amp; ec);
 </pre>
 </blockquote>
 <p>This function is called each time a file is completely downloaded. The
@@ -8137,6 +8301,7 @@ not be opened for writing after this.</p>
 <p><tt class="docutils literal"><span class="pre">index</span></tt> is the index of the file that completed.</p>
 <p>On windows the default storage implementation clears the sparse file flag
 on the specified file.</p>
+<p>If an error occurs, <tt class="docutils literal"><span class="pre">storage_error</span></tt> should be set to reflect it.</p>
 </div>
 <div class="section" id="example">
 <h2>example</h2>
@@ -8169,11 +8334,8 @@ struct temp_storage : storage_interface
         virtual bool rename_file(int file, std::string const&amp; new_name)
         { assert(false); return false; }
         virtual bool move_storage(std::string const&amp; save_path) { return false; }
-        virtual bool verify_resume_data(lazy_entry const&amp; rd, error_code&amp; error) { return false; }
+        virtual bool verify_resume_data(lazy_entry const&amp; rd, storage_error&amp; error) { return false; }
         virtual bool write_resume_data(entry&amp; rd) const { return false; }
-        virtual bool move_slot(int src_slot, int dst_slot) { assert(false); return false; }
-        virtual bool swap_slots(int slot1, int slot2) { assert(false); return false; }
-        virtual bool swap_slots3(int slot1, int slot2, int slot3) { assert(false); return false; }
         virtual size_type physical_offset(int slot, int offset)
         { return slot * m_files.piece_length() + offset; };
         virtual sha1_hash hash_for_slot(int slot, partial_hash&amp; ph, int piece_size)
@@ -8871,6 +9033,31 @@ the same peer.</p>
 <p><em>TODO: piece affinity by speed category</em>
 <em>TODO: piece priorities</em></p>
 </div>
+</div>
+<div class="section" id="predictive-piece-announce">
+<h1>predictive piece announce</h1>
+<p>In order to improve performance, libtorrent supports a feature called
+<tt class="docutils literal"><span class="pre">predictive</span> <span class="pre">piece</span> <span class="pre">announce</span></tt>. When enabled, it will make libtorrent announce
+that we have pieces to peers, before we truly have them. The most important
+case is to announce a piece as soon as it has been downloaded and passed
+the hash check, but not yet been written to disk. In this case, there is
+a risk the piece will fail to be written to disk, in which case we won't have
+the piece anymore, even though we announced it to peers.</p>
+<p>The other case is when we're very close to completing the download of a piece
+and assume it will pass the hash check, we can announce it to peers to make
+it available one round-trip sooner than otherwise. This lets libtorrent start
+uploading the piece to interested peers immediately when the piece complete, instead
+of waiting one round-trip for the peers to request it.</p>
+<p>This makes for the implementation slightly more complicated, since piece will have
+more states and more complicated transitions. For instance, a piece could be:</p>
+<ol class="arabic simple">
+<li>hashed but not fully written to disk</li>
+<li>fully written to disk but not hashed</li>
+<li>not fully downloaded</li>
+<li>downloaded and hash checked</li>
+</ol>
+<p>Once a piece is fully downloaded, the hash check could complete before any of
+the write operations or it could complete after all write operations are complete.</p>
 </div>
 <div class="section" id="ssl-torrents">
 <h1>SSL torrents</h1>

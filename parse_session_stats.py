@@ -52,7 +52,7 @@ def plot_fun(script):
 	sys.stdout.write('.')
 	sys.stdout.flush()
 
-def gen_report(name, unit, lines, short_unit, generation, log_file, type=line_graph):
+def gen_report(name, unit, lines, short_unit, generation, log_file, options):
 	try:
 		os.mkdir(output_dir)
 	except: pass
@@ -76,16 +76,18 @@ def gen_report(name, unit, lines, short_unit, generation, log_file, type=line_gr
 	out = open(script, 'wb')
 	print >>out, "set term png size 1200,700"
 	print >>out, 'set output "%s"' % filename
-	print >>out, 'set yrange [0:*]'
+	if 'allow-negative' in options:
+		print >>out, 'set yrange [0:*]'
 	print >>out, "set tics nomirror"
 	print >>out, "set key box"
-	if type == histogram:
-		binwidth = 0.005;
+	if options['type'] == histogram:
+		binwidth = options['binwidth']
+		numbins = int(options['numbins'])
 
 		print >>out, 'binwidth=%f' % binwidth
 		print >>out, 'set boxwidth binwidth'
 		print >>out, 'bin(x,width)=width*floor(x/width) + binwidth/2'
-		print >>out, 'set xrange [0:%f]' % (binwidth * 100)
+		print >>out, 'set xrange [0:%f]' % (binwidth * numbins)
 		print >>out, 'set xlabel "%s"' % unit
 		print >>out, 'set ylabel "number"'
 
@@ -100,7 +102,7 @@ def gen_report(name, unit, lines, short_unit, generation, log_file, type=line_gr
 		print >>out, ''
 		print >>out, ''
 
-	elif type == stacked:
+	elif options['type'] == stacked:
 		print >>out, 'set xrange [0:*]'
 		print >>out, 'set ylabel "%s"' % unit
 		print >>out, 'set xlabel "time (s)"'
@@ -190,7 +192,7 @@ def gen_html(reports, generations):
 reports = [
 	('torrents', 'num', '', 'number of torrents in different torrent states', ['downloading torrents', 'seeding torrents', \
 		'checking torrents', 'stopped torrents', 'upload-only torrents', 'error torrents', 'queued seed torrents', \
-		'queued download torrents'], stacked),
+		'queued download torrents'], {'type':stacked}),
 	('torrents_want_peers', 'num', '', 'number of torrents that want more peers', ['torrents want more peers']),
 	('peers', 'num', '', 'num connected peers', ['peers', 'connecting peers', 'connection attempts', 'banned peers', 'total peers']),
 	('peers_max', 'num', '', 'num connected peers', ['peers', 'connecting peers', 'connection attempts', 'banned peers', 'max connections', 'total peers']),
@@ -199,7 +201,7 @@ reports = [
 	('connect_candidates', 'num', '', 'number of peers we know of that we can connect to', ['connect candidates']),
 	('peers_list_size', 'num', '', 'number of known peers (not necessarily connected)', ['num list peers']),
 	('overall_rates', 'rate', 'B/s', 'download and upload rates', ['uploaded bytes', 'downloaded bytes', 'upload rate', 'download rate', 'smooth upload rate', 'smooth download rate']),
-	('disk_write_queue', 'Bytes', 'B', 'bytes queued up by peers, to be written to disk', ['disk write queued bytes', 'disk queue limit', 'disk queue low watermark']),
+	('disk_write_queue', 'Bytes', 'B', 'bytes queued up by peers, to be written to disk', ['disk write queued bytes']),
 	('peers_requests', 'num', '', 'incoming piece request rate', ['piece requests', 'piece rejects', 'max piece requests', 'invalid piece requests', 'choked piece requests', 'cancelled piece requests']),
 	('peers_upload', 'num', '', 'number of peers by state wrt. uploading', ['peers up interested', 'peers up unchoked', 'peers up requests', 'peers disk-up', 'peers up send buffer', 'peers bw-up', 'max unchoked']),
 	('peers_download', 'num', '', 'number of peers by state wrt. downloading', ['peers down interesting', 'peers down unchoked', 'peers down requests', 'peers disk-down', 'peers bw-down','num end-game peers']),
@@ -208,49 +210,58 @@ reports = [
 	('peer_errors_transport', 'num', '', 'number of peers by transport protocol', ['error tcp peers', 'error utp peers']),
 	('peer_errors_encryption', 'num', '', 'number of peers by encryption level', ['error encrypted peers', 'error rc4 peers', 'peer disconnects']),
 	('incoming requests', 'num', '', 'incoming 16kiB block requests', ['pending incoming block requests', 'average pending incoming block requests']),
-	('waste', '% of all downloaded bytes', '%%', 'proportion of all downloaded bytes that were wasted', ['% failed payload bytes', '% wasted payload bytes', '% protocol bytes'], stacked),
-	('waste by source', '% of all wasted bytes', '%%', 'what\' causing the waste', [ 'redundant timed-out', 'redundant cancelled', 'redundant unknown', 'redundant seed', 'redundant end-game', 'redundant closing'], stacked),
+	('disk_write_time', 'write time', 's', 'distribution of write jobs timing', ['disk write time'], {'type': 'histogram', 'binwidth': 0.1, 'numbins': 400}),
+	('disk_read_time', 'read time', 's', 'distribution of read jobs timing', ['disk read time'], {'type': 'histogram', 'binwidth': 0.1, 'numbins': 400}),
+	('average_disk_issue_time_absolute', 'job time', 's', 'running averages of issue timing of disk operations', ['disk issue time']),
+	('waste', '% of all downloaded bytes', '%%', 'proportion of all downloaded bytes that were wasted', ['% failed payload bytes', '% wasted payload bytes', '% protocol bytes'], {'type':stacked}),
+	('waste by source', '% of all wasted bytes', '%%', 'what\' causing the waste', [ 'redundant timed-out', 'redundant cancelled', 'redundant unknown', 'redundant seed', 'redundant end-game', 'redundant closing'], {'type':stacked}),
 	('average_disk_time_absolute', 'job time', 's', 'running averages of timings of disk operations', ['disk read time', 'disk write time', 'disk hash time', 'disk job time', 'disk sort time']),
 	('average_disk_queue_time', 'job queued time', 's', 'running averages of disk queue time', ['disk queue time', 'disk job time']),
-	('disk_time', '% of total disk job time', '%%', 'proportion of time spent by the disk thread', ['% read time', '% write time', '% hash time', '% sort time'], stacked),
+	('disk_time', '% of total disk job time', '%%', 'proportion of time spent by the disk thread', ['% read time', '% write time', '% hash time', '% sort time', '% issue time'], {'type': stacked}),
 	('disk_cache_hits', 'blocks (16kiB)', '', '', ['disk block read', 'read cache hits', 'disk block written', 'disk read back']),
-	('disk_cache', 'blocks (16kiB)', '', 'disk cache size and usage', ['disk buffer allocations', 'read disk cache size', 'disk cache size', 'cache size']),
+	('disk_cache', 'blocks (16kiB)', '', 'disk cache size and usage', ['disk buffer allocations', 'read disk cache size', 'disk cache size', 'cache size', 'pinned blocks', 'cache trim low watermark']),
 	('disk_readback', '% of written blocks', '%%', 'portion of written blocks that had to be read back for hash verification', ['% read back']),
-	('disk_queue', 'number of queued disk jobs', '', 'queued disk jobs', ['disk queue size', 'disk read queue size', 'read job queue size limit']),
+	('disk_queue', 'number of queued disk jobs', '', 'queued disk jobs', ['disk queue size', 'disk read queue size', 'allocated jobs', 'allocated read jobs', 'allocated write jobs']),
 	('disk_iops', 'operations/s', '', 'number of disk operations per second', ['read ops/s', 'write ops/s', 'smooth read ops/s', 'smooth write ops/s']),
+	('disk aiocb completion', 'operations/s', '', 'number of disk operations per second', ['completed aio jobs', 'in progress aio jobs']),
 	('disk pending reads', 'Bytes', '', 'number of bytes peers are waiting for to be read from the disk', ['pending reading bytes']),
 	('mixed mode', 'rate', 'B/s', 'rates by transport protocol', ['TCP up rate','TCP down rate','uTP up rate','uTP down rate','TCP up limit','TCP down limit']),
 	('connection_type', 'num', '', 'peers by transport protocol', ['utp peers','tcp peers']),
 	('uTP delay', 'buffering delay', 's', 'network delays measured by uTP', ['uTP peak send delay','uTP peak recv delay', 'uTP avg send delay', 'uTP avg recv delay']),
-	('uTP send delay histogram', 'buffering delay', 's', 'send delays measured by uTP', ['uTP avg send delay'], histogram),
-	('uTP recv delay histogram', 'buffering delay', 's', 'receive delays measured by uTP', ['uTP avg recv delay'], histogram),
-	('uTP stats', 'num', '', 'number of uTP sockets by state', ['uTP idle', 'uTP syn-sent', 'uTP connected', 'uTP fin-sent', 'uTP close-wait'], stacked),
-	('system memory', '', '', 'virtual memory page count', ['active resident pages', 'inactive resident pages', 'pinned resident pages', 'free pages'], stacked),
+	('uTP send delay histogram', 'buffering delay', 's', 'send delays measured by uTP', ['uTP avg send delay'], {'type': 'histogram', 'binwidth': 0.05, 'numbins': 100}),
+	('uTP recv delay histogram', 'buffering delay', 's', 'receive delays measured by uTP', ['uTP avg recv delay'], {'type': 'histogram', 'binwidth': 0.05, 'numbins': 100}),
+	('uTP stats', 'num', 's', 'number of uTP sockets by state', ['uTP idle', 'uTP syn-sent', 'uTP connected', 'uTP fin-sent', 'uTP close-wait'], {'type': stacked}),
+	('system memory', '', '', 'virtual memory page count', ['active resident pages', 'inactive resident pages', 'pinned resident pages', 'free pages'], {'type': stacked}),
 	('memory paging', '', '', 'vm disk activity', ['pageins', 'pageouts']),
 	('page faults', '', '', '', ['page faults']),
 	('CPU usage', '%', '', '', ['network thread system time', 'network thread user+system time']),
 	('boost.asio messages', 'events/s', '', 'number of messages posted per second', [ \
 		'read_counter', 'write_counter', 'tick_counter', 'lsd_counter', \
 		'lsd_peer_counter', 'udp_counter', 'accept_counter', 'disk_queue_counter', \
-		'disk_read_counter', 'disk_write_counter'], stacked),
+		'disk_counter'], {'type': stacked}),
 	('send_buffer_sizes', 'num', '', '', ['up 8', 'up 16', 'up 32', 'up 64', 'up 128', 'up 256', \
 		'up 512', 'up 1024', 'up 2048', 'up 4096', 'up 8192', 'up 16384', 'up 32768', 'up 65536', \
-		'up 131072', 'up 262144'], stacked),
+		'up 131072', 'up 262144'], {'type': stacked}),
 	('recv_buffer_sizes', 'num', '', '', ['down 8', 'down 16', 'down 32', 'down 64', 'down 128', \
 		'down 256', 'down 512', 'down 1024', 'down 2048', 'down 4096', 'down 8192', 'down 16384', \
-		'down 32768', 'down 65536', 'down 131072', 'down 262144'], stacked),
+		'down 32768', 'down 65536', 'down 131072', 'down 262144'], {'type': stacked}),
+	('ARC', 'num pieces', '', '', ['arc LRU pieces', 'arc LRU ghost pieces', 'arc LFU pieces', 'arc LFU ghost pieces'], {'allow-negative': True, 'type': 'lines'}),
 #	('absolute_waste', 'num', '', ['failed bytes', 'redundant bytes', 'download rate']),
 
 #somewhat uninteresting stats
 	('tick_rate', 'time between ticks', 's', '', ['tick interval', 'tick residual']),
-	('peer_dl_rates', 'num', '', 'peers split into download rate buckets', ['peers down 0', 'peers down 0-2', 'peers down 2-5', 'peers down 5-10', 'peers down 50-100', 'peers down 100-'], stacked),
-	('peer_dl_rates2', 'num', '', 'peers split into download rate buckets (only downloading peers)', ['peers down 0-2', 'peers down 2-5', 'peers down 5-10', 'peers down 50-100', 'peers down 100-'], stacked),
-	('peer_ul_rates', 'num', '', 'peers split into upload rate buckets', ['peers up 0', 'peers up 0-2', 'peers up 2-5', 'peers up 5-10', 'peers up 50-100', 'peers up 100-'], stacked),
-	('peer_ul_rates2', 'num', '', 'peers split into upload rate buckets (only uploading peers)', ['peers up 0-2', 'peers up 2-5', 'peers up 5-10', 'peers up 50-100', 'peers up 100-'], stacked),
+	('peer_dl_rates', 'num', '', 'peers split into download rate buckets', ['peers down 0', 'peers down 0-2', 'peers down 2-5', 'peers down 5-10', 'peers down 50-100', 'peers down 100-'], {'type':stacked}),
+	('peer_dl_rates2', 'num', '', 'peers split into download rate buckets (only downloading peers)', ['peers down 0-2', 'peers down 2-5', 'peers down 5-10', 'peers down 50-100', 'peers down 100-'], {'type':stacked}),
+	('peer_ul_rates', 'num', '', 'peers split into upload rate buckets', ['peers up 0', 'peers up 0-2', 'peers up 2-5', 'peers up 5-10', 'peers up 50-100', 'peers up 100-'], {'type':stacked}),
+	('peer_ul_rates2', 'num', '', 'peers split into upload rate buckets (only uploading peers)', ['peers up 0-2', 'peers up 2-5', 'peers up 5-10', 'peers up 50-100', 'peers up 100-'], {'type':stacked}),
 	('piece_picker_end_game', 'blocks', '', '', ['end game piece picker blocks', 'piece picker blocks', \
 		'piece picks', 'reject piece picks', 'unchoke piece picks', 'incoming redundant piece picks', \
-		'incoming piece picks', 'end game piece picks', 'snubbed piece picks'], stacked),
-	('piece_picker', 'blocks', '', '', ['piece picks', 'reject piece picks', 'unchoke piece picks', 'incoming redundant piece picks', 'incoming piece picks', 'end game piece picks', 'snubbed piece picks'], stacked),
+		'incoming piece picks', 'end game piece picks', 'snubbed piece picks'], {'type':stacked}),
+	('piece_picker', 'blocks', '', '', ['piece picks', 'reject piece picks', 'unchoke piece picks', 'incoming redundant piece picks', 'incoming piece picks', 'end game piece picks', 'snubbed piece picks'], {'type':stacked}),
+	('piece_picker_loops', 'num checked pieces', '', '', ['piece picker loops']),
+	('picker_partials', 'pieces', '', '', ['num partial pieces', 'num downloading partial pieces', 'num full partial pieces', 'num finished partial pieces']),
+	('picker_full_partials_distribution', 'full pieces', 'count', '', ['num full partial pieces'], {'type': 'histogram', 'binwidth': 5, 'numbins': 120}),
+	('picker_partials_distribution', 'partial pieces', 'count', '', ['num downloading partial pieces'], {'type': 'histogram', 'binwidth': 5, 'numbins': 120})
 ]
 
 print 'generating graphs'
@@ -263,10 +274,10 @@ scripts = []
 while os.path.exists(os.path.join(log_file_path, log_file)):
 	print '[%s] %04d\r[' % (' ' * len(reports), g),
 	for i in reports:
-		type = line_graph
-		try: type = i[5]
+		options = {'type': line_graph}
+		try: options = i[5]
 		except: pass
-		script = gen_report(i[0], i[1], i[4], i[2], g, os.path.join(log_file_path, log_file), type)
+		script = gen_report(i[0], i[1], i[4], i[2], g, os.path.join(log_file_path, log_file), options)
 		if script != None: scripts.append(script)
 	generations.append(g)
 	g += 1

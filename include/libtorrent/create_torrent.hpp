@@ -208,11 +208,11 @@ namespace libtorrent
 	}
 	
 	TORRENT_EXPORT void set_piece_hashes(create_torrent& t, std::string const& p
-		, boost::function<void(int)> f, error_code& ec);
+		, boost::function<void(int)> const& f, error_code& ec);
 
 #ifndef BOOST_NO_EXCEPTIONS
-	template <class Fun>
-	void set_piece_hashes(create_torrent& t, std::string const& p, Fun f)
+	inline void set_piece_hashes(create_torrent& t, std::string const& p
+		, boost::function<void(int i)> const& f)
 	{
 		error_code ec;
 		set_piece_hashes(t, p, f, ec);
@@ -252,8 +252,13 @@ namespace libtorrent
 			, filename(utf8), detail::default_pred, flags);
 	}
 	
-	void TORRENT_EXPORT set_piece_hashes(create_torrent& t, std::wstring const& p
-		, boost::function<void(int)> const& f, error_code& ec);
+	inline void set_piece_hashes(create_torrent& t, std::wstring const& p, boost::function<void(int)> f
+		, error_code& ec)
+	{
+		std::string utf8;
+		wchar_utf8(p, utf8);
+		set_piece_hashes(t, utf8, f, ec);
+	}
 
 #ifndef BOOST_NO_EXCEPTIONS
 	template <class Fun>

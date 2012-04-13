@@ -51,10 +51,21 @@ POSSIBILITY OF SUCH DAMAGE.
 
 namespace libtorrent
 {
+	struct pool_file_status
+	{
+		int file_index;
+		ptime last_use;
+		int open_mode;
+	};
+
 	struct TORRENT_EXPORT file_pool : boost::noncopyable
 	{
 		file_pool(int size = 40);
 		~file_pool();
+#if defined TORRENT_DEBUG && defined BOOST_HAS_PTHREADS
+		void set_thread_owner();
+		void clear_thread_owner();
+#endif
 
 		boost::intrusive_ptr<file> open_file(void* st, std::string const& p
 			, file_storage::iterator fe, file_storage const& fs, int m, error_code& ec);
@@ -63,6 +74,11 @@ namespace libtorrent
 		void resize(int size);
 		int size_limit() const { return m_size; }
 		void set_low_prio_io(bool b) { m_low_prio_io = b; }
+		void get_status(std::vector<pool_file_status>* files, void* st) const;
+
+#if TORRENT_USE_OVERLAPPED
+		void set_iocp(HANDLE completion_port) { m_iocp = completion_port; }
+#endif
 
 	private:
 
@@ -85,7 +101,14 @@ namespace libtorrent
 		typedef std::map<std::pair<void*, int>, lru_file_entry> file_set;
 		
 		file_set m_files;
-		mutex m_mutex;
+
+#if defined TORRENT_DEBUG && defined BOOST_HAS_PTHREADS
+		pthread_t m_owning_thread;
+#endif
+
+#if TORRENT_USE_OVERLAPPED
+		HANDLE m_iocp;
+#endif
 
 #if TORRENT_CLOSE_MAY_BLOCK
 		void closer_thread_fun();

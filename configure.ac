@@ -111,7 +111,7 @@ AS_IF([test -z "$BOOST_SYSTEM_LIB"],
       [AC_MSG_ERROR(Boost.System library not found. Try using --with-boost-system=lib)])
 
 CPPFLAGS="$BOOST_CPPFLAGS $CPPFLAGS"
-LDFLAGS="$BOOST_LDFLAGS $LDFLAGS"
+LDFLAGS="$BOOST_LDFLAGS $LDFLAGS -laio"
 
 
 ###############################################################################
@@ -636,7 +636,6 @@ AC_CONFIG_FILES(
   [include/libtorrent/Makefile]
   [examples/Makefile]
   [test/Makefile]
-  [tools/Makefile]
   [bindings/Makefile]
   [bindings/python/Makefile]
   [bindings/python/setup.py]

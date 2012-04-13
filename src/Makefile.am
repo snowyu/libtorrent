@@ -21,7 +21,8 @@ ASIO_OPENSSL_SOURCES = asio_ssl.cpp
 endif
 
 libtorrent_rasterbar_la_SOURCES = \
-  web_connection_base.cpp     \
+  web_connection_base.cpp         \
+  aiocb_pool.cpp                  \
   alert.cpp                       \
   allocator.cpp                   \
   asio.cpp                        \
@@ -31,6 +32,7 @@ libtorrent_rasterbar_la_SOURCES = \
   bandwidth_queue_entry.cpp       \
   bloom_filter.cpp                \
   broadcast_socket.cpp            \
+  block_cache.cpp                 \
   bt_peer_connection.cpp          \
   chained_buffer.cpp              \
   connection_queue.cpp            \
@@ -38,6 +40,7 @@ libtorrent_rasterbar_la_SOURCES = \
   create_torrent.cpp              \
   disk_buffer_holder.cpp          \
   disk_buffer_pool.cpp            \
+  disk_io_job.cpp                 \
   disk_io_thread.cpp              \
   entry.cpp                       \
   enum_net.cpp                    \
@@ -47,6 +50,7 @@ libtorrent_rasterbar_la_SOURCES = \
   file_pool.cpp                   \
   file_storage.cpp                \
   gzip.cpp                        \
+  hash_thread.cpp                 \
   http_connection.cpp             \
   http_parser.cpp                 \
   http_seed_connection.cpp        \
@@ -62,7 +66,6 @@ libtorrent_rasterbar_la_SOURCES = \
   lt_trackers.cpp                 \
   magnet_uri.cpp                  \
   metadata_transfer.cpp           \
-  mpi.c                           \
   natpmp.cpp                      \
   parse_url.cpp                   \
   pe_crypto.cpp                   \

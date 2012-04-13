@@ -196,7 +196,8 @@ void print_backtrace(char* out, int len, int max_depth)
 
 #else
 
-void print_backtrace(char* out, int len, int max_depth) {}
+void print_backtrace(char* out, int len, int max_depth)
+{ out[0] = 0; }
 
 #endif
 

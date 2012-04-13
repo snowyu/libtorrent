@@ -225,10 +225,9 @@ namespace libtorrent
 			too_many_optimistic_unchoke_slots,
 			bittyrant_with_no_uplimit,
 			too_high_disk_queue_limit,
+			aio_limit_reached,
 			too_few_outgoing_ports,
 			too_few_file_descriptors,
-
-
 
 
 
@@ -685,9 +684,14 @@ namespace libtorrent
 
 	struct TORRENT_EXPORT storage_moved_failed_alert: torrent_alert
 	{
-		storage_moved_failed_alert(torrent_handle const& h, error_code const& ec_)
+		storage_moved_failed_alert(torrent_handle const& h
+			, error_code const& ec
+			, std::string const& file
+			, char const* op)
 			: torrent_alert(h)
-			, error(ec_)
+			, error(ec)
+			, file(file)
+			, operation(op)
 		{}
 	
 		TORRENT_DEFINE_ALERT(storage_moved_failed_alert);
@@ -695,11 +699,14 @@ namespace libtorrent
 		const static int static_category = alert::storage_notification;
 		virtual std::string message() const
 		{
-			return torrent_alert::message() + " storage move failed: "
+			return torrent_alert::message() + " storage move failed. "
+				+ (operation?operation:"") + " (" + file + "): "
 				+ error.message();
 		}
 
 		error_code error;
+		std::string file;
+		char const* operation;
 	};
 
 	struct TORRENT_EXPORT torrent_deleted_alert: torrent_alert
@@ -867,12 +874,14 @@ namespace libtorrent
 	struct TORRENT_EXPORT file_error_alert: torrent_alert
 	{
 		file_error_alert(
-			std::string const& f
-			, torrent_handle const& h
-			, error_code const& e)
+			error_code const& ec
+			, std::string const& file
+			, char const* op
+			, torrent_handle const& h)
 			: torrent_alert(h)
-			, file(f)
-			, error(e)
+			, file(file)
+			, error(ec)
+			, operation(op)
 		{
 #ifndef TORRENT_NO_DEPRECATE
 			msg = error.message();
@@ -886,12 +895,14 @@ namespace libtorrent
 			| alert::storage_notification;
 		virtual std::string message() const
 		{
-			return torrent_alert::message() + " file (" + file + ") error: "
-				+ error.message();
+			return torrent_alert::message() + " "
+				+ (operation?operation:"") + " (" + file
+				+ ") error: " + error.message();
 		}
 
 		std::string file;
 		error_code error;
+		char const* operation;
 
 #ifndef TORRENT_NO_DEPRECATE
 		std::string msg;
@@ -1057,9 +1068,13 @@ namespace libtorrent
 	struct TORRENT_EXPORT fastresume_rejected_alert: torrent_alert
 	{
 		fastresume_rejected_alert(torrent_handle const& h
-			, error_code const& e)
+			, error_code const& ec
+			, std::string const& file
+			, char const* op)
 			: torrent_alert(h)
-			, error(e)
+			, error(ec)
+			, file(file)
+			, operation(op)
 		{
 #ifndef TORRENT_NO_DEPRECATE
 			msg = error.message();
@@ -1071,9 +1086,14 @@ namespace libtorrent
 		const static int static_category = alert::status_notification
 			| alert::error_notification;
 		virtual std::string message() const
-		{ return torrent_alert::message() + " fast resume rejected: " + error.message(); }
+		{
+			return torrent_alert::message() + " fast resume rejected. "
+				+ (operation?operation:"") + "(" + file + "): " + error.message();
+		}
 
 		error_code error;
+		std::string file;
+		char const* operation;
 
 #ifndef TORRENT_NO_DEPRECATE
 		std::string msg;
@@ -1331,6 +1351,17 @@ namespace libtorrent
 		virtual bool discardable() const { return false; }
 
 		std::vector<torrent_status> status;
+	};
+	
+	struct TORRENT_EXPORT mmap_cache_alert : alert
+	{
+		mmap_cache_alert(error_code const& ec): error(ec) {}
+		TORRENT_DEFINE_ALERT(mmap_cache_alert);
+
+		const static int static_category = alert::error_notification;
+		virtual std::string message() const;
+
+		error_code error;
 	};
 
 #undef TORRENT_DEFINE_ALERT

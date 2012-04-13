@@ -223,7 +223,11 @@ namespace libtorrent
 		// then use this mode.
 		p.pick_pieces(*bits, interesting_pieces
 			, num_requests, prefer_whole_pieces, c.peer_info_struct()
-			, state, c.picker_options(), suggested, t.num_peers());
+			, state, c.picker_options(), suggested, t.num_peers()
+#ifdef TORRENT_STATS
+			, ses.m_piece_picker_loops
+#endif
+			);
 
 #ifdef TORRENT_VERBOSE_LOGGING
 		c.peer_log("*** PIECE_PICKER [ prefer_whole: %d picked: %d ]"
@@ -237,7 +241,7 @@ namespace libtorrent
 		// also, if we already have at least one outstanding
 		// request, we shouldn't pick any busy pieces either
 		bool dont_pick_busy_blocks = (ses.m_settings.strict_end_game_mode
-			&& p.num_have() + int(p.get_download_queue().size())
+			&& p.num_have() + p.get_download_queue_size()
 				< t.torrent_file().num_pieces())
 			|| dq.size() + rq.size() > 0;
 
@@ -564,10 +568,6 @@ namespace libtorrent
 		INVARIANT_CHECK;
 
 		TORRENT_ASSERT(p->in_use);
-
-		if (!m_torrent->settings().ban_web_seeds && p->web_seed)
-			return;
-
 		if (is_connect_candidate(*p, m_finished))
 			--m_num_connect_candidates;
 
@@ -699,8 +699,8 @@ namespace libtorrent
 					{
 						if (erase_candidate > current) --erase_candidate;
 						if (candidate > current) --candidate;
+						--m_round_robin;
 						erase_peer(m_peers.begin() + current);
-						continue;
 					}
 					else
 					{
@@ -941,6 +941,8 @@ namespace libtorrent
 				(peer*)m_torrent->session().m_ipv4_peer_pool.malloc();
 			if (p == 0) return false;
 
+			TORRENT_ASSERT(p->in_use == false);
+
 #if TORRENT_USE_IPV6
 			if (is_v6)
 				m_torrent->session().m_ipv6_peer_pool.set_next_size(500);
@@ -978,13 +980,6 @@ namespace libtorrent
 		c.set_peer_info(i);
 		TORRENT_ASSERT(i->connection == 0);
 		c.add_stat(size_type(i->prev_amount_download) << 10, size_type(i->prev_amount_upload) << 10);
-
-		// restore transfer rate limits
-		int rate_limit;
-		rate_limit = i->upload_rate_limit;
-		if (rate_limit) c.set_upload_limit(rate_limit);
-		rate_limit = i->download_rate_limit;
-		if (rate_limit) c.set_download_limit(rate_limit);
 
 		i->prev_amount_download = 0;
 		i->prev_amount_upload = 0;
@@ -1253,7 +1248,7 @@ namespace libtorrent
 				p->in_use = false;
 #endif
 
-				m_torrent->session().m_i2p_peer_pool.destroy((i2p_peer*)p);
+				m_torrent->session().m_i2p_peer_pool.free((i2p_peer*)p);
 				return 0;
 			}
 		}
@@ -1378,10 +1373,10 @@ namespace libtorrent
 				p->in_use = false;
 #endif
 #if TORRENT_USE_IPV6
-				if (is_v6) m_torrent->session().m_ipv6_peer_pool.destroy((ipv6_peer*)p);
+				if (is_v6) m_torrent->session().m_ipv6_peer_pool.free((ipv6_peer*)p);
 				else
 #endif
-				m_torrent->session().m_ipv4_peer_pool.destroy((ipv4_peer*)p);
+				m_torrent->session().m_ipv4_peer_pool.free((ipv4_peer*)p);
 				return 0;
 			}
 #ifndef TORRENT_DISABLE_EXTENSIONS
@@ -1455,10 +1450,6 @@ namespace libtorrent
 		
 		TORRENT_ASSERT(p->connection == &c);
 		TORRENT_ASSERT(!is_connect_candidate(*p, m_finished));
-
-		// save transfer rate limits
-		p->upload_rate_limit = c.upload_limit();
-		p->download_rate_limit = c.download_limit();
 
 		p->connection = 0;
 		p->optimistically_unchoked = false;
@@ -1691,8 +1682,6 @@ namespace libtorrent
 		, last_optimistically_unchoked(0)
 		, last_connected(0)
 		, port(port)
-		, upload_rate_limit(0)
-		, download_rate_limit(0)
 		, hashfails(0)
 		, failcount(0)
 		, connectable(conn)
@@ -1771,6 +1760,10 @@ namespace libtorrent
 
 		if (lhs.connectable != rhs.connectable)
 			return lhs.connectable < rhs.connectable;
+
+		// prefer peers with higher failcount
+		if (lhs.failcount != rhs.failcount)
+			return lhs.failcount > rhs.failcount;
 
 		return lhs.trust_points < rhs.trust_points;
 	}
