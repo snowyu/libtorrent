@@ -119,6 +119,13 @@ bool print_alerts(libtorrent::session& ses, char const* name
 				|| (allow_disconnects && pea->error.message() == "Connection reset by peer")
 				|| (allow_disconnects && pea->error.message() == "End of file."));
 		}
+
+		invalid_request_alert* ira = alert_cast<invalid_request_alert>(*i);
+		if (ira)
+		{
+			fprintf(stderr, "peer error: %s\n", ira->message().c_str());
+			TEST_CHECK(false);
+		}
 		delete *i;
 	}
 	return ret;
@@ -788,6 +795,7 @@ void web_server_thread(int* port, bool ssl, bool chunked)
 			if (ec) fprintf(stderr, "close failed: %s\n", ec.message().c_str());
 			connection_close = false;
 		}
+      ec.clear();
 
 		if (!s.is_open())
 		{
@@ -868,7 +876,14 @@ void web_server_thread(int* port, bool ssl, bool chunked)
 
 			while (!p.finished())
 			{
-				TORRENT_ASSERT(len < int(sizeof(buf)));
+				if (ec)
+				{
+					fprintf(stderr, "?: %s\n", ec.message().c_str());
+               libtorrent::sleep(500);
+					failed = true;
+					break;
+				}
+				TORRENT_ASSERT(len < sizeof(buf));
 				size_t received = 0;
 				bool done = false;
 				bool timed_out = false;
@@ -901,6 +916,7 @@ void web_server_thread(int* port, bool ssl, bool chunked)
 				{
 					fprintf(stderr, "read failed: \"%s\" (%s) received: %d\n"
 						, ec.message().c_str(), ec.category().name(), int(received));
+               libtorrent::sleep(500);
 					failed = true;
 					break;
 				}

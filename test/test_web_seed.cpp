@@ -113,7 +113,8 @@ void test_transfer(boost::intrusive_ptr<torrent_info> torrent_file
 		rate_sum += s.download_payload_rate;
 		ses_rate_sum += ss.payload_download_rate;
 
-		cs = ses.get_cache_status();
+		sha1_hash ih(0);
+		ses.get_cache_info(ih, &cs);
 		if (cs.blocks_read < 1) cs.blocks_read = 1;
 		if (cs.blocks_written < 1) cs.blocks_written = 1;
 /*
@@ -123,8 +124,8 @@ void test_transfer(boost::intrusive_ptr<torrent_info> torrent_file
 			<< " session total: " << ss.total_payload_download
 			<< " torrent total: " << s.total_payload_download
 			<< " rate sum:" << ses_rate_sum
-			<< " cache: " << cs.cache_size
-			<< " rcache: " << cs.read_cache_size
+			<< " w-cache: " << cs.write_cache_size
+			<< " r-cache: " << cs.read_cache_size
 			<< " buffers: " << cs.total_used_buffers
 			<< std::endl;
 */
@@ -152,8 +153,8 @@ void test_transfer(boost::intrusive_ptr<torrent_info> torrent_file
 	// the url seed (i.e. banned it)
 	TEST_CHECK(!test_ban || th.url_seeds().empty());
 
-	TEST_EQUAL(cs.cache_size, 0);
-	TEST_EQUAL(cs.total_used_buffers, 0);
+	TEST_EQUAL(cs.read_cache_size, torrent_file->total_size() / 0x4000);
+	TEST_EQUAL(cs.total_used_buffers, torrent_file->total_size() / 0x4000);
 
 	std::cerr << "total_size: " << total_size
 		<< " rate_sum: " << rate_sum

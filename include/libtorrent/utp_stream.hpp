@@ -143,7 +143,7 @@ utp_socket_impl* construct_utp_impl(boost::uint16_t recv_id
 void detach_utp_impl(utp_socket_impl* s);
 void delete_utp_impl(utp_socket_impl* s);
 bool should_delete(utp_socket_impl* s);
-void tick_utp_impl(utp_socket_impl* s, ptime const& now);
+void tick_utp_impl(utp_socket_impl* s, ptime now);
 void utp_init_mtu(utp_socket_impl* s, int link_mtu, int utp_mtu);
 bool utp_incoming_packet(utp_socket_impl* s, char const* p
 	, int size, udp::endpoint const& ep, ptime receive_time);
@@ -192,7 +192,7 @@ public:
 	void io_control(IO_Control_Command& ioc, error_code& ec) {}
 
 #ifndef BOOST_NO_EXCEPTIONS
-	void bind(endpoint_type const& /*endpoint*/) {}
+	void bind(endpoint_type const& endpoint) {}
 #endif
 
 	void bind(endpoint_type const& endpoint, error_code& ec);
@@ -206,7 +206,7 @@ public:
 	error_code set_option(SettableSocketOption const& opt, error_code& ec) { return ec; }
 
 	void close();
-	void close(error_code const& /*ec*/) { close(); }
+	void close(error_code const& ec) { close(); }
 	bool is_open() const { return m_open; }
 
 	int read_buffer_size() const;
@@ -245,7 +245,7 @@ public:
 	endpoint_type remote_endpoint(error_code& ec) const;
 
 	std::size_t available() const;
-	std::size_t available(error_code& /*ec*/) const { return available(); }
+	std::size_t available(error_code& ec) const { return available(); }
 
 	asio::io_service& get_io_service() { return m_io_service; }
 
@@ -290,6 +290,25 @@ public:
 			using asio::buffer_cast;
 			using asio::buffer_size;
 			add_read_buffer(buffer_cast<void*>(*i), buffer_size(*i));
+		}
+		m_read_handler = handler;
+		set_read_handler(&utp_stream::on_read);
+	}
+
+	template <class Handler>
+	void async_read_some(boost::asio::null_buffers const&, Handler const& handler)
+	{
+		if (m_impl == 0)
+		{
+			m_io_service.post(boost::bind<void>(handler, asio::error::not_connected, 0));
+			return;
+		}
+
+		TORRENT_ASSERT(!m_read_handler);
+		if (m_read_handler)
+		{
+			m_io_service.post(boost::bind<void>(handler, asio::error::operation_not_supported, 0));
+			return;
 		}
 		m_read_handler = handler;
 		set_read_handler(&utp_stream::on_read);

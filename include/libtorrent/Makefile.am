@@ -19,6 +19,7 @@ nobase_include_HEADERS = \
   bandwidth_queue_entry.hpp    \
   bencode.hpp                  \
   bitfield.hpp                 \
+  block_cache.hpp              \
   bloom_filter.hpp             \
   broadcast_socket.hpp         \
   bt_peer_connection.hpp       \
@@ -34,6 +35,7 @@ nobase_include_HEADERS = \
   debug.hpp                    \
   disk_buffer_holder.hpp       \
   disk_buffer_pool.hpp         \
+  disk_io_job.hpp              \
   disk_io_thread.hpp           \
   entry.hpp                    \
   enum_net.hpp                 \
@@ -46,6 +48,7 @@ nobase_include_HEADERS = \
   file_storage.hpp             \
   fingerprint.hpp              \
   gzip.hpp                     \
+  hash_thread.hpp              \
   hasher.hpp                   \
   http_connection.hpp          \
   http_parser.hpp              \
@@ -62,10 +65,13 @@ nobase_include_HEADERS = \
   io_service_fwd.hpp           \
   ip_filter.hpp                \
   lazy_entry.hpp               \
+  link.hpp                     \
+  linked_list.hpp              \
   lsd.hpp                      \
   magnet_uri.hpp               \
   max.hpp                      \
   natpmp.hpp                   \
+  network_thread_pool.hpp      \
   packet_buffer.hpp            \
   parse_url.hpp                \
   pch.hpp                      \
@@ -99,7 +105,9 @@ nobase_include_HEADERS = \
   stat.hpp                     \
   storage.hpp                  \
   storage_defs.hpp             \
+  tailqueue.hpp                \
   thread.hpp                   \
+  thread_pool.hpp              \
   time.hpp                     \
   timestamp_history.hpp        \
   torrent_handle.hpp           \
