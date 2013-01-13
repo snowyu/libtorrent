@@ -76,11 +76,6 @@ namespace libtorrent
 {
 	class torrent;
 
-	namespace detail
-	{
-		struct session_impl;
-	}
-
 	class TORRENT_EXTRA_EXPORT web_connection_base
 		: public peer_connection
 	{
@@ -91,14 +86,13 @@ namespace libtorrent
 		// The peer_conenction should handshake and verify that the
 		// other end has the correct id
 		web_connection_base(
-			aux::session_impl& ses
+			aux::session_interface& ses
+			, aux::session_settings const& sett
+			, buffer_allocator_interface& allocator
+			, disk_interface& disk_thread
 			, boost::weak_ptr<torrent> t
 			, boost::shared_ptr<socket_type> s
-			, tcp::endpoint const& remote
-			, std::string const& url
-			, policy::peer* peerinfo
-			, std::string const& ext_auth
-			, web_seed_entry::headers_t const& ext_headers);
+			, web_seed_entry& web);
 		void start();
 
 		~web_connection_base();
@@ -122,12 +116,14 @@ namespace libtorrent
 		void write_cancel(peer_request const& r)
 		{ incoming_reject_request(r); }
 		void write_have(int index) {}
+		void write_dont_have(int index) {}
 		void write_piece(peer_request const& r, disk_buffer_holder& buffer) { TORRENT_ASSERT(false); }
 		void write_keepalive() {}
 		void on_connected();
 		void write_reject_request(peer_request const&) {}
 		void write_allow_fast(int) {}
 		void write_suggest(int piece) {}
+		void write_bitfield() {}
 
 #ifdef TORRENT_DEBUG
 		void check_invariant() const;

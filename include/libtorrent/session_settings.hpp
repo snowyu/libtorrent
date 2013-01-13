@@ -35,9 +35,10 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "libtorrent/version.hpp"
 #include "libtorrent/config.hpp"
-#include "libtorrent/version.hpp"
 
 #include <string>
+#include <vector>
+#include <utility>
 
 namespace libtorrent
 {
@@ -92,6 +93,7 @@ namespace libtorrent
 		bool proxy_peer_connections;
 	};
 
+#ifndef TORRENT_NO_DEPRECATE
 	struct TORRENT_EXPORT session_settings
 	{
 		session_settings(std::string const& user_agent_ = "libtorrent/"
@@ -208,9 +210,12 @@ namespace libtorrent
 		// connection is dropped. The time is specified in seconds.
 		int peer_connect_timeout;
 
+#ifndef TORRENT_NO_DEPRECATE
+		// deprecated, use set_peer_class_filter() instead
 		// if set to true, upload, download and unchoke limits
 		// are ignored for peers on the local network.
 		bool ignore_limits_on_local_network;
+#endif
 
 		// the number of connection attempts that
 		// are made per second.
@@ -262,24 +267,17 @@ namespace libtorrent
 		enum suggest_mode_t { no_piece_suggestions = 0, suggest_read_cache = 1 };
 		int suggest_mode;
 
-		// the maximum number of bytes a connection may have
-		// pending in the disk write queue before its download
-		// rate is being throttled. This prevents fast downloads
-		// to slow medias to allocate more and more memory
-		// indefinitely. This should be set to at least 16 kB
-		// to not completely disrupt normal downloads. If it's
-		// set to 0, you will be starving the disk thread and
-		// nothing will be written to disk.
-		// this is a per session setting.
+		// this is used to determine how many cache blocks to evict
+		// at a time once the limit is reached. The faster peers are
+		// downloading, and the more peers that are downloading, the
+		// larger this value should be to be efficient. It's specified
+		// in bytes, even though it's rounded to an even block (16kiB)
 		int max_queued_disk_bytes;
 
-		// this is the low watermark for the disk buffer queue.
-		// whenever the number of queued bytes exceed the
-		// max_queued_disk_bytes, libtorrent will wait for
-		// it to drop below this value before issuing more
-		// reads from the sockets. If set to 0, the
-		// low watermark will be half of the max queued disk bytes
+#ifndef TORRENT_NO_DEPRECATE
+		// not used anymore
 		int max_queued_disk_bytes_low_watermark;
+#endif
 
 		// the number of seconds to wait for a handshake
 		// response from a peer. If no response is received
@@ -328,12 +326,6 @@ namespace libtorrent
 		// 100. The default is 50.
 		int send_buffer_watermark_factor;
 
-#ifndef TORRENT_NO_DEPRECATE
-		// deprecated in 0.16
-		bool auto_upload_slots;
-		bool auto_upload_slots_rate_based;
-#endif
-
 		enum choking_algorithm_t
 		{
 			fixed_slots_choker,
@@ -371,6 +363,8 @@ namespace libtorrent
 		// that should be allocated at a time. It must be
 		// at least 1. Lower number saves memory at the expense
 		// of more heap allocations
+		// setting this to zero means 'automatic', i.e. proportional
+		// to the total disk cache size
 		int cache_buffer_chunk_size;
 
 		// the number of seconds a write cache entry sits
@@ -381,6 +375,12 @@ namespace libtorrent
 		// when true, the disk I/O thread uses the disk
 		// cache for caching blocks read from disk too
 		bool use_read_cache;
+		bool use_write_cache;
+
+		// this will make the disk cache never flush a write
+		// piece if it would cause is to have to re-read it
+		// once we want to calculate the piece hash
+		bool dont_flush_write_cache;
 
 		// don't implicitly cache pieces in the read cache,
 		// only cache pieces that are explicitly asked to be
@@ -400,6 +400,9 @@ namespace libtorrent
 		int disk_io_write_mode;
 		int disk_io_read_mode;
 
+		// allocate separate, contiguous, buffers for read and
+		// write calls. Only used where writev/readv cannot be used
+		// will use more RAM but may improve performance
 		bool coalesce_reads;
 		bool coalesce_writes;
 
@@ -407,7 +410,8 @@ namespace libtorrent
 		// outgoing connections will be bound to. This
 		// is useful for users that have routers that
 		// allow QoS settings based on local port.
-		std::pair<int, int> outgoing_ports;
+		int outgoing_port;
+		int num_outgoing_ports;
 
 		// the TOS byte of all peer traffic (including
 		// web seeds) is set to this value. The default
@@ -455,8 +459,10 @@ namespace libtorrent
 		// the default value for share ratio is 2
 		// the default seed time ratio is 7, because that's a common
 		// asymmetry ratio on connections
+		// these are specified as percentages
 		float share_ratio_limit;
 		float seed_time_ratio_limit;
+		// seed time limit is specified in seconds
 		int seed_time_limit;
 
 		// the interval (in seconds) between optimistic disconnects
@@ -466,13 +472,14 @@ namespace libtorrent
 
 		// the percentage of peers to disconnect every
 		// turnoever interval (if we're at the peer limit)
-		// defaults to 2/50:th
+		// defaults to 4%
+		// this is specified in percent
 		float peer_turnover;
 
 		// when we are connected to more than
 		// limit * peer_turnover_cutoff peers
 		// disconnect peer_turnover fraction
-		// of the peers
+		// of the peers. It is specified in percent
 		float peer_turnover_cutoff;
 
 		// if this is true (default) connections where both
@@ -614,14 +621,15 @@ namespace libtorrent
 		// disabled_storage)
 		bool disable_hash_checks;
 
-		// if this is true, disk read operations may
-		// be re-ordered based on their physical disk
-		// read offset. This greatly improves throughput
-		// when uploading to many peers. This assumes
-		// a traditional hard drive with a read head
-		// and spinning platters. If your storage medium
-		// is a solid state drive, this optimization
-		// doesn't give you an benefits
+		// if this is true, disk read operations are
+		// sorted by their physical offset on disk before
+		// issued to the operating system. This is useful
+		// if async I/O is not supported. It defaults to
+		// true if async I/O is not supported and fals
+		// otherwise.
+		// disk I/O operations are likely to be reordered
+		// regardless of this setting when async I/O
+		// is supported by the OS.
 		bool allow_reordered_disk_operations;
 
 		// if this is true, i2p torrents are allowed
@@ -860,9 +868,12 @@ namespace libtorrent
 		// connections and uTP connections
 		int mixed_mode_algorithm;
 
+#ifndef TORRENT_NO_DEPRECATE
+		// deprecated, use set_peer_class_filter() instead
 		// set to true if uTP connections should be rate limited
 		// defaults to false
 		bool rate_limit_utp;
+#endif
 
 		// this is the number passed in to listen(). i.e.
 		// the number of connections to accept while we're
@@ -924,6 +935,47 @@ namespace libtorrent
 		// preventing any other process from modifying them
 		bool lock_files;
 
+		// the number of threads to use for hash checking of pieces
+		// defaults to 1. If set to 0, the disk thread is used for hashing
+		int hashing_threads;
+
+		// the number of blocks to keep outstanding at any given time when
+		// checking torrents. Higher numbers give faster re-checks but uses
+		// more memory. Specified in number of 16 kiB blocks
+		int checking_mem_usage;
+
+		// if set to > 0, pieces will be announced to other peers before they
+		// are fully downloaded (and before they are hash checked). The intention
+		// is to gain 1.5 potential round trip times per downloaded piece. When
+		// non-zero, this indicates how many milliseconds in advance pieces
+		// should be announced, before they are expected to be completed.
+		int predictive_piece_announce;
+
+		// when false, bytes off the socket is received directly into the disk
+		// buffer. This requires many more calls to recv(). When using a
+		// contiguous recv buffer, the download rate can be much higher
+		bool contiguous_recv_buffer;
+
+		//#error this should not be an option, it should depend on whether or not we're seeding or downloading
+
+		// for some aio back-ends, the number of io-threads to use
+		int aio_threads;
+		// for some aio back-ends, the max number of outstanding jobs
+		int aio_max;
+
+		// the number of threads to use to call async_write_some on
+		// peer sockets. When seeding at extremely high speeds, using
+		// 2 or more threads here may make sense. Also when using SSL
+		// peer connections
+		int network_threads;
+
+		// if this is set, it is interpreted as a file path to
+		// where to create an mmaped file to back the disk cache.
+		// this is mostly useful to introduce another caching layer
+		// between RAM and hard drives. Typically you would point
+		// this to an SSD drive.
+		std::string mmap_cache;
+
 		// open an ssl listen socket for ssl torrents on this port
 		int ssl_listen;
 
@@ -942,6 +994,7 @@ namespace libtorrent
 		// limits torrent file size for URL torrents
 		int max_http_recv_buffer_size;
 	};
+#endif
 
 #ifndef TORRENT_DISABLE_DHT
 	struct dht_settings

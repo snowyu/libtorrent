@@ -41,6 +41,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #endif
 
 #include <boost/assert.hpp>
+#include <boost/weak_ptr.hpp>
 #include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/weak_ptr.hpp>
@@ -58,6 +59,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/address.hpp"
 #include "libtorrent/bitfield.hpp"
 #include "libtorrent/socket.hpp" // tcp::endpoint
+#include "libtorrent/file_pool.hpp"
 
 namespace libtorrent
 {
@@ -70,6 +72,7 @@ namespace libtorrent
 	struct peer_info;
 	struct peer_list_entry;
 	struct torrent_status;
+	struct torrent_handle;
 	class torrent;
 
 	TORRENT_EXPORT std::size_t hash_value(torrent_status const& ts);
@@ -152,15 +155,22 @@ namespace libtorrent
 		state_t piece_state;
 	};
 
+	// for boost::hash (and to support using this type in unordered_map etc.)
+	std::size_t hash_value(torrent_handle const& h);
+
 	struct TORRENT_EXPORT torrent_handle
 	{
 		friend class invariant_access;
 		friend struct aux::session_impl;
+		friend class session;
 		friend struct feed;
 		friend class torrent;
 		friend std::size_t hash_value(torrent_handle const& th);
 
 		torrent_handle() {}
+
+		torrent_handle(torrent_handle const& t)
+		{ if (!t.m_torrent.expired()) m_torrent = t.m_torrent; }
 
 		enum flags_t { overwrite_existing = 1 };
 		void add_piece(int piece, char const* data, int flags = 0) const;
@@ -205,6 +215,8 @@ namespace libtorrent
 		};
 
 		void file_progress(std::vector<size_type>& progress, int flags = 0) const;
+
+		void file_status(std::vector<pool_file_status>& status) const;
 
 		void clear_error() const;
 
@@ -322,6 +334,8 @@ namespace libtorrent
 		TORRENT_DEPRECATED_PREFIX
 		void filter_files(std::vector<bool> const& files) const TORRENT_DEPRECATED;
 
+		// set the interface to bind outgoing connections
+		// to.
 		TORRENT_DEPRECATED_PREFIX
 		void use_interface(const char* net_interface) const TORRENT_DEPRECATED;
 
@@ -340,6 +354,7 @@ namespace libtorrent
 		int piece_priority(int index) const;
 
 		void prioritize_pieces(std::vector<int> const& pieces) const;
+		void prioritize_pieces(std::vector<std::pair<int, int> > const& pieces) const;
 		std::vector<int> piece_priorities() const;
 
 		// priority must be within the range [0, 7]
@@ -369,22 +384,21 @@ namespace libtorrent
 		// returns the name of this torrent, in case it doesn't
 		// have metadata it returns the name assigned to it
 		// when it was added.
+		// TODO: name should be part of torrent_status
 		std::string name() const;
-
-		// TODO: add a feature where the user can tell the torrent
-		// to finish all pieces currently in the pipeline, and then
-		// abort the torrent.
 
 		void set_upload_limit(int limit) const;
 		int upload_limit() const;
 		void set_download_limit(int limit) const;
 		int download_limit() const;
 
+		void set_pinned(bool p) const;
 		void set_sequential_download(bool sd) const;
 
 		// manually connect a peer
-		void connect_peer(tcp::endpoint const& adr, int source = 0) const;
+		void connect_peer(tcp::endpoint const& adr, int source = 0, int flags = 0) const;
 
+		// save_path should be part of torrent_status
 		std::string save_path() const;
 
 		// -1 means unlimited unchokes
@@ -420,13 +434,20 @@ namespace libtorrent
 		bool operator<(const torrent_handle& h) const
 		{ return m_torrent.lock() < h.m_torrent.lock(); }
 
+		boost::uint32_t id() const
+		{
+			uintptr_t ret = (uintptr_t)m_torrent.lock().get();
+			// a torrent object is about 1024 bytes, so
+			// it's safe to shift 11 bits
+			return boost::uint32_t(ret >> 11);
+		}
+
 		boost::shared_ptr<torrent> native_handle() const;
 
 	private:
 
 		torrent_handle(boost::weak_ptr<torrent> const& t)
-			: m_torrent(t)
-		{}
+		{ if (!t.expired()) m_torrent = t; }
 
 #ifdef TORRENT_DEBUG
 		void check_invariant() const;
@@ -449,7 +470,11 @@ namespace libtorrent
 
 		enum state_t
 		{
+#ifndef TORRENT_NO_DEPRECATE
 			queued_for_checking,
+#else
+			unused_enum_for_backwards_compatibility,
+#endif
 			checking_files,
 			downloading_metadata,
 			downloading,
@@ -465,6 +490,7 @@ namespace libtorrent
 		bool sequential_download;
 		bool is_seeding;
 		bool is_finished;
+		bool is_loaded;
 		bool has_metadata;
 
 		float progress;
@@ -585,6 +611,7 @@ namespace libtorrent
 
 		int num_uploads;
 		int num_connections;
+		int num_undead_peers;
 		int uploads_limit;
 		int connections_limit;
 

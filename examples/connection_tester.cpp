@@ -40,6 +40,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/thread.hpp"
 #include "libtorrent/create_torrent.hpp"
 #include "libtorrent/hasher.hpp"
+#include "libtorrent/socket_io.hpp"
 #include <cstring>
 #include <boost/bind.hpp>
 #include <iostream>
@@ -66,6 +67,10 @@ void generate_block(boost::uint32_t* buffer, int piece, int start, int length)
 int local_if_counter = 0;
 bool local_bind = false;
 
+// when set to true, blocks downloaded are verified to match
+// the test torrents
+bool verify_downloads = false;
+
 // number of seeds we've spawned. The test is terminated
 // when this reaches zero, for dual tests
 static boost::detail::atomic_count num_seeds(0);
@@ -75,7 +80,7 @@ static boost::detail::atomic_count num_seeds(0);
 // a client and dual uploads and downloads from a client
 // at the same time (this is presumably the most realistic
 // test)
-enum { none, upload_test, download_test, dual_test } test_mode = none;
+static enum { none, upload_test, download_test, dual_test } test_mode = none;
 
 // the number of suggest messages received (total across all peers)
 boost::detail::atomic_count num_suggest(0);
@@ -83,14 +88,15 @@ boost::detail::atomic_count num_suggest(0);
 // the number of requests made from suggested pieces
 boost::detail::atomic_count num_suggested_requests(0);
 
-
 struct peer_conn
 {
 	peer_conn(io_service& ios, int num_pieces, int blocks_pp, tcp::endpoint const& ep
-		, char const* ih, bool seed_)
+		, char const* ih, bool seed_, int churn_)
 		: s(ios)
 		, read_pos(0)
 		, state(handshaking)
+		, choked(true)
+		, current_piece(-1)
 		, block(0)
 		, blocks_per_piece(blocks_pp)
 		, info_hash(ih)
@@ -100,13 +106,21 @@ struct peer_conn
 		, blocks_sent(0)
 		, num_pieces(num_pieces)
 		, start_time(time_now_hires())
+		, churn(churn_)
+		, endpoint(ep)
+		, restarting(false)
 	{
 		if (seed) ++num_seeds;
 		pieces.reserve(num_pieces);
+		start_conn();
+	}
+
+	void start_conn()
+	{
 		if (local_bind)
 		{
 			error_code ec;
-			s.open(ep.protocol(), ec);
+			s.open(endpoint.protocol(), ec);
 			if (ec)
 			{
 				close("ERROR OPEN: %s", ec);
@@ -124,7 +138,8 @@ struct peer_conn
 				return;
 			}
 		}
-		s.async_connect(ep, boost::bind(&peer_conn::on_connect, this, _1));
+		restarting = false;
+		s.async_connect(endpoint, boost::bind(&peer_conn::on_connect, this, _1));
 	}
 
 	stream_socket s;
@@ -142,6 +157,8 @@ struct peer_conn
 	int state;
 	std::vector<int> pieces;
 	std::vector<int> suggested_pieces;
+	std::vector<int> allowed_fast;
+	bool choked;
 	int current_piece; // the piece we're currently requesting blocks from
 	int block;
 	int blocks_per_piece;
@@ -155,6 +172,9 @@ struct peer_conn
 	int num_pieces;
 	ptime start_time;
 	ptime end_time;
+	int churn;
+	tcp::endpoint endpoint;
+	bool restarting;
 
 	void on_connect(error_code const& ec)
 	{
@@ -263,11 +283,18 @@ struct peer_conn
 
 	bool write_request()
 	{
+		if (choked && allowed_fast.empty() && current_piece == -1) return false;
+
 		if (pieces.empty() && suggested_pieces.empty() && current_piece == -1) return false;
 
 		if (current_piece == -1)
 		{
-			if (suggested_pieces.size() > 0)
+			if (choked && allowed_fast.size() > 0)
+			{
+				current_piece = allowed_fast.front();
+				allowed_fast.erase(allowed_fast.begin());
+			}
+			else if (suggested_pieces.size() > 0)
 			{
 				current_piece = suggested_pieces.front();
 				suggested_pieces.erase(suggested_pieces.begin());
@@ -328,8 +355,9 @@ struct peer_conn
 		if (time == 0) time = 1;
 		float up = (boost::int64_t(blocks_sent) * 0x4000) / time / 1000.f;
 		float down = (boost::int64_t(blocks_received) * 0x4000) / time / 1000.f;
-		printf("%s sent: %d received: %d duration: %d ms up: %.1fMB/s down: %.1fMB/s\n"
-			, tmp, blocks_sent, blocks_received, time, up, down);
+		error_code e;
+		printf("%s ep: %s sent: %d received: %d duration: %d ms up: %.1fMB/s down: %.1fMB/s\n"
+			, tmp, libtorrent::print_endpoint(s.local_endpoint(e)).c_str(), blocks_sent, blocks_received, time, up, down);
 		if (seed) --num_seeds;
 	}
 
@@ -358,6 +386,13 @@ struct peer_conn
 
 	void on_msg_length(error_code const& ec, size_t bytes_transferred)
 	{
+		if ((ec == boost::asio::error::operation_aborted || ec == boost::asio::error::bad_descriptor)
+			&& restarting)
+		{
+			start_conn();
+			return;
+		}
+
 		if (ec)
 		{
 			close("ERROR RECEIVE MESSAGE PREFIX: %s", ec);
@@ -367,6 +402,7 @@ struct peer_conn
 		unsigned int length = read_uint32(ptr);
 		if (length > sizeof(buffer))
 		{
+			fprintf(stderr, "len: %d\n", length);
 			close("ERROR RECEIVE MESSAGE PREFIX: packet too big", error_code());
 			return;
 		}
@@ -376,6 +412,13 @@ struct peer_conn
 
 	void on_message(error_code const& ec, size_t bytes_transferred)
 	{
+		if ((ec == boost::asio::error::operation_aborted || ec == boost::asio::error::bad_descriptor)
+			&& restarting)
+		{
+			start_conn();
+			return;
+		}
+
 		if (ec)
 		{
 			close("ERROR RECEIVE MESSAGE: %s", ec);
@@ -455,7 +498,7 @@ struct peer_conn
 			}
 			else if (msg == 7) // piece
 			{
-//				if (verify_downloads)
+				if (verify_downloads)
 				{
 					int piece = read_uint32(ptr);
 					int start = read_uint32(ptr);
@@ -466,6 +509,13 @@ struct peer_conn
 				--outstanding_requests;
 				int piece = detail::read_int32(ptr);
 				int start = detail::read_int32(ptr);
+
+				if (churn && (blocks_received % churn) == 0) {
+					outstanding_requests = 0;
+					restarting = true;
+					s.close();
+					return;
+				}
 				if ((start + bytes_transferred) / 0x4000 == blocks_per_piece)
 				{
 					write_have(piece);
@@ -481,6 +531,37 @@ struct peer_conn
 					pieces.erase(i);
 					suggested_pieces.push_back(piece);
 					++num_suggest;
+				}
+			}
+			else if (msg == 16) // reject request
+			{
+				int piece = detail::read_int32(ptr);
+				int start = detail::read_int32(ptr);
+				int length = detail::read_int32(ptr);
+
+				fprintf(stderr, "REJECT: [ piece: %d start: %d length: %d ]\n", piece, start, length);
+				s.close();
+				return;
+			}
+			else if (msg == 0) // choke
+			{
+				choked = true;
+				fprintf(stderr, "CHOKED");
+				s.close();
+				return;
+			}
+			else if (msg == 1) // unchoke
+			{
+				choked = false;
+			}
+			else if (msg == 17) // allowed_fast
+			{
+				int piece = detail::read_int32(ptr);
+				std::vector<int>::iterator i = std::find(pieces.begin(), pieces.end(), piece);
+				if (i != pieces.end())
+				{
+					pieces.erase(i);
+					allowed_fast.push_back(piece);
 				}
 			}
 			work_download();
@@ -517,6 +598,11 @@ struct peer_conn
 		vec[1] = libtorrent::asio::buffer(write_buffer, length);
 		boost::asio::async_write(s, vec, boost::bind(&peer_conn::on_have_all_sent, this, _1, _2));
 		++blocks_sent;
+		if (churn && (blocks_sent % churn) == 0 && seed) {
+			outstanding_requests = 0;
+			restarting = true;
+			s.close();
+		}
 	}
 
 	void write_have(int piece)
@@ -553,7 +639,8 @@ void print_usage()
 		"    1. num-connections - the number of connections to make to the target\n"
 		"    2. destination-IP - the IP address of the target\n"
 		"    3. destination-port - the port the target listens on\n"
-		"    4. torrent-file - the torrent file previously generated by gen-torrent\n\n"
+		"    4. torrent-file - the torrent file previously generated by gen-torrent\n"
+		"    5. churn - optional, number of reconnects per second\n\n"
 		"examples:\n\n"
 		"connection_tester gen-torrent 1024 4 test.torrent\n"
 		"connection_tester upload 200 127.0.0.1 6881 test.torrent\n"
@@ -581,7 +668,7 @@ void hasher_thread(libtorrent::create_torrent* t, int start_piece, int end_piece
 }
 
 // size is in megabytes
-void generate_torrent(std::vector<char>& buf, int size, int num_files)
+void generate_torrent(std::vector<char>& buf, int size, int num_files, char const* name)
 {
 	file_storage fs;
 	// 1 MiB piece size
@@ -595,7 +682,7 @@ void generate_torrent(std::vector<char>& buf, int size, int num_files)
 	while (s > 0)
 	{
 		char b[100];
-		snprintf(b, sizeof(b), "t/stress_test%d", i);
+		snprintf(b, sizeof(b), "%s/stress_test%d", name, i);
 		++i;
 		fs.add_file(b, (std::min)(s, size_type(file_size)));
 		s -= file_size;
@@ -657,7 +744,7 @@ int main(int argc, char* argv[])
 		int size = atoi(argv[2]);
 		int num_files = atoi(argv[3]);
 		std::vector<char> tmp;
-		generate_torrent(tmp, size ? size : 1024, num_files ? num_files : 1);
+		generate_torrent(tmp, size ? size : 1024, num_files ? num_files : 1, filename(argv[4]).c_str());
 
 		FILE* output = stdout;
 		if (strcmp("-", argv[4]) != 0)
@@ -731,17 +818,17 @@ int main(int argc, char* argv[])
 	}
 	else if (strcmp(argv[1], "upload") == 0)
 	{
-		if (argc != 6) print_usage();
+		if (argc != 6 && argc != 7) print_usage();
 		test_mode = upload_test;
 	}
 	else if (strcmp(argv[1], "download") == 0)
 	{
-		if (argc != 6) print_usage();
+		if (argc != 6 && argc != 7) print_usage();
 		test_mode = download_test;
 	}
 	else if (strcmp(argv[1], "dual") == 0)
 	{
-		if (argc != 6) print_usage();
+		if (argc != 6 && argc != 7) print_usage();
 		test_mode = dual_test;
 	}
 	else print_usage();
@@ -773,8 +860,12 @@ int main(int argc, char* argv[])
 		fprintf(stderr, "ERROR LOADING .TORRENT: %s\n", ec.message().c_str());
 		return 1;
 	}
-			
-	std::list<peer_conn*> conns;
+
+	int churn = 0;
+	if (argc == 7) churn = atoi(argv[6]);
+
+	std::vector<peer_conn*> conns;
+	conns.reserve(num_connections);
 	const int num_threads = 2;
 	io_service ios[num_threads];
 	for (int i = 0; i < num_connections; ++i)
@@ -783,7 +874,7 @@ int main(int argc, char* argv[])
 		if (test_mode == upload_test) seed = true;
 		else if (test_mode == dual_test) seed = (i & 1);
 		conns.push_back(new peer_conn(ios[i % num_threads], ti.num_pieces(), ti.piece_length() / 16 / 1024
-			, ep, (char const*)&ti.info_hash()[0], seed));
+			, ep, (char const*)&ti.info_hash()[0], seed, churn));
 		libtorrent::sleep(1);
 		ios[i % num_threads].poll_one(ec);
 		if (ec)
@@ -792,7 +883,6 @@ int main(int argc, char* argv[])
 			break;
 		}
 	}
-
 
 	thread t1(boost::bind(&io_thread, &ios[0]));
 	thread t2(boost::bind(&io_thread, &ios[1]));
@@ -805,7 +895,7 @@ int main(int argc, char* argv[])
 	boost::uint64_t total_sent = 0;
 	boost::uint64_t total_received = 0;
 	
-	for (std::list<peer_conn*>::iterator i = conns.begin()
+	for (std::vector<peer_conn*>::iterator i = conns.begin()
 		, end(conns.end()); i != end; ++i)
 	{
 		peer_conn* p = *i;

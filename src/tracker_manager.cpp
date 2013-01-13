@@ -194,13 +194,13 @@ namespace libtorrent
 
 	void tracker_manager::sent_bytes(int bytes)
 	{
-		TORRENT_ASSERT(m_ses.is_network_thread());
+		TORRENT_ASSERT(m_ses.is_single_thread());
 		m_ses.m_stat.sent_tracker_bytes(bytes);
 	}
 
 	void tracker_manager::received_bytes(int bytes)
 	{
-		TORRENT_ASSERT(m_ses.is_network_thread());
+		TORRENT_ASSERT(m_ses.is_single_thread());
 		m_ses.m_stat.received_tracker_bytes(bytes);
 	}
 
@@ -316,7 +316,7 @@ namespace libtorrent
 		for (tracker_connections_t::iterator i = m_connections.begin()
 			, end(m_connections.end()); i != end; ++i)
 		{
-			intrusive_ptr<tracker_connection> c = *i;
+			boost::intrusive_ptr<tracker_connection> c = *i;
 			tracker_request const& req = c->tracker_req();
 			if (req.event == tracker_request::stopped && !all)
 				continue;

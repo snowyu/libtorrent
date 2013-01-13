@@ -58,12 +58,16 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/file_storage.hpp"
 #include "libtorrent/copy_ptr.hpp"
 #include "libtorrent/socket.hpp"
-#include "libtorrent/policy.hpp" // for policy::peer
+#include "libtorrent/torrent_peer.hpp"
 
 namespace libtorrent
 {
 	class peer_connection;
 	struct session_settings;
+
+	namespace aux { struct session_settings; }
+	// exposed for the unit test
+	TORRENT_EXPORT void sanitize_append_path_element(std::string& path, char const* element, int element_len);
 
 	enum
 	{
@@ -145,7 +149,7 @@ namespace libtorrent
 			min_announce = min_time();
 		}
 
-		void failed(session_settings const& sett, int retry_interval = 0);
+		void failed(aux::session_settings const& sett, int retry_interval = 0);
 
 		bool will_announce(ptime now) const
 		{
@@ -209,7 +213,7 @@ namespace libtorrent
 		// connection, just to count hash failures
 		// it's also used to hold the peer_connection
 		// pointer, when the web seed is connected
-		policy::peer peer_info;
+		torrent_peer peer_info;
 	};
 
 #ifndef BOOST_NO_EXCEPTIONS
@@ -249,10 +253,15 @@ namespace libtorrent
 		~torrent_info();
 
 		file_storage const& files() const { return m_files; }
-		file_storage const& orig_files() const { return m_orig_files ? *m_orig_files : m_files; }
+		file_storage const& orig_files() const
+		{
+			TORRENT_ASSERT(is_loaded());
+			return m_orig_files ? *m_orig_files : m_files;
+		}
 
 		void rename_file(int index, std::string const& new_filename)
 		{
+			TORRENT_ASSERT(is_loaded());
 			copy_on_write();
 			m_files.rename_file(index, new_filename);
 		}
@@ -260,6 +269,7 @@ namespace libtorrent
 #if TORRENT_USE_WSTRING
 		void rename_file(int index, std::wstring const& new_filename)
 		{
+			TORRENT_ASSERT(is_loaded());
 			copy_on_write();
 			m_files.rename_file(index, new_filename);
 		}
@@ -302,16 +312,30 @@ namespace libtorrent
 		file_iterator end_files() const { return m_files.end(); }
 		reverse_file_iterator rbegin_files() const { return m_files.rbegin(); }
 		reverse_file_iterator rend_files() const { return m_files.rend(); }
+
 		int num_files() const { return m_files.num_files(); }
 		file_entry file_at(int index) const { return m_files.at(index); }
 
 		file_iterator file_at_offset(size_type offset) const
-		{ return m_files.file_at_offset(offset); }
+		{
+			TORRENT_ASSERT(is_loaded());
+			return m_files.file_at_offset(offset);
+		}
 		std::vector<file_slice> map_block(int piece, size_type offset, int size) const
-		{ return m_files.map_block(piece, offset, size); }
+		{
+			TORRENT_ASSERT(is_loaded());
+			return m_files.map_block(piece, offset, size);
+		}
 		peer_request map_file(int file, size_type offset, int size) const
-		{ return m_files.map_file(file, offset, size); }
-		
+		{
+			TORRENT_ASSERT(is_loaded());
+			return m_files.map_file(file, offset, size);
+		}
+
+		// load and unload this torrent info
+		void load(char const* buffer, int size, error_code& ec);
+		void unload();
+
 #ifndef TORRENT_NO_DEPRECATE
 // ------- start deprecation -------
 // these functions will be removed in a future version
@@ -345,6 +369,7 @@ namespace libtorrent
 		{
 			TORRENT_ASSERT(index >= 0);
 			TORRENT_ASSERT(index < m_files.num_pieces());
+			TORRENT_ASSERT(is_loaded());
 			if (is_merkle_torrent())
 			{
 				TORRENT_ASSERT(index < int(m_merkle_tree.size() - m_merkle_first_leaf));
@@ -359,6 +384,8 @@ namespace libtorrent
 				return &m_piece_hashes[index*20];
 			}
 		}
+
+		bool is_loaded() const { return m_piece_hashes; }
 
 		boost::optional<time_t> creation_date() const;
 
@@ -401,6 +428,8 @@ namespace libtorrent
 		std::map<int, sha1_hash> build_merkle_list(int piece) const;
 		bool is_merkle_torrent() const { return !m_merkle_tree.empty(); }
 
+		bool parse_torrent_file(lazy_entry const& libtorrent, error_code& ec, int flags);
+
 		// if we're logging member offsets, we need access to them
 #if defined TORRENT_DEBUG \
 		&& !defined TORRENT_LOGGING \
@@ -409,11 +438,12 @@ namespace libtorrent
 	private:
 #endif
 
+		void resolve_duplicate_filenames();
+
 		// not assignable
 		torrent_info const& operator=(torrent_info const&);
 
 		void copy_on_write();
-		bool parse_torrent_file(lazy_entry const& libtorrent, error_code& ec, int flags);
 
 		// the index to the first leaf. This is where the hash for the
 		// first piece is stored

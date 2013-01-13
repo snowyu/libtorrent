@@ -39,9 +39,16 @@ project
    ;
 
 test-suite libtorrent : 	
+	[ run test_connection_queue.cpp ]
+	[ run test_torrent_info.cpp ]
+	[ run test_recheck.cpp ]
+	[ run test_stat_cache.cpp ]
+	[ run test_part_file.cpp ]
+	[ run test_policy.cpp ]
 	[ run test_peer_priority.cpp ]
 	[ run test_file.cpp ]
 	[ run test_threads.cpp ]
+	[ run test_tailqueue.cpp ]
 	[ run test_rss.cpp ]
 	[ run test_bandwidth_limiter.cpp ]
 	[ run test_buffer.cpp ]
@@ -52,7 +59,11 @@ test-suite libtorrent :
 	[ run test_ip_filter.cpp ]
 	[ run test_hasher.cpp ]
 	[ run test_dht.cpp ]
-	[ run test_storage.cpp ]
+	[ run test_block_cache.cpp ]
+	[ run test_peer_classes.cpp ]
+	[ run test_settings_pack.cpp ]
+	[ run test_fence.cpp ]
+#	[ run test_storage.cpp ]
 	[ run test_upnp.cpp ]
 
 	[ run test_tracker.cpp ]

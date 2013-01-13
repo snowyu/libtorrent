@@ -98,12 +98,244 @@ namespace libtorrent
 
 	TORRENT_EXPORT void TORRENT_LINK_TEST_NAME() {}
 
+	TORRENT_EXPORT void min_memory_usage(settings_pack& set)
+	{
+		// receive data directly into disk buffers
+		// this yields more system calls to read() and
+		// kqueue(), but saves RAM.
+		set.set_bool(settings_pack::contiguous_recv_buffer, false);
+
+		// keep 2 blocks outstanding when hashing
+		set.set_int(settings_pack::checking_mem_usage, 2);
+
+		// don't use any extra threads to do SHA-1 hashing
+		set.set_int(settings_pack::hashing_threads, 0);
+		set.set_int(settings_pack::network_threads, 0);
+		set.set_int(settings_pack::aio_threads, 1);
+
+		set.set_int(settings_pack::alert_queue_size, 100);
+
+		// setting this to a low limit, means more
+		// peers are more likely to request from the
+		// same piece. Which means fewer partial
+		// pieces and fewer entries in the partial
+		// piece list
+		set.set_int(settings_pack::whole_pieces_threshold, 2);
+		set.set_bool(settings_pack::use_parole_mode, false);
+		set.set_bool(settings_pack::prioritize_partial_pieces, true);
+
+		// connect to 5 peers per second
+		set.set_int(settings_pack::connection_speed, 5);
+
+		// be extra nice on the hard drive when running
+		// on embedded devices. This might slow down
+		// torrent checking
+		set.set_int(settings_pack::file_checks_delay_per_block, 5);
+
+		// only have 4 files open at a time
+		set.set_int(settings_pack::file_pool_size, 4);
+
+		// we want to keep the peer list as small as possible
+		set.set_bool(settings_pack::allow_multiple_connections_per_ip, false);
+		set.set_int(settings_pack::max_failcount, 2);
+		set.set_int(settings_pack::inactivity_timeout, 120);
+
+		// whenever a peer has downloaded one block, write
+		// it to disk, and don't read anything from the
+		// socket until the disk write is complete
+		set.set_int(settings_pack::max_queued_disk_bytes, 1);
+
+		// don't keep track of all upnp devices, keep
+		// the device list small
+		set.set_bool(settings_pack::upnp_ignore_nonrouters, true);
+
+		// never keep more than one 16kB block in
+		// the send buffer
+		set.set_int(settings_pack::send_buffer_watermark, 9);
+
+		// don't use any disk cache
+		set.set_int(settings_pack::cache_size, 0);
+		set.set_int(settings_pack::cache_buffer_chunk_size, 1);
+		set.set_bool(settings_pack::use_read_cache, false);
+		set.set_bool(settings_pack::use_disk_read_ahead, false);
+
+		set.set_bool(settings_pack::close_redundant_connections, true);
+
+		set.set_int(settings_pack::max_peerlist_size, 500);
+		set.set_int(settings_pack::max_paused_peerlist_size, 50);
+
+		// udp trackers are cheaper to talk to
+		set.set_bool(settings_pack::prefer_udp_trackers, true);
+
+		set.set_int(settings_pack::max_rejects, 10);
+
+		set.set_int(settings_pack::recv_socket_buffer_size, 16 * 1024);
+		set.set_int(settings_pack::send_socket_buffer_size, 16 * 1024);
+
+		// use less memory when checking pieces
+		set.set_bool(settings_pack::optimize_hashing_for_speed, false);
+
+		// use less memory when reading and writing
+		// whole pieces
+		set.set_bool(settings_pack::coalesce_reads, false);
+		set.set_bool(settings_pack::coalesce_writes, false);
+
+		// disallow the buffer size to grow for the uTP socket
+		set.set_bool(settings_pack::utp_dynamic_sock_buf, false);
+	}
+
+	TORRENT_EXPORT void high_performance_seed(settings_pack& set)
+	{
+		// don't throttle TCP, assume there is
+		// plenty of bandwidth
+		set.set_int(settings_pack::mixed_mode_algorithm, settings_pack::prefer_tcp);
+
+		// we will probably see a high rate of alerts, make it less
+		// likely to loose alerts
+		set.set_int(settings_pack::alert_queue_size, 10000);
+
+		// allow 500 files open at a time
+		set.set_int(settings_pack::file_pool_size, 500);
+
+		// don't update access time for each read/write
+		set.set_bool(settings_pack::no_atime_storage, true);
+
+		// as a seed box, we must accept multiple peers behind
+		// the same NAT
+		set.set_bool(settings_pack::allow_multiple_connections_per_ip, true);
+
+		// connect to 50 peers per second
+		set.set_int(settings_pack::connection_speed, 50);
+
+		// allow 8000 peer connections
+		set.set_int(settings_pack::connections_limit, 8000);
+
+		// allow lots of peers to try to connect simultaneously
+		set.set_int(settings_pack::listen_queue_size, 200);
+
+		// unchoke many peers
+		set.set_int(settings_pack::unchoke_slots_limit, 500);
+
+		// we need more DHT capacity to ping more peers
+		// candidates before trying to connect
+		set.set_int(settings_pack::dht_upload_rate_limit, 100000);
+
+		// we're more interested in downloading than seeding
+		// only service a read job every 1000 write job (when
+		// disk is congested). Presumably on a big box, writes
+		// are extremely cheap and reads are relatively expensive
+		// so that's the main reason this ratio should be adjusted
+		set.set_int(settings_pack::read_job_every, 100);
+
+		// use 1 GB of cache
+		set.set_int(settings_pack::cache_size, 32768 * 2);
+		set.set_bool(settings_pack::use_read_cache, true);
+		set.set_int(settings_pack::cache_buffer_chunk_size, 0);
+		set.set_int(settings_pack::read_cache_line_size, 32);
+		set.set_int(settings_pack::write_cache_line_size, 256);
+		set.set_bool(settings_pack::low_prio_disk, false);
+		// 30 seconds expiration to save cache
+		// space for active pieces
+		set.set_int(settings_pack::cache_expiry, 30);
+		// this is expensive and could add significant
+		// delays when freeing a large number of buffers
+		set.set_bool(settings_pack::lock_disk_cache, false);
+
+		// in case the OS we're running on doesn't support
+		// readv/writev, allocate contiguous buffers for
+		// reads and writes
+		// disable, since it uses a lot more RAM and a significant
+		// amount of CPU to copy it around
+		set.set_bool(settings_pack::coalesce_reads, false);
+		set.set_bool(settings_pack::coalesce_writes, false);
+
+		// the max number of bytes pending write before we throttle
+		// download rate
+		set.set_int(settings_pack::max_queued_disk_bytes, 7 * 1024 * 1024);
+
+		set.set_bool(settings_pack::explicit_read_cache, false);
+		// prevent fast pieces to interfere with suggested pieces
+		// since we unchoke everyone, we don't need fast pieces anyway
+		set.set_int(settings_pack::allowed_fast_set_size, 0);
+		// suggest pieces in the read cache for higher cache hit rate
+//		set.set_int(settings_pack::suggest_mode, session_settings::suggest_read_cache);
+
+		set.set_bool(settings_pack::close_redundant_connections, true);
+
+		set.set_int(settings_pack::max_rejects, 10);
+
+		set.set_bool(settings_pack::optimize_hashing_for_speed, true);
+
+		// don't let connections linger for too long
+		set.set_int(settings_pack::request_timeout, 10);
+		set.set_int(settings_pack::peer_timeout, 20);
+		set.set_int(settings_pack::inactivity_timeout, 20);
+
+		set.set_int(settings_pack::active_limit, 2000);
+		set.set_int(settings_pack::active_tracker_limit, 2000);
+		set.set_int(settings_pack::active_dht_limit, 600);
+		set.set_int(settings_pack::active_seeds, 2000);
+
+		set.set_int(settings_pack::choking_algorithm, settings_pack::fixed_slots_choker);
+
+		// of 500 ms, and a send rate of 4 MB/s, the upper
+		// limit should be 2 MB
+		set.set_int(settings_pack::send_buffer_watermark, 3 * 1024 * 1024);
+
+		// put 1.5 seconds worth of data in the send buffer
+		// this gives the disk I/O more heads-up on disk
+		// reads, and can maximize throughput
+		set.set_int(settings_pack::send_buffer_watermark_factor, 150);
+
+		// always stuff at least 1 MiB down each peer
+		// pipe, to quickly ramp up send rates
+ 		set.set_int(settings_pack::send_buffer_low_watermark, 1 * 1024 * 1024);
+
+		// don't retry peers if they fail once. Let them
+		// connect to us if they want to
+		set.set_int(settings_pack::max_failcount, 1);
+
+		// allow the buffer size to grow for the uTP socket
+		set.set_bool(settings_pack::utp_dynamic_sock_buf, true);
+
+		// we're likely to have more than 4 cores on a high
+		// performance machine. One core is needed for the
+		// network thread
+		set.set_int(settings_pack::hashing_threads, 4);
+
+		// the number of threads to use to call async_write_some
+		// on peer sockets
+		// TODO: this doesn't actually fully work yet. There appears to be some race condition involved
+		set.set_int(settings_pack::network_threads, 0);
+
+		// number of disk threads for low level file operations
+		set.set_int(settings_pack::aio_threads, 8);
+
+		// keep 5 MiB outstanding when checking hashes
+		// of a resumed file
+		set.set_int(settings_pack::checking_mem_usage, 320);
+	}
+
+#ifndef TORRENT_NO_DEPRECATE
 	// this function returns a session_settings object
 	// which will optimize libtorrent for minimum memory
 	// usage, with no consideration of performance.
 	TORRENT_EXPORT session_settings min_memory_usage()
 	{
 		session_settings set;
+
+		// receive data directly into disk buffers
+		// this yields more system calls to read() and
+		// kqueue(), but saves RAM.
+		set.contiguous_recv_buffer = false;
+
+		// keep 2 blocks outstanding when hashing
+		set.checking_mem_usage = 2;
+
+		// don't use any extra threads to do SHA-1 hashing
+		set.hashing_threads = 0;
+		set.network_threads = 0;
+		set.aio_threads = 1;
 
 		set.alert_queue_size = 100;
 
@@ -229,30 +461,35 @@ namespace libtorrent
 		// use 1 GB of cache
 		set.cache_size = 32768 * 2;
 		set.use_read_cache = true;
-		set.cache_buffer_chunk_size = 128;
+		set.cache_buffer_chunk_size = 0;
 		set.read_cache_line_size = 32;
 		set.write_cache_line_size = 32;
 		set.low_prio_disk = false;
-		// one hour expiration
-		set.cache_expiry = 60 * 60;
+		// 30 seconds expiration to save cache
+		// space for active pieces
+		set.cache_expiry = 30;
 		// this is expensive and could add significant
 		// delays when freeing a large number of buffers
 		set.lock_disk_cache = false;
 
+		// in case the OS we're running on doesn't support
+		// readv/writev, allocate contiguous buffers for
+		// reads and writes
+		// disable, since it uses a lot more RAM and a significant
+		// amount of CPU to copy it around
+		set.coalesce_reads = false;
+		set.coalesce_writes = false;
+
 		// the max number of bytes pending write before we throttle
 		// download rate
-		set.max_queued_disk_bytes = 10 * 1024 * 1024;
-		// flush write cache in a way to minimize the amount we need to
-		// read back once we want to hash-check the piece. i.e. try to
-		// flush all blocks in-order
-		set.disk_cache_algorithm = session_settings::avoid_readback;
+		set.max_queued_disk_bytes = 7 * 1024 * 1024;;
 
 		set.explicit_read_cache = false;
 		// prevent fast pieces to interfere with suggested pieces
 		// since we unchoke everyone, we don't need fast pieces anyway
 		set.allowed_fast_set_size = 0;
 		// suggest pieces in the read cache for higher cache hit rate
-		set.suggest_mode = session_settings::suggest_read_cache;
+//		set.suggest_mode = session_settings::suggest_read_cache;
 
 		set.close_redundant_connections = true;
 
@@ -272,11 +509,8 @@ namespace libtorrent
 
 		set.choking_algorithm = session_settings::fixed_slots_choker;
 
-		// in order to be able to deliver very high
-		// upload rates, this should be able to cover
-		// the bandwidth delay product. Assuming an RTT
-		// of 500 ms, and a send rate of 20 MB/s, the upper
-		// limit should be 10 MB
+		// of 500 ms, and a send rate of 4 MB/s, the upper
+		// limit should be 2 MB
 		set.send_buffer_watermark = 3 * 1024 * 1024;
 
 		// put 1.5 seconds worth of data in the send buffer
@@ -295,11 +529,29 @@ namespace libtorrent
 		// allow the buffer size to grow for the uTP socket
 		set.utp_dynamic_sock_buf = true;
 
+		// we're likely to have more than 4 cores on a high
+		// performance machine. One core is needed for the
+		// network thread
+		set.hashing_threads = 4;
+
+		// the number of threads to use to call async_write_some
+		// on peer sockets
+		// TODO: this doesn't actually fully work yet. There appears to be some race condition involved
+		set.network_threads = 0;
+
+		// number of disk threads for low level file operations
+		set.aio_threads = 8;
+
+		// keep 5 MiB outstanding when checking hashes
+		// of a resumed file
+		set.checking_mem_usage = 320;
+
 		// max 'bottled' http receive buffer/url torrent size
 		set.max_http_recv_buffer_size = 6 * 1024 * 1024;
 
 		return set;
 	}
+#endif
 
 	// wrapper around a function that's executed in the network thread
 	// ans synchronized in the client thread
@@ -469,6 +721,11 @@ namespace libtorrent
 		TORRENT_SYNC_CALL1(get_feeds, &f);
 	}
 
+	void session::set_load_function(user_load_function_t fun)
+	{
+		TORRENT_ASYNC_CALL1(set_load_function, fun);
+	}
+
 #ifndef TORRENT_DISABLE_EXTENSIONS
 	void session::add_extension(boost::function<boost::shared_ptr<torrent_plugin>(torrent*, void*)> ext)
 	{
@@ -587,6 +844,20 @@ namespace libtorrent
 	void session::post_torrent_updates()
 	{
 		TORRENT_ASYNC_CALL(post_torrent_updates);
+	}
+
+	std::vector<stats_metric> session::session_stats_metrics() const
+	{
+		std::vector<stats_metric> ret;
+		// defined in session_stats.cpp
+		extern void get_stats_metric_map(std::vector<stats_metric>& stats);
+		get_stats_metric_map(ret);
+		return ret;
+	}
+
+	void session::post_session_stats()
+	{
+		TORRENT_ASYNC_CALL(post_session_stats);
 	}
 
 	std::vector<torrent_handle> session::get_torrents() const
@@ -733,6 +1004,12 @@ namespace libtorrent
 		return r;
 	}
 
+	void session::use_interfaces(char const* interfaces)
+	{
+		std::string ifaces = interfaces;
+		TORRENT_ASYNC_CALL1(use_outgoing_interfaces, ifaces);
+	}
+
 	session_status session::status() const
 	{
 		TORRENT_SYNC_CALL_RET(session_status, status);
@@ -755,15 +1032,36 @@ namespace libtorrent
 		return r;
 	}
 
+#ifndef TORRENT_NO_DEPRECATE
 	void session::get_cache_info(sha1_hash const& ih
 		, std::vector<cached_piece_info>& ret) const
 	{
-		m_impl->m_disk_thread.get_cache_info(ih, ret);
+		cache_status st;
+		get_cache_info(&st, find_torrent(ih));
+		ret.swap(st.pieces);
 	}
 
 	cache_status session::get_cache_status() const
 	{
-		return m_impl->m_disk_thread.status();
+		cache_status st;
+		get_cache_info(&st);
+		return st;
+	}
+#endif
+
+	void session::get_cache_info(cache_status* ret
+		, torrent_handle h, int flags) const
+	{
+		piece_manager* st = 0;
+		boost::shared_ptr<torrent> t = h.m_torrent.lock();
+		if (t)
+		{
+			if (t->has_storage())
+				st = &t->storage();
+			else
+				flags = session::disk_cache_no_pieces;
+		}
+		m_impl->m_disk_thread.get_cache_info(ret, flags & session::disk_cache_no_pieces, st);
 	}
 
 #ifndef TORRENT_DISABLE_DHT
@@ -828,12 +1126,45 @@ namespace libtorrent
 	}
 #endif
 
+	void session::set_peer_class_filter(ip_filter const& f)
+	{
+		TORRENT_ASYNC_CALL1(set_peer_class_filter, f);
+	}
+
+	void session::set_peer_class_type_filter(peer_class_type_filter const& f)
+	{
+		TORRENT_ASYNC_CALL1(set_peer_class_type_filter, f);
+	}
+
+	int session::create_peer_class(char const* name)
+	{
+		TORRENT_SYNC_CALL_RET1(int, create_peer_class, name);
+		return r;
+	}
+
+	void session::delete_peer_class(int cid)
+	{
+		TORRENT_ASYNC_CALL1(delete_peer_class, cid);
+	}
+
+	peer_class_info session::get_peer_class(int cid)
+	{
+		TORRENT_SYNC_CALL_RET1(peer_class_info, get_peer_class, cid);
+		return r;
+	}
+
+	void session::set_peer_class(int cid, peer_class_info const& pci)
+	{
+		TORRENT_ASYNC_CALL2(set_peer_class, cid, pci);
+	}
+
 	bool session::is_listening() const
 	{
 		TORRENT_SYNC_CALL_RET(bool, is_listening);
 		return r;
 	}
 
+#ifndef TORRENT_NO_DEPRECATE
 	void session::set_settings(session_settings const& s)
 	{
 		TORRENT_ASYNC_CALL1(set_settings, s);
@@ -841,7 +1172,20 @@ namespace libtorrent
 
 	session_settings session::settings() const
 	{
-		TORRENT_SYNC_CALL_RET(session_settings, settings);
+		TORRENT_SYNC_CALL_RET(session_settings, deprecated_settings);
+		return r;
+	}
+#endif
+
+	void session::apply_settings(settings_pack const& s)
+	{
+		settings_pack* copy = new settings_pack(s);
+		TORRENT_ASYNC_CALL1(apply_settings_pack, copy);
+	}
+
+	aux::session_settings session::get_settings() const
+	{
+		TORRENT_SYNC_CALL_RET(aux::session_settings, settings);
 		return r;
 	}
 
@@ -1109,190 +1453,17 @@ namespace libtorrent
 		return m_impl->m_half_open;
 	}
 
+#ifndef TORRENT_NO_DEPRECATE
 	session_settings::session_settings(std::string const& user_agent_)
-		: version(LIBTORRENT_VERSION_NUM)
-		, user_agent(user_agent_)
-		, tracker_completion_timeout(60)
-		, tracker_receive_timeout(40)
-		, stop_tracker_timeout(5)
-		, tracker_maximum_response_length(1024*1024)
-		, piece_timeout(20)
-		, request_timeout(50)
-		, request_queue_time(3)
-		, max_allowed_in_request_queue(250)
-		, max_out_request_queue(200)
-		, whole_pieces_threshold(20)
-		, peer_timeout(120)
-		, urlseed_timeout(20)
-		, urlseed_pipeline_size(5)
-		, urlseed_wait_retry(30)
-		, file_pool_size(40)
-		, allow_multiple_connections_per_ip(false)
-		, max_failcount(3)
-		, min_reconnect_time(60)
-		, peer_connect_timeout(15)
-		, ignore_limits_on_local_network(true)
-		, connection_speed(6)
-		, send_redundant_have(true)
-		, lazy_bitfields(true)
-		, inactivity_timeout(600)
-		, unchoke_interval(15)
-		, optimistic_unchoke_interval(30)
-		, num_want(200)
-		, initial_picker_threshold(4)
-		, allowed_fast_set_size(10)
-		, suggest_mode(no_piece_suggestions)
-		, max_queued_disk_bytes(1024 * 1024)
-		, max_queued_disk_bytes_low_watermark(0)
-		, handshake_timeout(10)
-#ifndef TORRENT_DISABLE_DHT
-		, use_dht_as_fallback(false)
-#endif
-		, free_torrent_hashes(true)
-		, upnp_ignore_nonrouters(false)
-		, send_buffer_low_watermark(512)
-		, send_buffer_watermark(500 * 1024)
-		, send_buffer_watermark_factor(50)
-#ifndef TORRENT_NO_DEPRECATE
-		// deprecated in 0.16
-		, auto_upload_slots(true)
-		, auto_upload_slots_rate_based(true)
-#endif
-		, choking_algorithm(fixed_slots_choker)
-		, seed_choking_algorithm(round_robin)
-		, use_parole_mode(true)
-		, cache_size(1024)
-		, cache_buffer_chunk_size(16)
-		, cache_expiry(300)
-		, use_read_cache(true)
-		, explicit_read_cache(0)
-		, explicit_cache_interval(30)
-		, disk_io_write_mode(0)
-		, disk_io_read_mode(0)
-		, coalesce_reads(false)
-		, coalesce_writes(false)
-		, outgoing_ports(0,0)
-		, peer_tos(0)
-		, active_downloads(3)
-		, active_seeds(5)
-		, active_dht_limit(88) // don't announce more than once every 40 seconds
-		, active_tracker_limit(1600) // don't announce to trackers more than once every 1.125 seconds
-		, active_lsd_limit(60) // don't announce to local network more than once every 5 seconds
-		, active_limit(15)
-		, auto_manage_prefer_seeds(false)
-		, dont_count_slow_torrents(true)
-		, auto_manage_interval(30)
-		, share_ratio_limit(2.f)
-		, seed_time_ratio_limit(7.f)
-		, seed_time_limit(24 * 60 * 60) // 24 hours
-		, peer_turnover_interval(300)
-		, peer_turnover(2 / 50.f)
-		, peer_turnover_cutoff(.9f)
-		, close_redundant_connections(true)
-		, auto_scrape_interval(1800)
-		, auto_scrape_min_interval(300)
-		, max_peerlist_size(4000)
-		, max_paused_peerlist_size(4000)
-		, min_announce_interval(5 * 60)
-		, prioritize_partial_pieces(false)
-		, auto_manage_startup(120)
-		, rate_limit_ip_overhead(true)
-		, announce_to_all_trackers(false)
-		, announce_to_all_tiers(false)
-		, prefer_udp_trackers(true)
-		, strict_super_seeding(false)
-		, seeding_piece_quota(20)
-#ifdef TORRENT_WINDOWS
-		, max_sparse_regions(30000)
-#else
-		, max_sparse_regions(0)
-#endif
-#ifndef TORRENT_DISABLE_MLOCK
-		, lock_disk_cache(false)
-#endif
-		, max_rejects(50)
-		, recv_socket_buffer_size(0)
-		, send_socket_buffer_size(0)
-		, optimize_hashing_for_speed(true)
-		, file_checks_delay_per_block(0)
-		, disk_cache_algorithm(avoid_readback)
-		, read_cache_line_size(32)
-		, write_cache_line_size(32)
-		, optimistic_disk_retry(10 * 60)
-		, disable_hash_checks(false)
-		, allow_reordered_disk_operations(true)
-		, allow_i2p_mixed(false)
-		, max_suggest_pieces(10)
-		, drop_skipped_requests(false)
-		, low_prio_disk(true)
-		, local_service_announce_interval(5 * 60)
-		, dht_announce_interval(15 * 60)
-		, udp_tracker_token_expiry(60)
-		, volatile_read_cache(false)
-		, guided_read_cache(false)
-		, default_cache_min_age(1)
-		, num_optimistic_unchoke_slots(0)
-		, no_atime_storage(true)
-		, default_est_reciprocation_rate(16000)
-		, increase_est_reciprocation_rate(20)
-		, decrease_est_reciprocation_rate(3)
-		, incoming_starts_queued_torrents(false)
-		, report_true_downloaded(false)
-		, strict_end_game_mode(true)
-		, broadcast_lsd(true)
-		, enable_outgoing_utp(true)
-		, enable_incoming_utp(true)
-		, enable_outgoing_tcp(true)
-		, enable_incoming_tcp(true)
-		, max_pex_peers(50)
-		, ignore_resume_timestamps(false)
-		, no_recheck_incomplete_resume(false)
-		, anonymous_mode(false)
-		, tick_interval(100)
-		, report_web_seed_downloads(true)
-		, share_mode_target(3)
-		, upload_rate_limit(0)
-		, download_rate_limit(0)
-		, local_upload_rate_limit(0)
-		, local_download_rate_limit(0)
-		, dht_upload_rate_limit(4000)
-		, unchoke_slots_limit(8)
-		, half_open_limit(0)
-		, connections_limit(200)
-		, connections_slack(10)
-		, utp_target_delay(100) // milliseconds
-		, utp_gain_factor(1500) // bytes per rtt
-		, utp_min_timeout(500) // milliseconds
-		, utp_syn_resends(2)
-		, utp_fin_resends(2)
-		, utp_num_resends(6)
-		, utp_connect_timeout(3000) // milliseconds
-#ifndef TORRENT_NO_DEPRECATE
-		, utp_delayed_ack(0) // milliseconds
-#endif
-		, utp_dynamic_sock_buf(false) // this doesn't seem quite reliable yet
-		, utp_loss_multiplier(50) // specified in percent
-		, mixed_mode_algorithm(peer_proportional)
-		, rate_limit_utp(true)
-		, listen_queue_size(5)
-		, announce_double_nat(false)
-		, torrent_connect_boost(10)
-		, seeding_outgoing_connections(true)
-		, no_connect_privileged_ports(true)
-		, alert_queue_size(6000)
-		, max_metadata_size(3*1024*1024)
-		, smooth_connects(true)
-		, always_send_user_agent(false)
-		, apply_ip_filter_to_trackers(true)
-		, read_job_every(10)
-		, use_disk_read_ahead(true)
-		, lock_files(false)
-		, ssl_listen(4433)
-		, tracker_backoff(250)
-		, ban_web_seeds(true)
-		, max_http_recv_buffer_size(2*1024*1024)
-	{}
+	{
+		aux::session_settings def;
+		def.set_str(settings_pack::user_agent, user_agent_);
+		initialize_default_settings(def);
+		load_struct_from_settings(def, *this);
+	}
 
 	session_settings::~session_settings() {}
+#endif // TORRENT_NO_DEPRECATE
+
 }
 

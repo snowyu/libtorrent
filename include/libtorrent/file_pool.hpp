@@ -51,6 +51,13 @@ POSSIBILITY OF SUCH DAMAGE.
 
 namespace libtorrent
 {
+	struct pool_file_status
+	{
+		int file_index;
+		ptime last_use;
+		int open_mode;
+	};
+
 	struct TORRENT_EXPORT file_pool : boost::noncopyable
 	{
 		file_pool(int size = 40);
@@ -58,15 +65,16 @@ namespace libtorrent
 
 		boost::intrusive_ptr<file> open_file(void* st, std::string const& p
 			, file_storage::iterator fe, file_storage const& fs, int m, error_code& ec);
-		void release(void* st);
+		void release(void* st = NULL);
 		void release(void* st, int file_index);
 		void resize(int size);
 		int size_limit() const { return m_size; }
 		void set_low_prio_io(bool b) { m_low_prio_io = b; }
+		void get_status(std::vector<pool_file_status>* files, void* st) const;
 
 	private:
 
-		void remove_oldest();
+		void remove_oldest(mutex::scoped_lock& l);
 
 		int m_size;
 		bool m_low_prio_io;
@@ -85,17 +93,8 @@ namespace libtorrent
 		typedef std::map<std::pair<void*, int>, lru_file_entry> file_set;
 		
 		file_set m_files;
-		mutex m_mutex;
 
-#if TORRENT_CLOSE_MAY_BLOCK
-		void closer_thread_fun();
-		mutex m_closer_mutex;
-		std::vector<boost::intrusive_ptr<file> > m_queued_for_close;
-		bool m_stop_thread;
-
-		// used to close files
-		thread m_closer_thread;
-#endif
+		mutable mutex m_mutex;
 	};
 }
 

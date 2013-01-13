@@ -90,6 +90,11 @@ namespace libtorrent
 
 	char* page_aligned_allocator::malloc(size_type bytes)
 	{
+		TORRENT_ASSERT(bytes > 0);
+		// just sanity check (this needs to be pretty high
+		// for cases where the cache size is several gigabytes)
+		TORRENT_ASSERT(bytes < 0x30000000);
+
 #ifdef TORRENT_DEBUG_BUFFERS
 		int page = page_size();
 		int num_pages = (bytes + (page-1)) / page + 2;
@@ -127,8 +132,18 @@ namespace libtorrent
 #endif
 	}
 
+#ifdef TORRENT_DEBUG_BUFFERS
+	bool page_aligned_allocator::in_use(char* const block)
+	{
+		int page = page_size();
+		alloc_header* h = (alloc_header*)(block - page);
+		return h->magic == 0x1337;
+	}
+#endif
+
 	void page_aligned_allocator::free(char* const block)
 	{
+		if (block == 0) return;
 
 #ifdef TORRENT_DEBUG_BUFFERS
 		int page = page_size();

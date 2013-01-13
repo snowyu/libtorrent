@@ -3,7 +3,9 @@ project(libtorrent)
 
 set(sources
 	web_connection_base
+	aiocb_pool
 	alert
+	alert_handler
 	allocator
 	asio
 	asio_ssl
@@ -11,6 +13,7 @@ set(sources
 	bandwidth_limit
 	bandwidth_manager
 	bandwidth_queue_entry
+	block_cache
 	bloom_filter
 	chained_buffer
 	connection_queue
@@ -39,6 +42,8 @@ set(sources
 	natpmp
 	packet_buffer
 	piece_picker
+	platform_util
+	proxy_base
 	policy
 	puff
 	random
@@ -46,6 +51,7 @@ set(sources
 	rss
 	session
 	session_impl
+	session_stats
 	settings
 	socket_io
 	socket_type  
@@ -58,6 +64,7 @@ set(sources
 	torrent
 	torrent_handle
 	torrent_info
+	torrent_peer
 	tracker_manager
 	http_tracker_connection
 	utf8
@@ -69,6 +76,7 @@ set(sources
 	logger
 	file_pool
 	lsd
+	disk_io_job
 	disk_buffer_pool
 	disk_io_thread
 	enum_net
@@ -246,7 +254,7 @@ set_target_properties(torrent-rasterbar PROPERTIES
 	SOVERSION 1
 	VERSION 1)
 
-set (VERSION "1.0.0")
+set (VERSION "1.1.0")
 
 get_property (COMPILETIME_OPTIONS_LIST
 	DIRECTORY ${CMAKE_CURRENT_SOURCE_DIRECTORY}

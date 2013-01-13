@@ -57,9 +57,12 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/alert.hpp" // alert::error_notification
 #include "libtorrent/add_torrent_params.hpp"
 #include "libtorrent/rss.hpp"
+#include "libtorrent/peer_class.hpp"
+#include "libtorrent/peer_class_type_filter.hpp"
 #include "libtorrent/build_config.hpp"
 
 #include "libtorrent/storage.hpp"
+#include "libtorrent/session_settings.hpp"
 
 #ifdef _MSC_VER
 #	include <eh.h>
@@ -84,8 +87,24 @@ namespace libtorrent
 	class upnp;
 	class alert;
 
+	struct stats_metric
+	{
+		char const* name;
+		int value_index;
+		enum { type_counter, type_gauge };
+		int type;
+	};
+
+	typedef boost::function<void(sha1_hash const&, std::vector<char>&
+		, error_code&)> user_load_function_t;
+
+	TORRENT_EXPORT void min_memory_usage(settings_pack& set);
+	TORRENT_EXPORT void high_performance_seed(settings_pack& set);
+
+#ifndef TORRENT_NO_DEPRECATE
 	TORRENT_EXPORT session_settings min_memory_usage();
 	TORRENT_EXPORT session_settings high_performance_seed();
+#endif
 
 #ifndef TORRENT_CFG
 #error TORRENT_CFG is not defined!
@@ -191,6 +210,9 @@ namespace libtorrent
 			, boost::uint32_t flags = 0) const;
 		void post_torrent_updates();
 
+		std::vector<stats_metric> session_stats_metrics() const;
+		void post_session_stats();
+
 		// returns a list of all torrents in this session
 		std::vector<torrent_handle> get_torrents() const;
 		
@@ -250,11 +272,21 @@ namespace libtorrent
 		void resume();
 		bool is_paused() const;
 
-		session_status status() const;
-		cache_status get_cache_status() const;
+		void set_load_function(user_load_function_t fun);
 
+		session_status status() const;
+
+#ifndef TORRENT_NO_DEPRECATE
+		// deprecated in aio branch
+		TORRENT_DEPRECATED_PREFIX
 		void get_cache_info(sha1_hash const& ih
-			, std::vector<cached_piece_info>& ret) const;
+			, std::vector<cached_piece_info>& ret) const TORRENT_DEPRECATED;
+		TORRENT_DEPRECATED_PREFIX
+		cache_status get_cache_status() const TORRENT_DEPRECATED;
+#endif
+
+		enum { disk_cache_no_pieces = 1 };
+		void get_cache_info(cache_status* ret, torrent_handle h = torrent_handle(), int flags = 0) const;
 
 		feed_handle add_feed(feed_settings const& feed);
 		void remove_feed(feed_handle h);
@@ -314,7 +346,20 @@ namespace libtorrent
 		void set_key(int key);
 		peer_id id() const;
 
-		bool is_listening() const;
+		// built-in peer classes
+		enum {
+			global_peer_class_id,
+			tcp_peer_class_id,
+			local_peer_class_id
+		};
+
+		// peer class API
+		void set_peer_class_filter(ip_filter const& f);
+		void set_peer_class_type_filter(peer_class_type_filter const& f);
+		int create_peer_class(char const* name);
+		void delete_peer_class(int cid);
+		peer_class_info get_peer_class(int cid);
+		void set_peer_class(int cid, peer_class_info const& pci);
 
 		// if the listen port failed in some way
 		// you can retry to listen on another port-
@@ -353,6 +398,10 @@ namespace libtorrent
 
 		// returns the port we ended up listening on
 		unsigned short listen_port() const;
+		bool is_listening() const;
+
+		// specify which interfaces to bind outgoing connections to
+		void use_interfaces(char const* interfaces);
 
 		enum options_t
 		{
@@ -368,8 +417,16 @@ namespace libtorrent
 
 		void remove_torrent(const torrent_handle& h, int options = none);
 
-		void set_settings(session_settings const& s);
-		session_settings settings() const;
+#ifndef TORRENT_NO_DEPRECATE
+		// deprecated in aio-branch
+		TORRENT_DEPRECATED_PREFIX
+		void set_settings(session_settings const& s) TORRENT_DEPRECATED;
+		TORRENT_DEPRECATED_PREFIX
+		session_settings settings() const TORRENT_DEPRECATED;
+#endif
+
+		void apply_settings(settings_pack const& s);
+		aux::session_settings get_settings() const;
 
 		void set_proxy(proxy_settings const& s);
 		proxy_settings proxy() const;

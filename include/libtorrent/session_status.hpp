@@ -114,6 +114,7 @@ namespace libtorrent
 		size_type total_failed_bytes;
 
 		int num_peers;
+		int num_dead_peers;
 		int num_unchoked;
 		int allowed_upload_slots;
 
@@ -142,6 +143,8 @@ namespace libtorrent
 		utp_status utp_stats;
 
 		int peerlist_size;
+		int num_torrents;
+		int num_paused_torrents;
 	};
 
 }

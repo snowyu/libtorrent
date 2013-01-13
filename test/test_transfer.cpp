@@ -49,9 +49,7 @@ POSSIBILITY OF SUCH DAMAGE.
 using namespace libtorrent;
 using boost::tuples::ignore;
 
-int const alert_mask = alert::all_categories
-& ~alert::progress_notification
-& ~alert::stats_notification;
+const int mask = alert::all_categories & ~(alert::performance_warning | alert::stats_notification);
 
 // test the maximum transfer rate
 void test_rate()
@@ -63,8 +61,8 @@ void test_rate()
 	remove_all("tmp1_transfer_moved", ec);
 	remove_all("tmp2_transfer_moved", ec);
 
-	session ses1(fingerprint("LT", 0, 1, 0, 0), std::make_pair(48575, 49000), "0.0.0.0", 0, alert_mask);
-	session ses2(fingerprint("LT", 0, 1, 0, 0), std::make_pair(49575, 50000), "0.0.0.0", 0, alert_mask);
+	session ses1(fingerprint("LT", 0, 1, 0, 0), std::make_pair(48575, 49000), "0.0.0.0", 0, mask);
+	session ses2(fingerprint("LT", 0, 1, 0, 0), std::make_pair(49575, 50000), "0.0.0.0", 0, mask);
 
 	torrent_handle tor1;
 	torrent_handle tor2;
@@ -79,6 +77,9 @@ void test_rate()
 
 	boost::tie(tor1, tor2, ignore) = setup_transfer(&ses1, &ses2, 0
 		, true, false, true, "_transfer", 0, &t);
+
+	ses1.set_alert_mask(mask);
+	ses2.set_alert_mask(mask);
 
 	ptime start = time_now();
 
@@ -121,104 +122,60 @@ void print_alert(std::auto_ptr<alert>)
 }
 
 // simulate a full disk
-struct test_storage : storage_interface
+struct test_storage : default_storage 
 {
-	test_storage(file_storage const& fs, std::string const& p, file_pool& fp)
-		: m_lower_layer(default_storage_constructor(fs, 0, p, fp, std::vector<boost::uint8_t>()))
+	test_storage(storage_params const& params)
+		: default_storage(params)
   		, m_written(0)
 		, m_limit(16 * 1024 * 2)
 	{}
 
-	virtual bool initialize(bool allocate_files)
-	{ return m_lower_layer->initialize(allocate_files); }
-
-	virtual bool has_any_file()
-	{ return m_lower_layer->has_any_file(); }
-
-	virtual int readv(file::iovec_t const* bufs, int slot, int offset, int num_bufs)
-	{ return m_lower_layer->readv(bufs, slot, offset, num_bufs); }
-
-	virtual int writev(file::iovec_t const* bufs, int slot, int offset, int num_bufs)
+	void set_limit(int lim)
 	{
-		int ret = m_lower_layer->writev(bufs, slot, offset, num_bufs);
-		if (ret > 0) m_written += ret;
-		if (m_written > m_limit)
-		{
-#if BOOST_VERSION == 103500
-			set_error("", error_code(boost::system::posix_error::no_space_on_device, get_posix_category()));
-#elif BOOST_VERSION > 103500
-			set_error("", error_code(boost::system::errc::no_space_on_device, get_posix_category()));
-#else
-			set_error("", error_code(ENOSPC, get_posix_category()));
-#endif
-			return -1;
-		}
-		return ret;
+		mutex::scoped_lock l(m_mutex);
+		m_limit = lim;
 	}
 
-	virtual size_type physical_offset(int piece_index, int offset)
-	{ return m_lower_layer->physical_offset(piece_index, offset); }
-
-	virtual int read(char* buf, int slot, int offset, int size)
-	{ return m_lower_layer->read(buf, slot, offset, size); }
-
-	virtual int write(const char* buf, int slot, int offset, int size)
+	int writev(
+		file::iovec_t const* bufs
+		, int num_bufs
+		, int piece_index
+		, int offset
+		, int flags
+		, storage_error& se)
 	{
-		int ret = m_lower_layer->write(buf, slot, offset, size);
-		if (ret > 0) m_written += ret;
-		if (m_written > m_limit)
+		mutex::scoped_lock l(m_mutex);
+		if (m_written >= m_limit)
 		{
+			std::cerr << "storage written: " << m_written << " limit: " << m_limit << std::endl;
+			error_code ec;
 #if BOOST_VERSION == 103500
-			set_error("", error_code(boost::system::posix_error::no_space_on_device, get_posix_category()));
+			ec = error_code(boost::system::posix_error::no_space_on_device, get_posix_category());
 #elif BOOST_VERSION > 103500
-			set_error("", error_code(boost::system::errc::no_space_on_device, get_posix_category()));
+			ec = error_code(boost::system::errc::no_space_on_device, get_posix_category());
 #else
-			set_error("", error_code(ENOSPC, get_posix_category()));
+			ec = error_code(ENOSPC, get_posix_category());
 #endif
-			return -1;
+			se.ec = ec;
+			return 0;
 		}
-		return ret;
+
+		for (int i = 0; i < num_bufs; ++i)
+			m_written += bufs[i].iov_len;
+		l.unlock();
+		return default_storage::writev(bufs, num_bufs, piece_index, offset, flags, se);
 	}
-
-	virtual int sparse_end(int start) const
-	{ return m_lower_layer->sparse_end(start); }
-
-	virtual bool move_storage(std::string const& save_path)
-	{ return m_lower_layer->move_storage(save_path); }
-
-	virtual bool verify_resume_data(lazy_entry const& rd, error_code& error)
-	{ return m_lower_layer->verify_resume_data(rd, error); }
-
-	virtual bool write_resume_data(entry& rd) const
-	{ return m_lower_layer->write_resume_data(rd); }
-
-	virtual bool move_slot(int src_slot, int dst_slot)
-	{ return m_lower_layer->move_slot(src_slot, dst_slot); }
-
-	virtual bool swap_slots(int slot1, int slot2)
-	{ return m_lower_layer->swap_slots(slot1, slot2); }
-
-	virtual bool swap_slots3(int slot1, int slot2, int slot3)
-	{ return m_lower_layer->swap_slots3(slot1, slot2, slot3); }
-
-	virtual bool release_files() { return m_lower_layer->release_files(); }
-
-	virtual bool rename_file(int index, std::string const& new_filename)
-	{ return m_lower_layer->rename_file(index, new_filename); }
-
-	virtual bool delete_files() { return m_lower_layer->delete_files(); }
 
 	virtual ~test_storage() {}
 
-	boost::scoped_ptr<storage_interface> m_lower_layer;
 	int m_written;
 	int m_limit;
+	mutex m_mutex;
 };
 
-storage_interface* test_storage_constructor(file_storage const& fs
-	, file_storage const*, std::string const& path, file_pool& fp, std::vector<boost::uint8_t> const&)
+storage_interface* test_storage_constructor(storage_params const& params)
 {
-	return new test_storage(fs, path, fp);
+	return new test_storage(params);
 }
 
 int tracker_responses = 0;
@@ -230,7 +187,8 @@ bool on_alert(alert* a)
 	return false;
 }
 
-void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowed_fast = false, bool test_priorities = false)
+void test_transfer(int proxy_type, bool test_disk_full = false
+	, bool test_allowed_fast = false, bool test_priorities = false)
 {
 
 	char const* test_name[] = {"no", "SOCKS4", "SOCKS5", "SOCKS5 password", "HTTP", "HTTP password"};
@@ -244,8 +202,8 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 	remove_all("tmp1_transfer_moved", ec);
 	remove_all("tmp2_transfer_moved", ec);
 
-	session ses1(fingerprint("LT", 0, 1, 0, 0), std::make_pair(48075, 49000), "0.0.0.0", 0, alert_mask);
-	session ses2(fingerprint("LT", 0, 1, 0, 0), std::make_pair(49075, 50000), "0.0.0.0", 0, alert_mask);
+	session ses1(fingerprint("LT", 0, 1, 0, 0), std::make_pair(48075, 49000), "0.0.0.0", 0, mask);
+	session ses2(fingerprint("LT", 0, 1, 0, 0), std::make_pair(49075, 50000), "0.0.0.0", 0, mask);
 
 	proxy_settings ps;
 	if (proxy_type)
@@ -259,42 +217,43 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 		ses2.set_proxy(ps);
 	}
 
-	session_settings sett;
-	sett.allow_multiple_connections_per_ip = false;
-	sett.ignore_limits_on_local_network = false;
+	settings_pack pack;
+	pack.set_bool(settings_pack::allow_multiple_connections_per_ip, false);
 
 	if (test_allowed_fast)
 	{
-		sett.allowed_fast_set_size = 2000;
-		sett.unchoke_slots_limit = 0;
+		pack.set_int(settings_pack::allowed_fast_set_size, 2000);
 	}
 
-	sett.unchoke_slots_limit = 0;
-	ses1.set_settings(sett);
-	TEST_CHECK(ses1.settings().unchoke_slots_limit == 0);
-	sett.unchoke_slots_limit = -1;
-	ses1.set_settings(sett);
-	TEST_CHECK(ses1.settings().unchoke_slots_limit == -1);
-	sett.unchoke_slots_limit = 8;
-	ses1.set_settings(sett);
-	TEST_CHECK(ses1.settings().unchoke_slots_limit == 8);
+	pack.set_int(settings_pack::unchoke_slots_limit, 0);
+	ses1.apply_settings(pack);
+	TEST_CHECK(ses1.get_settings().get_int(settings_pack::unchoke_slots_limit) == 0);
+
+	pack.set_int(settings_pack::unchoke_slots_limit, -1);
+	ses1.apply_settings(pack);
+	TEST_CHECK(ses1.get_settings().get_int(settings_pack::unchoke_slots_limit) == -1);
+
+	pack.set_int(settings_pack::unchoke_slots_limit, 8);
+	ses1.apply_settings(pack);
+	TEST_CHECK(ses1.get_settings().get_int(settings_pack::unchoke_slots_limit) == 8);
 
 	// we need a short reconnect time since we
 	// finish the torrent and then restart it
 	// immediately to complete the second half.
 	// using a reconnect time > 0 will just add
 	// to the time it will take to complete the test
-	sett.min_reconnect_time = 0;
-	sett.stop_tracker_timeout = 1;
-	sett.announce_to_all_trackers = true;
-	sett.announce_to_all_tiers = true;
-	// make sure we announce to both http and udp trackers
-	sett.prefer_udp_trackers = false;
-	sett.enable_outgoing_utp = false;
-	sett.enable_incoming_utp = false;
+	pack.set_int(settings_pack::min_reconnect_time, 0);
+	pack.set_int(settings_pack::stop_tracker_timeout, 1);
+	pack.set_bool(settings_pack::announce_to_all_trackers, true);
+	pack.set_bool(settings_pack::announce_to_all_tiers, true);
 
-	ses1.set_settings(sett);
-	ses2.set_settings(sett);
+	// make sure we announce to both http and udp trackers
+	pack.set_bool(settings_pack::prefer_udp_trackers, false);
+	pack.set_bool(settings_pack::enable_outgoing_utp, false);
+	pack.set_bool(settings_pack::enable_incoming_utp, false);
+
+	ses1.apply_settings(pack);
+	ses2.apply_settings(pack);
 
 #ifndef TORRENT_DISABLE_ENCRYPTION
 	pe_settings pes;
@@ -336,7 +295,7 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 	boost::tie(tor1, tor2, ignore) = setup_transfer(&ses1, &ses2, 0
 		, true, false, true, "_transfer", 8 * 1024, &t, false, test_disk_full?&addp:0);
 
-	int num_pieces = tor2.get_torrent_info().num_pieces();
+	int num_pieces = tor2.torrent_file()->num_pieces();
 	std::vector<int> priorities(num_pieces, 1);
 	if (test_priorities)
 	{
@@ -348,17 +307,18 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 		std::cerr << std::endl;
 	}
 
+	ses1.set_alert_mask(mask);
+	ses2.set_alert_mask(mask);
 //	ses1.set_alert_dispatch(&print_alert);
-
-//	sett = ses2.settings();
-//	sett.download_rate_limit = tor2.get_torrent_info().piece_length() * 5;
-//	ses2.set_settings(sett);
 
 	// also test to move the storage of the downloader and the uploader
 	// to make sure it can handle switching paths
 	bool test_move_storage = false;
 
 	tracker_responses = 0;
+	int upload_mode_timer = 0;
+
+	wait_for_downloading(ses2, "ses2");
 
 	for (int i = 0; i < 50; ++i)
 	{
@@ -392,23 +352,25 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 			std::cerr << "moving storage" << std::endl;
 		}
 
-		if (test_disk_full && st2.upload_mode)
+		// wait 10 loops before we restart the torrent. This lets
+		// us catch all events that failed (and would put the torrent
+		// back into upload mode) before we restart it.
+		if (test_disk_full && st2.upload_mode && ++upload_mode_timer > 10)
 		{
 			test_disk_full = false;
-			((test_storage*)tor2.get_storage_impl())->m_limit = 16 * 1024 * 1024;
+			std::cerr << "lifting write limit in storage" << std::endl;
+			((test_storage*)tor2.get_storage_impl())->set_limit(16 * 1024 * 1024);
 			tor2.set_upload_mode(false);
+			// at this point we probably disconnected the seed
+			// so we need to reconnect as well
+			fprintf(stderr, "reconnecting peer\n");
+			error_code ec;
+			tor2.connect_peer(tcp::endpoint(address::from_string("127.0.0.1", ec)
+				, ses1.listen_port()));
 			continue;
 		}
 
 		if (!test_disk_full && st2.is_finished) break;
-
-		if (st2.state != torrent_status::downloading)
-		{
-			static char const* state_str[] =	
-				{"checking (q)", "checking", "dl metadata"
-				, "downloading", "finished", "seeding", "allocating", "checking (r)"};
-			std::cerr << "st2 state: " << state_str[st2.state] << std::endl;
-		}
 
 		TEST_CHECK(st1.state == torrent_status::seeding
 			|| st1.state == torrent_status::checking_files);
@@ -430,9 +392,19 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 			std::cerr << "torrent is finished (50% complete)" << std::endl;
 		else return;
 
+		std::vector<int> priorities2 = tor2.piece_priorities();
+		std::copy(priorities2.begin(), priorities2.end(), std::ostream_iterator<int>(std::cerr, ", "));
+		std::cerr << std::endl;
+		TEST_CHECK(std::equal(priorities.begin(), priorities.end(), priorities2.begin()));
+
 		std::cerr << "force recheck" << std::endl;
 		tor2.force_recheck();
 	
+		priorities2 = tor2.piece_priorities();
+		std::copy(priorities2.begin(), priorities2.end(), std::ostream_iterator<int>(std::cerr, ", "));
+		std::cerr << std::endl;
+		TEST_CHECK(std::equal(priorities.begin(), priorities.end(), priorities2.begin()));
+
 		for (int i = 0; i < 50; ++i)
 		{
 			test_sleep(100);
@@ -443,7 +415,9 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 			if (st2.state != torrent_status::checking_files) break;
 		}
 
-		std::vector<int> priorities2 = tor2.piece_priorities();
+		priorities2 = tor2.piece_priorities();
+		std::copy(priorities2.begin(), priorities2.end(), std::ostream_iterator<int>(std::cerr, ", "));
+		std::cerr << std::endl;
 		TEST_CHECK(std::equal(priorities.begin(), priorities.end(), priorities2.begin()));
 
 		for (int i = 0; i < 5; ++i)
@@ -480,6 +454,7 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 
 		std::vector<char> resume_data;
 		a = ses2.wait_for_alert(seconds(10));
+		ptime start = time_now_hires();
 		while (a)
 		{
 			std::auto_ptr<alert> holder = ses2.pop_alert();
@@ -488,13 +463,20 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 			{
 				bencode(std::back_inserter(resume_data)
 						, *alert_cast<save_resume_data_alert>(a)->resume_data);
+				fprintf(stderr, "saved resume data\n");
 				break;
 			}
+			else if (alert_cast<save_resume_data_failed_alert>(a))
+			{
+				fprintf(stderr, "save resume failed\n");
+				break;
+			}
+			if (total_seconds(time_now_hires() - start) > 10)
+				break;
+
 			a = ses2.wait_for_alert(seconds(10));
 		}
 		TEST_CHECK(resume_data.size());	
-
-		std::cerr << "saved resume data" << std::endl;
 
 		ses2.remove_torrent(tor2);
 
@@ -510,9 +492,7 @@ void test_transfer(int proxy_type, bool test_disk_full = false, bool test_allowe
 		p.save_path = "tmp2_transfer_moved";
 		p.resume_data = &resume_data;
 		tor2 = ses2.add_torrent(p, ec);
-		ses2.set_alert_mask(alert::all_categories
-			& ~alert::progress_notification
-			& ~alert::stats_notification);
+		ses2.set_alert_mask(mask);
 		tor2.prioritize_pieces(priorities);
 		std::cout << "resetting priorities" << std::endl;
 		tor2.resume();
@@ -598,13 +578,13 @@ int test_main()
 	// test with all kinds of proxies
 	for (int i = 0; i < 6; ++i)
 		test_transfer(i);
-	
+
 	// test with a (simulated) full disk
 	test_transfer(0, true, true);
-	
+
 	// test allowed fast
 	test_transfer(0, false, true, true);
-	
+
 	error_code ec;
 	remove_all("tmp1_transfer", ec);
 	remove_all("tmp2_transfer", ec);

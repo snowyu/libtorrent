@@ -53,7 +53,8 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/assert.hpp"
 #include "libtorrent/time.hpp"
 
-// #define TORRENT_DEBUG_REFCOUNTS
+//#define TORRENT_PICKER_LOG
+//#define TORRENT_DEBUG_REFCOUNTS
 
 #ifdef TORRENT_DEBUG_REFCOUNTS
 #include <set>
@@ -65,6 +66,7 @@ namespace libtorrent
 	class torrent;
 	class peer_connection;
 	struct bitfield;
+	struct logger;
 
 	struct TORRENT_EXTRA_EXPORT piece_block
 	{
@@ -100,6 +102,10 @@ namespace libtorrent
 	{
 	public:
 
+#if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_LOGGING || defined TORRENT_ERROR_LOGGING
+		static void print_size(logger& l);
+#endif
+
 		struct piece_pos;
 
 		enum
@@ -115,7 +121,7 @@ namespace libtorrent
 			block_info(): peer(0), num_peers(0), state(state_none) {}
 			// the peer this block was requested or
 			// downloaded from. This is a pointer to
-			// a policy::peer object
+			// a torrent_peer object
 			void* peer;
 			// the number of peers that has this block in their
 			// download or request queues
@@ -151,35 +157,71 @@ namespace libtorrent
 			// have affinity to pieces with the same speed category
 			speed_affinity = 32,
 			// ignore the prefer_whole_pieces parameter
-			ignore_whole_pieces = 64
+			ignore_whole_pieces = 64,
+			// only expands pieces (when prefer whole pieces is set)
+			// within properly aligned ranges, not the largest possible
+			// range of pieces.
+			align_expanded_pieces = 128
 		};
 
 		struct downloading_piece
 		{
-			downloading_piece(): state(none), index(-1), info(0)
-				, finished(0), writing(0), requested(0) {}
+			downloading_piece() : info(0), index(-1)
+				, finished(0), state(none), writing(0)
+				, passed_hash_check(0), failed_write(0)
+				, requested(0), outstanding_hash_check(0) {}
 
 			bool operator<(downloading_piece const& rhs) const { return index < rhs.index; }
 
-			piece_state_t state;
-
-			// the index of the piece
-			int index;
 			// info about each block
 			// this is a pointer into the m_block_info
 			// vector owned by the piece_picker
 			block_info* info;
+
+			// the index of the piece
+			int index;
+
 			// the number of blocks in the finished state
-			boost::int16_t finished;
+			boost::uint16_t finished:14;
+
+			// the speed state of this piece
+			boost::uint16_t state:2;
+
 			// the number of blocks in the writing state
-			boost::int16_t writing;
+			boost::uint16_t writing:14;
+
+			// set to true when the hash check job
+			// returns with a valid hash for this piece.
+			// we might not 'have' the piece yet though,
+			// since it might not have been written to
+			// disk. This is not set of failed_write is
+			// set.
+			boost::uint16_t passed_hash_check:1;
+
+			// set to true when any block in this piece
+			// fails to be written to disk
+			// if a block fails, passed_hash_check is also
+			// cleared. Checking the hash of a piece and
+			// writing it to disk are both done asynchronously.
+			// the operations may complete in any order. It's
+			// important that at the end we know whether
+			// both succeeded. And if write failed, we want
+			// the piece to be restored to a state where download
+			// can be resumed
+			boost::uint16_t failed_write:1;
+
 			// the number of blocks in the requested state
-			boost::int16_t requested;
+			boost::uint16_t requested:14;
+
+			// set to true while there is an outstanding
+			// hash check for this piece
+			boost::uint16_t outstanding_hash_check:1;
 		};
 		
 		piece_picker();
 
 		void get_availability(std::vector<int>& avail) const;
+		int get_availability(int piece) const;
 
 		// increases the peer count for the given piece
 		// (is used when a HAVE message is received)
@@ -214,12 +256,7 @@ namespace libtorrent
 		void init(int blocks_per_piece, int blocks_in_last_piece, int total_num_pieces);
 		int num_pieces() const { return int(m_piece_map.size()); }
 
-		bool have_piece(int index) const
-		{
-			TORRENT_ASSERT(index >= 0);
-			TORRENT_ASSERT(index < int(m_piece_map.size()));
-			return m_piece_map[index].index == piece_pos::we_have_index;
-		}
+		bool have_piece(int index) const;
 
 		bool is_downloading(int index) const
 		{
@@ -227,7 +264,7 @@ namespace libtorrent
 			TORRENT_ASSERT(index < int(m_piece_map.size()));
 
 			piece_pos const& p = m_piece_map[index];
-			return p.downloading;
+			return p.downloading();
 		}
 
 		// sets the priority of a piece.
@@ -257,13 +294,15 @@ namespace libtorrent
 		// decides to download a piece, it must mark it as being downloaded
 		// itself, by using the mark_as_downloading() member function.
 		// THIS IS DONE BY THE peer_connection::send_request() MEMBER FUNCTION!
-		// The last argument is the policy::peer pointer for the peer that
+		// The last argument is the torrent_peer pointer for the peer that
 		// we'll download from.
 		void pick_pieces(bitfield const& pieces
 			, std::vector<piece_block>& interesting_blocks, int num_blocks
 			, int prefer_whole_pieces, void* peer, piece_state_t speed
 			, int options, std::vector<int> const& suggested_pieces
-			, int num_peers) const;
+			, int num_peers
+			, int& loop_counter
+			) const;
 
 		// picks blocks from each of the pieces in the piece_list
 		// vector that is also in the piece bitmask. The blocks
@@ -309,9 +348,24 @@ namespace libtorrent
 		// and false if the block is already finished or writing
 		bool mark_as_writing(piece_block block, void* peer);
 
+		void mark_as_canceled(piece_block block, void* peer);
 		void mark_as_finished(piece_block block, void* peer);
 		void write_failed(piece_block block);
 		int num_peers(piece_block block) const;
+
+		// if the piece failed, it will automatically be
+		// restored when all blocks are completely written
+		// i.e. transition to finished state. Before then,
+		// it's kept in the writing state to avoid requesting
+		// it from other peers. A piece may also pass the hash
+		// check before all blocks have been written. In this
+		// case a bit will be set in the piece_pos entry
+		// indicating this.
+		void piece_passed(int index);
+		void piece_failed(int index);
+
+		void mark_as_checking(int index);
+		void mark_as_done_checking(int index);
 
 		// returns information about the given piece
 		void piece_info(int index, piece_picker::downloading_piece& st) const;
@@ -330,7 +384,13 @@ namespace libtorrent
 		// this means that this piece-block can be picked again
 		void abort_download(piece_block block, void* peer = 0);
 
+		// returns true if all blocks in this piece are finished
+		// or if we have the piece
 		bool is_piece_finished(int index) const;
+
+		// returns true if we have the piece or if the piece
+		// has passed the hash check
+		bool has_piece_passed(int index) const;
 
 		// returns the number of blocks there is in the given piece
 		int blocks_in_piece(int index) const;
@@ -339,12 +399,18 @@ namespace libtorrent
 		// the hash-check yet
 		int unverified_blocks() const;
 
+		// return the peer pointers for all blocks that are currently
+		// in requested state (i.e. requested but not received)
+		void get_requestors(std::vector<void*>& d, int index) const;
+
+		// return the peer pointers to all peers that participated in
+		// this piece
 		void get_downloaders(std::vector<void*>& d, int index) const;
 
-		std::vector<downloading_piece> const& get_download_queue() const
-		{ return m_downloads; }
+		std::vector<piece_picker::downloading_piece> get_download_queue() const;
+		int get_download_queue_size() const;
 
-		int num_downloading_pieces() const { return int(m_downloads.size()); }
+		void get_download_queue_sizes(int* partial, int* full, int* finished) const;
 
 		void* get_downloader(piece_block block) const;
 
@@ -355,6 +421,13 @@ namespace libtorrent
 		int num_have_filtered() const { return m_num_have_filtered; }
 
 		int num_have() const { return m_num_have; }
+
+		int num_passed() const { return m_num_passed; }
+
+		// return true if we have all the pieces we wanted
+		bool is_finished() const { return m_num_have - m_num_have_filtered == int(m_piece_map.size()) - m_num_filtered; }
+
+		bool is_seeding() const { return m_num_have == int(m_piece_map.size()); }
 
 		// the number of pieces we want and don't have
 		int num_want_left() const { return num_pieces() - m_num_have - m_num_filtered; }
@@ -391,7 +464,7 @@ namespace libtorrent
 		bool can_pick(int piece, bitfield const& bitmask) const;
 		bool is_piece_free(int piece, bitfield const& bitmask) const;
 		std::pair<int, int> expand_piece(int piece, int whole_pieces
-			, bitfield const& have) const;
+			, bitfield const& have, int options) const;
 
 	public:
 
@@ -400,8 +473,7 @@ namespace libtorrent
 			piece_pos() {}
 			piece_pos(int peer_count_, int index_)
 				: peer_count(peer_count_)
-				, downloading(0)
-				, full(0)
+				, state(piece_pos::piece_open)
 				, piece_priority(1)
 				, index(index_)
 			{
@@ -411,15 +483,28 @@ namespace libtorrent
 
 			// the number of peers that has this piece
 			// (availability)
-#if TORRENT_COMPACT_PICKER
+#if TORRENT_OPTIMIZE_MEMORY_USAGE
 			boost::uint32_t peer_count : 9;
 #else
 			boost::uint32_t peer_count : 16;
 #endif
-			// is 1 if the piece is marked as being downloaded
-			boost::uint32_t downloading : 1;
-			// set when downloading, but no free blocks to request left
-			boost::uint32_t full : 1;
+
+			// state of this piece.
+			enum state_t
+			{
+				// the piece is open to be picked
+				piece_open,
+				// the piece is partially downloaded or requested
+				piece_downloading,
+				// all blocks in the piece have been requested
+				piece_full,
+				// all blocks in the piece have been received and
+				// are either finished or writing
+				piece_finished
+			};
+
+			boost::uint32_t state : 2;
+
 			// is 0 if the piece is filtered (not to be downloaded)
 			// 1 is normal priority (default)
 			// 2 is higher priority than pieces at the same availability level
@@ -429,7 +514,7 @@ namespace libtorrent
 			// 7 is maximum priority (ignores availability)
 			boost::uint32_t piece_priority : 3;
 			// index in to the piece_info vector
-#if TORRENT_COMPACT_PICKER
+#if TORRENT_OPTIMIZE_MEMORY_USAGE
 			boost::uint32_t index : 18;
 #else
 			boost::uint32_t index;
@@ -439,12 +524,13 @@ namespace libtorrent
 			// all the peers that have this piece
 			std::set<const void*> have_peers;
 #endif
+
 			enum
 			{
 				// index is set to this to indicate that we have the
 				// piece. There is no entry for the piece in the
 				// buckets if this is the case.
-#if TORRENT_COMPACT_PICKER
+#if TORRENT_OPTIMIZE_MEMORY_USAGE
 				we_have_index = 0x3ffff,
 #else
 				we_have_index = 0xffffffff,
@@ -452,7 +538,7 @@ namespace libtorrent
 				// the priority value that means the piece is filtered
 				filter_priority = 0,
 				// the max number the peer count can hold
-#if TORRENT_COMPACT_PICKER
+#if TORRENT_OPTIMIZE_MEMORY_USAGE
 				max_peer_count = 0x1ff
 #else
 				max_peer_count = 0xffff
@@ -462,6 +548,7 @@ namespace libtorrent
 			bool have() const { return index == we_have_index; }
 			void set_have() { index = we_have_index; TORRENT_ASSERT(have()); }
 			void set_not_have() { index = 0; TORRENT_ASSERT(!have()); }
+			bool downloading() const { return state > 0; }
 			
 			bool filtered() const { return piece_priority == filter_priority; }
 			void filtered(bool f) { piece_priority = f ? filter_priority : 0; }
@@ -484,11 +571,12 @@ namespace libtorrent
 				// filtered pieces (prio = 0), pieces we have or pieces with
 				// availability = 0 should not be present in the piece list
 				// returning -1 indicates that they shouldn't.
-				if (filtered() || have() || peer_count + picker->m_seeds == 0)
+				if (filtered() || have() || peer_count + picker->m_seeds == 0
+					|| state == piece_full || state == piece_finished)
 					return -1;
 
 				// prio 7 disregards availability
-				if (piece_priority == priority_levels - 1) return 1 - downloading;
+				if (piece_priority == priority_levels - 1) return 1 - downloading();
 
 				// prio 4,5,6 halves the availability of a piece
 				int availability = peer_count;
@@ -499,7 +587,7 @@ namespace libtorrent
 					p -= (priority_levels - 2) / 2;
 				}
 
-				if (downloading) return availability * prio_factor;
+				if (downloading()) return availability * prio_factor;
 				return availability * prio_factor + (priority_levels / 2) - p;
 			}
 
@@ -513,7 +601,7 @@ namespace libtorrent
 	private:
 
 #ifndef TORRENT_DEBUG_REFCOUNTS
-#if TORRENT_COMPACT_PICKER
+#if TORRENT_OPTIMIZE_MEMORY_USAGE
 		BOOST_STATIC_ASSERT(sizeof(piece_pos) == sizeof(char) * 4);
 #else
 		BOOST_STATIC_ASSERT(sizeof(piece_pos) == sizeof(char) * 8);
@@ -539,22 +627,19 @@ namespace libtorrent
 		// shuffles the given piece inside it's priority range
 		void shuffle(int priority, int elem_index);
 
-//		void sort_piece(std::vector<downloading_piece>::iterator dp);
+		typedef std::vector<downloading_piece>::iterator dlpiece_iter;
+		dlpiece_iter add_download_piece(int index);
+		void erase_download_piece(dlpiece_iter i);
 
-		downloading_piece& add_download_piece(int index);
-		void erase_download_piece(std::vector<downloading_piece>::iterator i);
+		std::vector<downloading_piece>::const_iterator find_dl_piece(int queue, int index) const;
+		std::vector<downloading_piece>::iterator find_dl_piece(int queue, int index);
 
-		std::vector<downloading_piece>::const_iterator find_dl_piece(int index) const;
-		std::vector<downloading_piece>::iterator find_dl_piece(int index);
-
-		void update_full(downloading_piece& dp);
+		// returns an iterator to the downloading piece, whichever
+		// download list it may live in now
+		std::vector<downloading_piece>::iterator update_piece_state(std::vector<downloading_piece>::iterator dp);
 
 		// some compilers (e.g. gcc 2.95, does not inherit access
 		// privileges to nested classes)
-	public:
-		// the number of seeds. These are not added to
-		// the availability counters of the pieces
-		int m_seeds;
 	private:
 
 		// the following vectors are mutable because they sometimes may
@@ -576,6 +661,7 @@ namespace libtorrent
 		// doesn't exist in the piece_info buckets
 		// pieces with the filtered flag set doesn't have entries in
 		// the m_piece_info buckets either
+		// TODO: should this be allocated lazily?
 		mutable std::vector<piece_pos> m_piece_map;
 
 		// each piece that's currently being downloaded
@@ -583,16 +669,28 @@ namespace libtorrent
 		// i.e. it says wich parts of the piece that
 		// is being downloaded. This list is ordered
 		// by piece index to make lookups efficient
-		std::vector<downloading_piece> m_downloads;
+		// there are 3 buckets of downloading pieces, each
+		// is individually sorted by piece index.
+		// 0: downloading pieces with unrequested blocks
+		// 1: downloading pieces where every block is busy
+		//    and some are still in the requested state
+		// 2: downloading pieces where every block is
+		//    finished or writing
+		std::vector<downloading_piece> m_downloads[3];
 
 		// this holds the information of the
 		// blocks in partially downloaded pieces.
-		// the first m_blocks_per_piece entries
-		// in the vector belongs to the first
-		// entry in m_downloads, the second
-		// m_blocks_per_piece entries to the
-		// second entry in m_downloads and so on.
+		// the downloading_piece::info pointers
+		// point into this vector for its storage
 		std::vector<block_info> m_block_info;
+
+		// if a piece fails the hash check and is still
+		// being written to disk (i.e. not in finished
+		// state), the piece index is put in this vector.
+		// once all blocks are completed and the piece index
+		// is found in this vector, the piece is restored
+		// and taken out of the vector
+		std::vector<int> m_failed_pieces;
 
 		int m_blocks_per_piece;
 		int m_blocks_in_last_piece;
@@ -606,8 +704,11 @@ namespace libtorrent
 		// the number of pieces we have that also are filtered
 		int m_num_have_filtered;
 		
-		// the number of pieces we have
+		// the number of pieces we have (i.e. passed + flushed)
 		int m_num_have;
+		
+		// the number of pieces that have passed the hash check
+		int m_num_passed;
 
 		// we have all pieces in the range [0, m_cursor)
 		// m_cursor is the first piece we don't have
@@ -621,12 +722,16 @@ namespace libtorrent
 		// the number of regions of pieces we don't have.
 		int m_sparse_regions;
 
+		// the number of seeds. These are not added to
+		// the availability counters of the pieces
+		int m_seeds;
+
 		// if this is set to true, it means update_pieces()
 		// has to be called before accessing m_pieces.
 		mutable bool m_dirty;
 	public:
 
-#if TORRENT_COMPACT_PICKER
+#if TORRENT_OPTIMIZE_MEMORY_USAGE
 		enum { max_pieces = piece_pos::we_have_index - 1 };
 #else
 		// still limited by piece_block

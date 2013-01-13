@@ -49,6 +49,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/config.hpp"
 #include "libtorrent/buffer.hpp"
 #include "libtorrent/socket.hpp"
+#include "libtorrent/peer_id.hpp" // for sha1_hash
 
 namespace libtorrent
 {
@@ -65,6 +66,7 @@ namespace libtorrent
 	class alert;
 	struct torrent_plugin;
 	class torrent;
+	struct add_torrent_params;
 
 	struct TORRENT_EXPORT plugin
 	{
@@ -80,6 +82,11 @@ namespace libtorrent
 		// alerts that are filtered are not
 		// posted
 		virtual void on_alert(alert const* a) {}
+
+		// return true if the add_torrent_params should be added
+		virtual bool on_unknown_torrent(sha1_hash const& info_hash
+			, peer_connection* pc, add_torrent_params& p)
+		{ return false; }
 
 		// called once per second
 		virtual void on_tick() {}
@@ -120,6 +127,15 @@ namespace libtorrent
 		// the state is one of torrent_status::state_t
 		// enum members
 		virtual void on_state(int s) {}
+
+		// called when the torrent is unloaded from RAM
+		// and loaded again, respectively
+		// unload is called right before the torrent is
+		// unloaded and load is called right after it's
+		// loaded. i.e. the full torrent state is available
+		// when these callbacks are called.
+		virtual void on_unload() {}
+		virtual void on_load() {}
 
 		// called every time policy::add_peer is called
 		// src is a bitmask of which sources this peer

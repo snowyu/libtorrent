@@ -104,7 +104,7 @@ void test_transfer(libtorrent::pe_settings::enc_policy policy,
 
 	fprintf(stderr, "waiting for transfer to complete\n");
 
-	for (int i = 0; i < 50; ++i)
+	for (int i = 0; i < 25; ++i)
 	{
 		torrent_status s = tor2.status();
 		print_alerts(ses1, "ses1");
@@ -198,8 +198,6 @@ int test_main()
 
 	test_transfer(pe_settings::enabled, pe_settings::both, false, true);
 	test_transfer(pe_settings::enabled, pe_settings::both, true, true);
-
-	return 0;
 
 	test_transfer(pe_settings::disabled);
 

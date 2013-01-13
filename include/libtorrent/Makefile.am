@@ -8,17 +8,21 @@ nobase_include_HEADERS = \
   address.hpp                  \
   add_torrent_params.hpp       \
   alert.hpp                    \
+  alert_handler.hpp            \
+  alert_observer.hpp           \
   alert_dispatcher.hpp         \
   alert_types.hpp              \
   alloca.hpp                   \
   allocator.hpp                \
   assert.hpp                   \
+  atomic.hpp                   \
   bandwidth_limit.hpp          \
   bandwidth_manager.hpp        \
   bandwidth_socket.hpp         \
   bandwidth_queue_entry.hpp    \
   bencode.hpp                  \
   bitfield.hpp                 \
+  block_cache.hpp              \
   bloom_filter.hpp             \
   broadcast_socket.hpp         \
   bt_peer_connection.hpp       \
@@ -26,6 +30,7 @@ nobase_include_HEADERS = \
   build_config.hpp             \
   chained_buffer.hpp           \
   config.hpp                   \
+  connection_interface.hpp     \
   connection_queue.hpp         \
   ConvertUTF.h                 \
   copy_ptr.hpp                 \
@@ -34,7 +39,11 @@ nobase_include_HEADERS = \
   debug.hpp                    \
   disk_buffer_holder.hpp       \
   disk_buffer_pool.hpp         \
+  disk_interface.hpp           \
+  disk_io_job.hpp              \
   disk_io_thread.hpp           \
+  disk_observer.hpp            \
+  disk_job_pool.hpp            \
   entry.hpp                    \
   enum_net.hpp                 \
   error.hpp                    \
@@ -63,21 +72,29 @@ nobase_include_HEADERS = \
   ip_filter.hpp                \
   ip_voter.hpp                 \
   lazy_entry.hpp               \
+  link.hpp                     \
+  linked_list.hpp              \
   lsd.hpp                      \
   magnet_uri.hpp               \
   max.hpp                      \
   natpmp.hpp                   \
+  network_thread_pool.hpp      \
   packet_buffer.hpp            \
   parse_url.hpp                \
+  part_file.hpp                \
   pch.hpp                      \
   pe_crypto.hpp                \
   peer_connection.hpp          \
   peer.hpp                     \
+  peer_class.hpp               \
+  peer_class_set.hpp           \
+  peer_class_type_filter.hpp   \
   peer_id.hpp                  \
   peer_info.hpp                \
   peer_request.hpp             \
   piece_block_progress.hpp     \
   piece_picker.hpp             \
+  platform_util.hpp            \
   policy.hpp                   \
   proxy_base.hpp               \
   ptime.hpp                    \
@@ -89,6 +106,7 @@ nobase_include_HEADERS = \
   session_settings.hpp         \
   session_status.hpp           \
   settings.hpp                 \
+  settings_pack.hpp            \
   size_type.hpp                \
   sliding_average.hpp          \
   socket.hpp                   \
@@ -98,24 +116,30 @@ nobase_include_HEADERS = \
   socks5_stream.hpp            \
   ssl_stream.hpp               \
   stat.hpp                     \
+  stat_cache.hpp               \
   storage.hpp                  \
   storage_defs.hpp             \
-  string_util.hpp              \
+  tailqueue.hpp                \
   struct_debug.hpp             \
+  string_util.hpp              \
   thread.hpp                   \
+  thread_pool.hpp              \
   time.hpp                     \
   timestamp_history.hpp        \
   torrent_handle.hpp           \
   torrent.hpp                  \
   torrent_info.hpp             \
+  torrent_peer.hpp             \
   tracker_manager.hpp          \
   udp_socket.hpp               \
   udp_tracker_connection.hpp   \
+  uncork_interface.hpp         \
   union_endpoint.hpp           \
   upnp.hpp                     \
   utp_socket_manager.hpp       \
   utp_stream.hpp               \
   utf8.hpp                     \
+  vector_utils.hpp             \
   version.hpp                  \
   web_connection_base.hpp      \
   web_peer_connection.hpp      \
@@ -127,6 +151,7 @@ nobase_include_HEADERS = \
   tommath_superclass.h \
   \
   aux_/session_impl.hpp        \
+  aux_/session_settings.hpp\
   \
   extensions/logger.hpp             \
   extensions/lt_trackers.hpp        \

@@ -41,17 +41,18 @@ POSSIBILITY OF SUCH DAMAGE.
 #endif
 
 #include <boost/function/function2.hpp>
+#include <boost/function/function0.hpp>
 #include <boost/limits.hpp>
 #include <boost/shared_ptr.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <boost/intrusive_ptr.hpp>
+#include <boost/unordered_set.hpp>
 
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
 
 
-#include "libtorrent/torrent_info.hpp"
 #include "libtorrent/piece_picker.hpp"
 #include "libtorrent/intrusive_ptr_base.hpp"
 #include "libtorrent/peer_request.hpp"
@@ -60,8 +61,13 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/file.hpp"
 #include "libtorrent/disk_buffer_holder.hpp"
 #include "libtorrent/thread.hpp"
+#include "libtorrent/atomic.hpp"
 #include "libtorrent/storage_defs.hpp"
 #include "libtorrent/allocator.hpp"
+#include "libtorrent/file_pool.hpp" // pool_file_status
+#include "libtorrent/part_file.hpp"
+#include "libtorrent/stat_cache.hpp"
+#include "libtorrent/lazy_entry.hpp"
 
 namespace libtorrent
 {
@@ -69,7 +75,9 @@ namespace libtorrent
 	struct file_pool;
 	struct disk_io_job;
 	struct disk_buffer_pool;
-	struct session_settings;
+	struct cache_status;
+	namespace aux { struct session_settings; }
+	struct cached_piece_entry;
 
 	TORRENT_EXTRA_EXPORT std::vector<std::pair<size_type, std::time_t> > get_filesizes(
 		file_storage const& t
@@ -81,172 +89,139 @@ namespace libtorrent
 		, std::vector<std::pair<size_type, std::time_t> > const& sizes
 		, bool compact_mode
 		, std::string* error = 0);
-/*
-	struct TORRENT_EXTRA_EXPORT file_allocation_failed: std::exception
-	{
-		file_allocation_failed(const char* error_msg): m_msg(error_msg) {}
-		virtual const char* what() const throw() { return m_msg.c_str(); }
-		virtual ~file_allocation_failed() throw() {}
-		std::string m_msg;
-	};
-*/
-	struct TORRENT_EXTRA_EXPORT partial_hash
-	{
-		partial_hash(): offset(0) {}
-		// the number of bytes in the piece that has been hashed
-		int offset;
-		// the sha-1 context
-		hasher h;
-	};
+
+	TORRENT_EXTRA_EXPORT int bufs_size(file::iovec_t const* bufs, int num_bufs);
 
 	struct TORRENT_EXPORT storage_interface
 	{
-		storage_interface(): m_disk_pool(0), m_settings(0) {}
+		storage_interface(): m_settings(0) {}
+
 		// create directories and set file sizes
-		// if allocate_files is true. 
-		// allocate_files is true if allocation mode
-		// is set to full and sparse files are supported
-		// false return value indicates an error
-		virtual bool initialize(bool allocate_files) = 0;
+		virtual void initialize(storage_error& ec) = 0;
 
-		virtual bool has_any_file() = 0;
+		virtual int readv(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, storage_error& ec) = 0;
+		virtual int writev(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, storage_error& ec) = 0;
 
-		virtual int readv(file::iovec_t const* bufs, int slot, int offset, int num_bufs);
-		virtual int writev(file::iovec_t const* bufs, int slot, int offset, int num_bufs);
+		virtual bool has_any_file(storage_error& ec) = 0;
 
-		virtual void hint_read(int, int, int) {}
-		// negative return value indicates an error
-		virtual int read(char* buf, int slot, int offset, int size) = 0;
-
-		// negative return value indicates an error
-		virtual int write(const char* buf, int slot, int offset, int size) = 0;
-
-		virtual size_type physical_offset(int slot, int offset) = 0;
-
-		// returns the end of the sparse region the slot 'start'
-		// resides in i.e. the next slot with content. If start
-		// is not in a sparse region, start itself is returned
-		virtual int sparse_end(int start) const { return start; }
+		// change the priorities of files. This is a fenced job and is
+		// guaranteed to be the only running function on this storage
+		virtual void set_file_priority(std::vector<boost::uint8_t> const& prio, storage_error& ec) = 0;
 
 		// non-zero return value indicates an error
-		virtual bool move_storage(std::string const& save_path) = 0;
+		virtual void move_storage(std::string const& save_path, storage_error& ec) = 0;
 
 		// verify storage dependent fast resume entries
-		virtual bool verify_resume_data(lazy_entry const& rd, error_code& error) = 0;
+		virtual bool verify_resume_data(lazy_entry const& rd, storage_error& ec) = 0;
 
 		// write storage dependent fast resume entries
-		virtual bool write_resume_data(entry& rd) const = 0;
-
-		// moves (or copies) the content in src_slot to dst_slot
-		virtual bool move_slot(int src_slot, int dst_slot) = 0;
-
-		// swaps the data in slot1 and slot2
-		virtual bool swap_slots(int slot1, int slot2) = 0;
-
-		// swaps the puts the data in slot1 in slot2, the data in slot2
-		// in slot3 and the data in slot3 in slot1
-		virtual bool swap_slots3(int slot1, int slot2, int slot3) = 0;
+		virtual void write_resume_data(entry& rd, storage_error& ec) const = 0;
 
 		// this will close all open files that are opened for
 		// writing. This is called when a torrent has finished
 		// downloading.
 		// non-zero return value indicates an error
-		virtual bool release_files() = 0;
+		virtual void release_files(storage_error& ec) = 0;
 
 		// this will rename the file specified by index.
-		virtual bool rename_file(int index, std::string const& new_filename) = 0;
+		virtual void rename_file(int index, std::string const& new_filenamem, storage_error& ec) = 0;
 
 		// this will close all open files and delete them
 		// non-zero return value indicates an error
-		virtual bool delete_files() = 0;
+		virtual void delete_files(storage_error& ec) = 0;
 
-		virtual void finalize_file(int) {}
+		// called for every file when it completes downloading
+		// used on windows to turn off the sparse flag
+		virtual void finalize_file(int, storage_error&) {}
 
-		disk_buffer_pool* disk_pool() { return m_disk_pool; }
-		session_settings const& settings() const { return *m_settings; }
+		// called periodically (useful for deferred flushing). When returning
+		// false, it means no more ticks are necessary. Any disk job submitted
+		// will re-enable ticking. The default will always turn ticking back
+		// off again.
+		virtual bool tick() { return false; }
 
-		void set_error(std::string const& file, error_code const& ec) const;
-
-		error_code const& error() const { return m_error; }
-		std::string const& error_file() const { return m_error_file; }
-		virtual void clear_error() { m_error = error_code(); m_error_file.resize(0); }
-
-		mutable error_code m_error;
-		mutable std::string m_error_file;
+		aux::session_settings const& settings() const { return *m_settings; }
 
 		virtual ~storage_interface() {}
 
-		disk_buffer_pool* m_disk_pool;
-		session_settings* m_settings;
+		// initialized in disk_io_thread::perform_async_job
+		aux::session_settings* m_settings;
 	};
 
 	class TORRENT_EXPORT default_storage : public storage_interface, boost::noncopyable
 	{
 	public:
-		default_storage(file_storage const& fs, file_storage const* mapped, std::string const& path
-			, file_pool& fp, std::vector<boost::uint8_t> const& file_prio);
+		default_storage(storage_params const& params);
 		~default_storage();
 
-		void finalize_file(int file);
-		bool has_any_file();
-		bool rename_file(int index, std::string const& new_filename);
-		bool release_files();
-		bool delete_files();
-		bool initialize(bool allocate_files);
-		bool move_storage(std::string const& save_path);
-		int read(char* buf, int slot, int offset, int size);
-		int write(char const* buf, int slot, int offset, int size);
+		void finalize_file(int file, storage_error& ec);
+		bool has_any_file(storage_error& ec);
+		void set_file_priority(std::vector<boost::uint8_t> const& prio, storage_error& ec);
+		void rename_file(int index, std::string const& new_filename, storage_error& ec);
+		void release_files(storage_error& ec);
+		void delete_files(storage_error& ec);
+		void initialize(storage_error& ec);
+		void move_storage(std::string const& save_path, storage_error& ec);
 		int sparse_end(int start) const;
-		void hint_read(int slot, int offset, int len);
-		int readv(file::iovec_t const* bufs, int slot, int offset, int num_bufs);
-		int writev(file::iovec_t const* buf, int slot, int offset, int num_bufs);
-		size_type physical_offset(int slot, int offset);
-		bool move_slot(int src_slot, int dst_slot);
-		bool swap_slots(int slot1, int slot2);
-		bool swap_slots3(int slot1, int slot2, int slot3);
-		bool verify_resume_data(lazy_entry const& rd, error_code& error);
-		bool write_resume_data(entry& rd) const;
+		bool verify_resume_data(lazy_entry const& rd, storage_error& error);
+		void write_resume_data(entry& rd, storage_error& ec) const;
+		bool tick();
+
+		int readv(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, storage_error& ec);
+		int writev(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, storage_error& ec);
 
 		// this identifies a read or write operation
 		// so that default_storage::readwritev() knows what to
 		// do when it's actually touching the file
 		struct fileop
 		{
-			size_type (file::*regular_op)(size_type file_offset
-				, file::iovec_t const* bufs, int num_bufs, error_code& ec);
-			size_type (default_storage::*unaligned_op)(boost::intrusive_ptr<file> const& f
-				, size_type file_offset, file::iovec_t const* bufs, int num_bufs
-				, error_code& ec);
+			// file operation
+			size_type (file::*op)(size_type file_offset
+				, file::iovec_t const* bufs, int num_bufs, error_code& ec, int flags);
 			int cache_setting;
+			// file open mode (file::read_only, file::write_only etc.)
 			int mode;
+			int flags;
+			// used for error reporting
+			int operation_type;
 		};
 
-		void delete_one_file(std::string const& p);
+		void delete_one_file(std::string const& p, error_code& ec);
 		int readwritev(file::iovec_t const* bufs, int slot, int offset
-			, int num_bufs, fileop const&);
-
-		size_type read_unaligned(boost::intrusive_ptr<file> const& file_handle
-			, size_type file_offset, file::iovec_t const* bufs, int num_bufs, error_code& ec);
-		size_type write_unaligned(boost::intrusive_ptr<file> const& file_handle
-			, size_type file_offset, file::iovec_t const* bufs, int num_bufs, error_code& ec);
+			, int num_bufs, fileop const& op, storage_error& ec);
 
 		file_storage const& files() const { return m_mapped_files?*m_mapped_files:m_files; }
+
+		void need_partfile();
 
 		boost::scoped_ptr<file_storage> m_mapped_files;
 		file_storage const& m_files;
 
+		// in order to avoid calling stat() on each file multiple times
+		// during startup, cache the results in here, and clear it all
+		// out once the torrent starts (to avoid getting stale results)
+		// each slot represents the size and timestamp of the file
+		mutable stat_cache m_stat_cache;
+
 		// helper function to open a file in the file pool with the right mode
 		boost::intrusive_ptr<file> open_file(file_storage::iterator fe, int mode
-			, error_code& ec) const;
+			, int flags, error_code& ec) const;
 
 		std::vector<boost::uint8_t> m_file_priority;
 		std::string m_save_path;
+		std::string m_part_file_name;
 		// the file pool is typically stored in
 		// the session, to make all storage
 		// instances use the same pool
 		file_pool& m_pool;
 
-		int m_page_size;
+		// used for skipped files
+		boost::scoped_ptr<part_file> m_part_file;
+
 		bool m_allocate_files;
 	};
 
@@ -262,286 +237,174 @@ namespace libtorrent
 	{
 	public:
 		disabled_storage(int piece_size) : m_piece_size(piece_size) {}
-		bool has_any_file() { return false; }
-		bool rename_file(int, std::string const&) { return false; }
-		bool release_files() { return false; }
-		bool delete_files() { return false; }
-		bool initialize(bool) { return false; }
-		bool move_storage(std::string const&) { return true; }
-		int read(char*, int, int, int size) { return size; }
-		int write(char const*, int, int, int size) { return size; }
-		size_type physical_offset(int, int) { return 0; }
-		int readv(file::iovec_t const* bufs, int slot, int offset, int num_bufs);
-		int writev(file::iovec_t const* bufs, int slot, int offset, int num_bufs);
-		bool move_slot(int, int) { return false; }
-		bool swap_slots(int, int) { return false; }
-		bool swap_slots3(int, int, int) { return false; }
-		bool verify_resume_data(lazy_entry const&, error_code&) { return false; }
-		bool write_resume_data(entry&) const { return false; }
+		bool has_any_file(storage_error&) { return false; }
+		void set_file_priority(std::vector<boost::uint8_t> const& prio, storage_error& ec) {}
+		void rename_file(int, std::string const&, storage_error&) {}
+		void release_files(storage_error&) {}
+		void delete_files(storage_error&) {}
+		void initialize(storage_error&) {}
+		void move_storage(std::string const&, storage_error&) {}
+
+		int readv(file::iovec_t const* bufs, int num_bufs, int piece
+			, int offset, int flags, storage_error& ec);
+		int writev(file::iovec_t const* bufs, int num_bufs, int piece
+			, int offset, int flags, storage_error& ec);
+
+		bool verify_resume_data(lazy_entry const& rd, storage_error& error) { return false; }
+		void write_resume_data(entry& rd, storage_error& ec) const {}
 
 		int m_piece_size;
 	};
 
+	// this storage implementation always reads zeroes, and always discards
+	// anything written to it
+	struct zero_storage : storage_interface
+	{
+		virtual void initialize(storage_error& ec) {}
+
+		virtual int readv(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, storage_error& ec);
+		virtual int writev(file::iovec_t const* bufs, int num_bufs
+			, int piece, int offset, int flags, storage_error& ec);
+
+		virtual bool has_any_file(storage_error& ec) { return false; }
+		virtual void set_file_priority(std::vector<boost::uint8_t> const& prio, storage_error& ec) {}
+		virtual void move_storage(std::string const& save_path, storage_error& ec) {}
+		virtual bool verify_resume_data(lazy_entry const& rd, storage_error& ec) { return false; }
+		virtual void write_resume_data(entry& rd, storage_error& ec) const {}
+		virtual void release_files(storage_error& ec) {}
+		virtual void rename_file(int index, std::string const& new_filenamem, storage_error& ec) {}
+		virtual void delete_files(storage_error& ec) {}
+	};
+
 	struct disk_io_thread;
+
+	// implements the disk I/O job fence used by the piece_manager
+	// to provide to the disk thread. Whenever a disk job needs
+	// exclusive access to the storage for that torrent, it raises
+	// the fence, blocking all new jobs, until there are no longer
+	// any outstanding jobs on the torrent, then the fence is lowered
+	// and it can be performed, along with the backlog of jobs that
+	// accrued while the fence was up
+	struct TORRENT_EXTRA_EXPORT disk_job_fence
+	{
+		disk_job_fence();
+
+		// returns one of the fence_* enums.
+		// if there are no outstanding jobs on the
+		// storage, fence_post_fence is returned, the flush job is expected
+		// to be discarded by the caller.
+		// fence_post_flush is returned if the fence job was blocked and queued,
+		// but the flush job should be posted (i.e. put on the job queue)
+		// fence_post_none if both the fence and the flush jobs were queued.
+		enum { fence_post_fence = 0, fence_post_flush = 1, fence_post_none = 2 };
+		int raise_fence(disk_io_job* fence_job, disk_io_job* flush_job, atomic_count* blocked_counter);
+		bool has_fence() const;
+
+		// called whenever a job completes and is posted back to the
+		// main network thread. the tailqueue of jobs will have the
+		// backed-up jobs prepended to it in case this resulted in the
+		// fence being lowered.
+		int job_complete(disk_io_job* j, tailqueue& job_queue);
+		int num_outstanding_jobs() const { return m_outstanding_jobs; }
+
+		// if there is a fence up, returns true and adds the job
+		// to the queue of blocked jobs
+		bool is_blocked(disk_io_job* j, bool ignore_fence = false);
+		
+		// the number of blocked jobs
+		int num_blocked() const;
+
+	private:
+		// when > 0, this storage is blocked for new async
+		// operations until all outstanding jobs have completed.
+		// at that point, the m_blocked_jobs are issued
+		// the count is the number of fence job currently in the queue
+		int m_has_fence;
+
+		// when there's a fence up, jobs are queued up in here
+		// until the fence is lowered
+		tailqueue m_blocked_jobs;
+
+		// the number of disk_io_job objects there are, belonging
+		// to this torrent, currently pending, hanging off of
+		// cached_piece_entry objects. This is used to determine
+		// when the fence can be lowered
+		atomic_count m_outstanding_jobs;
+
+		// must be held when accessing m_has_fence and
+		// m_blocked_jobs
+		mutable mutex m_mutex;
+	};
+
+	// this class keeps track of which pieces, belonging to
+	// a specific storage, are in the cache right now. It's
+	// used for quickly being able to evict all pieces for a
+	// specific torrent
+	struct TORRENT_EXTRA_EXPORT storage_piece_set
+	{
+		void add_piece(cached_piece_entry* p);
+		void remove_piece(cached_piece_entry* p);
+		bool has_piece(cached_piece_entry* p) const;
+		int num_pieces() const { return m_cached_pieces.size(); }
+		boost::unordered_set<cached_piece_entry*> const& cached_pieces() const
+		{ return m_cached_pieces; }
+	private:
+		// these are cached pieces belonging to this storage
+		boost::unordered_set<cached_piece_entry*> m_cached_pieces;
+	};
 
 	class TORRENT_EXTRA_EXPORT piece_manager
 		: public intrusive_ptr_base<piece_manager>
+		, public disk_job_fence
+		, public storage_piece_set
 		, boost::noncopyable
 	{
-	friend class invariant_access;
 	friend struct disk_io_thread;
 	public:
 
 		piece_manager(
-			boost::shared_ptr<void> const& torrent
-			, boost::intrusive_ptr<torrent_info const> info
-			, std::string const& path
-			, file_pool& fp
-			, disk_io_thread& io
-			, storage_constructor_type sc
-			, storage_mode_t sm
-			, std::vector<boost::uint8_t> const& file_prio);
+			storage_interface* storage_impl
+			, boost::shared_ptr<void> const& torrent
+			, file_storage* files);
 
 		~piece_manager();
 
-		boost::intrusive_ptr<torrent_info const> info() const { return m_info; }
-		void write_resume_data(entry& rd) const;
-
-		void async_finalize_file(int file);
-
-		void async_check_fastresume(lazy_entry const* resume_data
-			, boost::function<void(int, disk_io_job const&)> const& handler);
-		
-		void async_check_files(boost::function<void(int, disk_io_job const&)> const& handler);
-
-		void async_rename_file(int index, std::string const& name
-			, boost::function<void(int, disk_io_job const&)> const& handler);
-
-		void async_read(
-			peer_request const& r
-			, boost::function<void(int, disk_io_job const&)> const& handler
-			, int cache_line_size = 0
-			, int cache_expiry = 0);
-
-		void async_read_and_hash(
-			peer_request const& r
-			, boost::function<void(int, disk_io_job const&)> const& handler
-			, int cache_expiry = 0);
-
-		void async_cache(int piece
-			, boost::function<void(int, disk_io_job const&)> const& handler
-			, int cache_expiry = 0);
-
-		// returns the write queue size
-		int async_write(
-			peer_request const& r
-			, disk_buffer_holder& buffer
-			, boost::function<void(int, disk_io_job const&)> const& f);
-
-		void async_hash(int piece, boost::function<void(int, disk_io_job const&)> const& f);
-
-		void async_release_files(
-			boost::function<void(int, disk_io_job const&)> const& handler
-			= boost::function<void(int, disk_io_job const&)>());
-
-		void abort_disk_io();
-
-		void async_clear_read_cache(
-			boost::function<void(int, disk_io_job const&)> const& handler
-			= boost::function<void(int, disk_io_job const&)>());
-
-		void async_delete_files(
-			boost::function<void(int, disk_io_job const&)> const& handler
-			= boost::function<void(int, disk_io_job const&)>());
-
-		void async_move_storage(std::string const& p
-			, boost::function<void(int, disk_io_job const&)> const& handler);
-
-		void async_save_resume_data(
-			boost::function<void(int, disk_io_job const&)> const& handler);
+		file_storage const* files() const { return &m_files; }
 
 		enum return_t
 		{
-			// return values from check_fastresume and check_files
+			// return values from check_fastresume
 			no_error = 0,
-			need_full_check = -1,
-			fatal_disk_error = -2,
+			fatal_disk_error = -1,
+			need_full_check = -2,
 			disk_check_aborted = -3
 		};
 
 		storage_interface* get_storage_impl() { return m_storage.get(); }
 
+		void write_resume_data(entry& rd, storage_error& ec) const;
+
 	private:
 
-		std::string save_path() const;
-
-		bool verify_resume_data(lazy_entry const& rd, error_code& e)
-		{ return m_storage->verify_resume_data(rd, e); }
-
-		bool is_allocating() const
-		{ return m_state == state_expand_pieces; }
-
-		void mark_failed(int index);
-
-		error_code const& error() const { return m_storage->error(); }
-		std::string const& error_file() const { return m_storage->error_file(); }
-		int last_piece() const { return m_last_piece; }
-		void clear_error() { m_storage->clear_error(); }
-
-		int slot_for(int piece) const;
-		int piece_for(int slot) const;
-	
-		// helper functions for check_dastresume	
-		int check_no_fastresume(error_code& error);
-		int check_init_storage(error_code& error);
-		
 		// if error is set and return value is 'no_error' or 'need_full_check'
 		// the error message indicates that the fast resume data was rejected
 		// if 'fatal_disk_error' is returned, the error message indicates what
 		// when wrong in the disk access
-		int check_fastresume(lazy_entry const& rd, error_code& error);
+		int check_fastresume(lazy_entry const& rd, storage_error& error);
 
-		// this function returns true if the checking is complete
-		int check_files(int& current_slot, int& have_piece, error_code& error);
-
-#ifndef TORRENT_NO_DEPRECATE
-		bool compact_allocation() const
-		{ return m_storage_mode == storage_mode_compact; }
-#endif
+		// helper functions for check_fastresume	
+		int check_no_fastresume(storage_error& error);
+		int check_init_storage(storage_error& error);
 
 #ifdef TORRENT_DEBUG
-		std::string name() const { return m_info->name(); }
-#endif
+		std::string name() const { return m_files.name(); }
 
-		bool allocate_slots_impl(int num_slots, mutex::scoped_lock& l, bool abort_on_disk = false);
-
-		// updates the ph.h hasher object with the data at the given slot
-		// and optionally a 'small hash' as well, the hash for
-		// the partial slot. Returns the number of bytes read
-		int hash_for_slot(int slot, partial_hash& h, int piece_size
-			, int small_piece_size = 0, sha1_hash* small_hash = 0);
-
-		void hint_read_impl(int piece_index, int offset, int size);
-
-		int read_impl(
-			file::iovec_t* bufs
-			, int piece_index
-			, int offset
-			, int num_bufs);
-
-		int write_impl(
-			file::iovec_t* bufs
-			, int piece_index
-			, int offset
-			, int num_bufs);
-
-		size_type physical_offset(int piece_index, int offset);
-
-		void finalize_file(int index);
-
-		// returns the number of pieces left in the
-		// file currently being checked
-		int skip_file() const;
-		// -1=error 0=ok >0=skip this many pieces
-		int check_one_piece(int& have_piece);
-		int identify_data(
-			sha1_hash const& large_hash
-			, sha1_hash const& small_hash
-			, int current_slot);
-
-		void switch_to_full_mode();
-		sha1_hash hash_for_piece_impl(int piece, int* readback = 0);
-
-		int release_files_impl() { return m_storage->release_files(); }
-		int delete_files_impl() { return m_storage->delete_files(); }
-		int rename_file_impl(int index, std::string const& new_filename)
-		{ return m_storage->rename_file(index, new_filename); }
-
-		int move_storage_impl(std::string const& save_path);
-
-		int allocate_slot_for_piece(int piece_index);
-#ifdef TORRENT_DEBUG
 		void check_invariant() const;
-#ifdef TORRENT_STORAGE_DEBUG
-		void debug_log() const;
 #endif
-#endif
-		boost::intrusive_ptr<torrent_info const> m_info;
 		file_storage const& m_files;
 
 		boost::scoped_ptr<storage_interface> m_storage;
-
-		storage_mode_t m_storage_mode;
-
-		// slots that haven't had any file storage allocated
-		std::vector<int> m_unallocated_slots;
-		// slots that have file storage, but isn't assigned to a piece
-		std::vector<int> m_free_slots;
-
-		enum
-		{
-			has_no_slot = -3 // the piece has no storage
-		};
-
-		// maps piece indices to slots. If a piece doesn't
-		// have any storage, it is set to 'has_no_slot'
-		std::vector<int> m_piece_to_slot;
-
-		enum
-		{
-			unallocated = -1, // the slot is unallocated
-			unassigned = -2   // the slot is allocated but not assigned to a piece
-		};
-
-		// maps slots to piece indices, if a slot doesn't have a piece
-		// it can either be 'unassigned' or 'unallocated'
-		std::vector<int> m_slot_to_piece;
-
-		std::string m_save_path;
-
-		mutable mutex m_mutex;
-
-		enum {
-			// the default initial state
-			state_none,
-			// the file checking is complete
-			state_finished,
-			// checking the files
-			state_full_check,
-			// move pieces to their final position
-			state_expand_pieces
-		} m_state;
-		int m_current_slot;
-		// used during check. If any piece is found
-		// that is not in its final position, this
-		// is set to true
-		bool m_out_of_place;
-		// used to move pieces while expanding
-		// the storage from compact allocation
-		// to full allocation
-		aligned_holder m_scratch_buffer;
-		aligned_holder m_scratch_buffer2;
-		// the piece that is in the scratch buffer
-		int m_scratch_piece;
-
-		// the last piece we wrote to or read from
-		int m_last_piece;
-
-		// this is saved in case we need to instantiate a new
-		// storage (osed when remapping files)
-		storage_constructor_type m_storage_constructor;
-
-		// this maps a piece hash to piece index. It will be
-		// build the first time it is used (to save time if it
-		// isn't needed)
-		std::multimap<sha1_hash, int> m_hash_to_piece;
-	
-		// this map contains partial hashes for downloading
-		// pieces. This is only accessed from within the
-		// disk-io thread.
-		std::map<int, partial_hash> m_piece_hasher;
-
-		disk_io_thread& m_io_thread;
 
 		// the reason for this to be a void pointer
 		// is to avoid creating a dependency on the

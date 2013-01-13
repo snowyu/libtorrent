@@ -3,7 +3,7 @@ libtorrent manual
 =================
 
 :Author: Arvid Norberg, arvid@rasterbar.com
-:Version: 1.0.0
+:Version: 1.1.0
 
 .. contents:: Table of contents
   :depth: 2
@@ -359,7 +359,7 @@ Build features:
 |                          |   awareness except on windows).                    |
 +--------------------------+----------------------------------------------------+
 | ``asserts``              | * ``off`` - disable all asserts                    |
-|                          | * ``peoduction`` - enable asserts in release       |
+|                          | * ``production`` - enable asserts in release       |
 |                          |   builds, but don't abort, just log them to        |
 |                          |   ``extern char const* libtorrent_assert_log``.    |
 |                          | * ``on`` - enable asserts in debug builds (this is |

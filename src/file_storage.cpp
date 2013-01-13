@@ -45,6 +45,7 @@ namespace libtorrent
 	file_storage::file_storage()
 		: m_total_size(0)
 		, m_num_pieces(0)
+		, m_num_files(0)
 		, m_piece_length(0)
 	{}
 
@@ -71,8 +72,19 @@ namespace libtorrent
 
 	void file_storage::update_path_index(internal_file_entry& e)
 	{
-		std::string parent = parent_path(e.filename());
-		if (parent.empty())
+		// sorry about this messy string handling, but I did
+		// profile it, and it was expensive
+		std::string fn = e.filename();
+		char const* leaf = filename_cstr(fn.c_str());
+		char const* branch_path = "";
+		if (leaf > fn.c_str())
+		{
+			// split the string into the leaf filename
+			// and the branch path
+			branch_path = fn.c_str();
+			((char*)leaf)[-1] = 0;
+		}
+		if (branch_path[0] == 0)
 		{
 			e.path_index = -1;
 		}
@@ -80,20 +92,20 @@ namespace libtorrent
 		{
 			// do we already have this path in the path list?
 			std::vector<std::string>::reverse_iterator p
-				= std::find(m_paths.rbegin(), m_paths.rend(), parent);
+				= std::find(m_paths.rbegin(), m_paths.rend(), branch_path);
 
 			if (p == m_paths.rend())
 			{
 				// no, we don't. add it
 				e.path_index = m_paths.size();
-				m_paths.push_back(parent);
+				m_paths.push_back(branch_path);
 			}
 			else
 			{
 				// yes we do. use it
 				e.path_index = p.base() - m_paths.begin() - 1;
 			}
-			e.set_name(filename(e.filename()).c_str());
+			e.set_name(leaf);
 		}
 	}
 
@@ -313,6 +325,7 @@ namespace libtorrent
 		}
 		TORRENT_ASSERT(m_name == split_path(file).c_str());
 		m_files.push_back(internal_file_entry());
+		++m_num_files;
 		internal_file_entry& e = m_files.back();
 		e.set_name(file.c_str());
 		e.size = size;
@@ -355,6 +368,7 @@ namespace libtorrent
 		}
 		internal_file_entry ife(ent);
 		m_files.push_back(ife);
+		++m_num_files;
 		internal_file_entry& e = m_files.back();
 		if (e.size < 0) e.size = 0;
 		e.offset = m_total_size;
@@ -627,6 +641,7 @@ namespace libtorrent
 				int cur_index = file_index(*i);
 				int index = m_files.size();
 				m_files.push_back(internal_file_entry());
+				++m_num_files;
 				internal_file_entry& e = m_files.back();
 				// i may have been invalidated, refresh it
 				i = m_files.begin() + cur_index;
@@ -653,6 +668,16 @@ namespace libtorrent
 			off += i->size;
 		}
 		m_total_size = off;
+	}
+
+	void file_storage::unload()
+	{
+		std::vector<internal_file_entry>().swap(m_files);
+		std::vector<char const*>().swap(m_file_hashes);
+		std::vector<std::string>().swap(m_symlinks);
+		std::vector<time_t>().swap(m_mtime);
+		std::vector<size_type>().swap(m_file_base);
+		std::vector<std::string>().swap(m_paths);
 	}
 }
 

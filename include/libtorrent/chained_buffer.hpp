@@ -42,18 +42,27 @@ POSSIBILITY OF SUCH DAMAGE.
 #else
 #include <boost/asio/buffer.hpp>
 #endif
-#include <list>
+#include <deque>
+#include <vector>
 #include <string.h> // for memcpy
+
+#if defined TORRENT_DEBUG || defined TORRENT_RELEASE_ASSERTS
+#include "libtorrent/disk_io_job.hpp"
+#include "libtorrent/block_cache.hpp"
+#endif
+
+#include "libtorrent/debug.hpp"
 
 namespace libtorrent
 {
 #if BOOST_VERSION >= 103500
 	namespace asio = boost::asio;
 #endif
-	struct TORRENT_EXTRA_EXPORT chained_buffer
+	struct TORRENT_EXTRA_EXPORT chained_buffer : private single_threaded
 	{
 		chained_buffer(): m_bytes(0), m_capacity(0)
 		{
+			thread_started();
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
 			m_destructed = false;
 #endif
@@ -67,6 +76,9 @@ namespace libtorrent
 
 			char* start; // the first byte to send/receive in the buffer
 			int used_size; // this is the number of bytes to send/receive
+#ifdef TORRENT_DEBUG
+			block_cache_reference ref;
+#endif
 		};
 
 		bool empty() const { return m_bytes == 0; }
@@ -77,6 +89,21 @@ namespace libtorrent
 
 		void append_buffer(char* buffer, int s, int used_size
 			, boost::function<void(char*)> const& destructor);
+
+#ifdef TORRENT_DEBUG
+		void set_ref(block_cache_reference ref)
+		{
+			int count = 1;
+			for (std::deque<buffer_t>::iterator i = m_vec.begin()
+				, end(m_vec.end()); i != end; ++i)
+			{
+				// technically this is allowed, but not very likely to happen
+				// without being a bug
+				if (i->ref.storage == ref.storage && i->ref.piece == ref.piece && i->ref.block == ref.block) ++count;
+			}
+			m_vec.back().ref = ref;
+		}
+#endif
 
 		// returns the number of bytes available at the
 		// end of the last chained buffer.
@@ -92,7 +119,9 @@ namespace libtorrent
 		// enough room, returns 0
 		char* allocate_appendix(int s);
 
-		std::list<asio::const_buffer> const& build_iovec(int to_send);
+		std::vector<asio::const_buffer> const& build_iovec(int to_send);
+
+		void clear();
 
 		~chained_buffer();
 
@@ -100,7 +129,7 @@ namespace libtorrent
 
 		// this is the list of all the buffers we want to
 		// send
-		std::list<buffer_t> m_vec;
+		std::deque<buffer_t> m_vec;
 
 		// this is the number of bytes in the send buf.
 		// this will always be equal to the sum of the
@@ -113,7 +142,7 @@ namespace libtorrent
 
 		// this is the vector of buffers used when
 		// invoking the async write call
-		std::list<asio::const_buffer> m_tmp_vec;
+		std::vector<asio::const_buffer> m_tmp_vec;
 
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
 		bool m_destructed;

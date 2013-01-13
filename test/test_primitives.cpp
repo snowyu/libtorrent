@@ -68,7 +68,7 @@ using namespace libtorrent;
 using namespace boost::tuples;
 
 namespace libtorrent {
-	TORRENT_EXPORT std::string sanitize_path(std::string const& p);
+	TORRENT_EXPORT void sanitize_append_path_element(std::string& p, char const* element, int len);
 	namespace dht
 	{
 		TORRENT_EXPORT libtorrent::dht::node_id generate_id_impl(
@@ -409,12 +409,26 @@ int test_main()
 	error_code ec;
 	int ret = 0;
 
+	sliding_average<4> avg;
+	TEST_EQUAL(avg.mean(), 0);
+	TEST_EQUAL(avg.avg_deviation(), 0);
+	avg.add_sample(500);
+	TEST_EQUAL(avg.mean(), 500);
+	TEST_EQUAL(avg.avg_deviation(), 0);
+	avg.add_sample(501);
+	TEST_EQUAL(avg.avg_deviation(), 1);
+	avg.add_sample(0);
+	avg.add_sample(0);
+	printf("avg: %d dev: %d\n", avg.mean(), avg.avg_deviation());
+	TEST_CHECK(abs(avg.mean() - 250) < 50);
+	TEST_CHECK(abs(avg.avg_deviation() - 250) < 80);
+
 	// make sure the retry interval keeps growing
 	// on failing announces
 	announce_entry ae("dummy");
 	int last = 0;
-	session_settings sett;
-	sett.tracker_backoff = 250;
+	aux::session_settings sett;
+	sett.set_int(settings_pack::tracker_backoff, 250);
 	for (int i = 0; i < 10; ++i)
 	{
 		ae.failed(sett, 5);
@@ -728,6 +742,7 @@ int test_main()
 		TEST_CHECK(pb.at(new_index) == (void*)2);
 	}
 
+	// make sure the error codes and error strings are aligned
 	TEST_CHECK(error_code(errors::http_error).message() == "HTTP error");
 	TEST_CHECK(error_code(errors::missing_file_sizes).message() == "missing or invalid 'file sizes' entry");
 	TEST_CHECK(error_code(errors::unsupported_protocol_version).message() == "unsupported protocol version");
@@ -743,20 +758,22 @@ int test_main()
 	// test session state load/restore
 	session* s = new session(fingerprint("LT",0,0,0,0), 0);
 
-	session_settings sett;
-	sett.user_agent = "test";
-	sett.tracker_receive_timeout = 1234;
-	sett.file_pool_size = 543;
-	sett.urlseed_wait_retry = 74;
-	sett.file_pool_size = 754;
-	sett.initial_picker_threshold = 351;
-	sett.upnp_ignore_nonrouters = 5326;
-	sett.coalesce_writes = 623;
-	sett.auto_scrape_interval = 753;
-	sett.close_redundant_connections = 245;
-	sett.auto_scrape_interval = 235;
-	sett.auto_scrape_min_interval = 62;
-	s->set_settings(sett);
+	settings_pack pack;
+	pack.set_str(settings_pack::user_agent, "test");
+	pack.set_int(settings_pack::tracker_receive_timeout, 1234);
+	pack.set_int(settings_pack::file_pool_size, 543);
+	pack.set_int(settings_pack::urlseed_wait_retry, 74);
+	pack.set_int(settings_pack::initial_picker_threshold, 351);
+	pack.set_bool(settings_pack::upnp_ignore_nonrouters, true);
+	pack.set_bool(settings_pack::coalesce_writes, true);
+	pack.set_int(settings_pack::auto_scrape_interval, 753);
+	pack.set_bool(settings_pack::close_redundant_connections, false);
+	pack.set_int(settings_pack::auto_scrape_interval, 235);
+	pack.set_int(settings_pack::auto_scrape_min_interval, 62);
+	s->apply_settings(pack);
+
+	TEST_EQUAL(pack.get_str(settings_pack::user_agent), "test");
+	TEST_EQUAL(pack.get_int(settings_pack::tracker_receive_timeout), 1234);
 
 #ifndef TORRENT_DISABLE_DHT
 	dht_settings dhts;
@@ -862,31 +879,19 @@ int test_main()
 	TEST_CHECK(session_state2.dict_find("settings")->dict_find("optimistic_disk_retry") == 0);
 
 	s->load_state(session_state2);
-#define CMP_SET(x) TEST_CHECK(s->settings().x == sett.x)
 
-	CMP_SET(user_agent);
+#define CMP_SET(x) fprintf(stderr, #x ": %d %d\n"\
+	, s->get_settings().get_int(settings_pack:: x)\
+	, pack.get_int(settings_pack:: x)); \
+	TEST_EQUAL(s->get_settings().get_int(settings_pack:: x), pack.get_int(settings_pack:: x))
+
 	CMP_SET(tracker_receive_timeout);
 	CMP_SET(file_pool_size);
 	CMP_SET(urlseed_wait_retry);
-	CMP_SET(file_pool_size);
 	CMP_SET(initial_picker_threshold);
-	CMP_SET(upnp_ignore_nonrouters);
-	CMP_SET(coalesce_writes);
 	CMP_SET(auto_scrape_interval);
-	CMP_SET(close_redundant_connections);
 	CMP_SET(auto_scrape_interval);
 	CMP_SET(auto_scrape_min_interval);
-	CMP_SET(max_peerlist_size);
-	CMP_SET(max_paused_peerlist_size);
-	CMP_SET(min_announce_interval);
-	CMP_SET(prioritize_partial_pieces);
-	CMP_SET(auto_manage_startup);
-	CMP_SET(rate_limit_ip_overhead);
-	CMP_SET(announce_to_all_trackers);
-	CMP_SET(announce_to_all_tiers);
-	CMP_SET(prefer_udp_trackers);
-	CMP_SET(strict_super_seeding);
-	CMP_SET(seeding_piece_quota);
 	delete s;
 	}
 
@@ -912,6 +917,11 @@ int test_main()
 	TEST_EQUAL(extension("blah.exe"), ".exe");
 	TEST_EQUAL(extension("blah.foo.bar"), ".bar");
 	TEST_EQUAL(extension("blah.foo."), ".");
+
+	TEST_EQUAL(remove_extension("blah"), "blah");
+	TEST_EQUAL(remove_extension("blah.exe"), "blah");
+	TEST_EQUAL(remove_extension("blah.foo.bar"), "blah.foo");
+	TEST_EQUAL(remove_extension("blah.foo."), "blah.foo");
 
 	TEST_EQUAL(filename("blah"), "blah");
 	TEST_EQUAL(filename("/blah/foo/bar"), "bar");
@@ -972,6 +982,16 @@ int test_main()
 	TEST_EQUAL(is_complete(""), false);
 #endif
 
+#ifdef TORRENT_WINDOWS
+	TEST_EQUAL(convert_path_to_windows("c:/blah/foo/bar\\"), "c:\\blah\\foo\\bar\\");
+	TEST_EQUAL(resolve_file_url("file:///c:/blah/foo/bar"), "c:\\blah\\foo\\bar");
+	TEST_EQUAL(resolve_file_url("file:///c:/b%efah/foo/bar"), "c:\\b?ah\\foo\\bar");
+	TEST_EQUAL(resolve_file_url("file://\\c:\\b%3fah\\foo\\bar"), "c:\\b?ah\\foo\\bar");
+#else
+	TEST_EQUAL(resolve_file_url("file:///c/blah/foo/bar"), "/c/blah/foo/bar");
+	TEST_EQUAL(resolve_file_url("file:///c/b%3fah/foo/bar"), "/c/b?ah/foo/bar");
+#endif
+
 	// test split_string
 
 	char const* tags[10];
@@ -1004,23 +1024,70 @@ int test_main()
 	TEST_EQUAL(maybe_url_encode("abc"), "abc");
 	TEST_EQUAL(maybe_url_encode("http://abc.com/abc"), "http://abc.com/abc");
 	
-	// test sanitize_path
+	// test sanitize_append_path_element
 
+	std::string path;
+	path.clear();
+	sanitize_append_path_element(path, "/a/", 3);
+	sanitize_append_path_element(path, "b", 1);
+	sanitize_append_path_element(path, "c", 1);
 #ifdef TORRENT_WINDOWS
-	TEST_EQUAL(sanitize_path("/a/b/c"), "a\\b\\c");
-	TEST_EQUAL(sanitize_path("a/../c"), "a\\c");
+	TEST_EQUAL(path, "a\\b\\c");
 #else
-	TEST_EQUAL(sanitize_path("/a/b/c"), "a/b/c");
-	TEST_EQUAL(sanitize_path("a/../c"), "a/c");
+	TEST_EQUAL(path, "a/b/c");
 #endif
-	TEST_EQUAL(sanitize_path("/.././c"), "c");
-	TEST_EQUAL(sanitize_path("dev:"), "");
-	TEST_EQUAL(sanitize_path("c:/b"), "b");
+
+	path.clear();
+	sanitize_append_path_element(path, "a", 1);
+	sanitize_append_path_element(path, "..", 2);
+	sanitize_append_path_element(path, "c", 1);
 #ifdef TORRENT_WINDOWS
-	TEST_EQUAL(sanitize_path("c:\\.\\c"), "c");
-	TEST_EQUAL(sanitize_path("\\c"), "c");
+	TEST_EQUAL(path, "a\\c");
 #else
-	TEST_EQUAL(sanitize_path("//./c"), "c");
+	TEST_EQUAL(path, "a/c");
+#endif
+
+	path.clear();
+	sanitize_append_path_element(path, "/..", 3);
+	sanitize_append_path_element(path, ".", 1);
+	sanitize_append_path_element(path, "c", 1);
+	TEST_EQUAL(path, "c");
+
+	path.clear();
+	sanitize_append_path_element(path, "dev:", 4);
+#ifdef TORRENT_WINDOWS
+	TEST_EQUAL(path, "dev");
+#else
+	TEST_EQUAL(path, "dev:");
+#endif
+
+	path.clear();
+	sanitize_append_path_element(path, "c:", 2);
+	sanitize_append_path_element(path, "b", 1);
+#ifdef TORRENT_WINDOWS
+	TEST_EQUAL(path, "c\\b");
+#else
+	TEST_EQUAL(path, "c:/b");
+#endif
+
+	path.clear();
+	sanitize_append_path_element(path, "c:", 2);
+	sanitize_append_path_element(path, ".", 1);
+	sanitize_append_path_element(path, "c", 1);
+#ifdef TORRENT_WINDOWS
+	TEST_EQUAL(path, "c\\c");
+#else
+	TEST_EQUAL(path, "c:/c");
+#endif
+
+	path.clear();
+	sanitize_append_path_element(path, "\\c", 2);
+	sanitize_append_path_element(path, ".", 1);
+	sanitize_append_path_element(path, "c", 1);
+#ifdef TORRENT_WINDOWS
+	TEST_EQUAL(path, "c\\c");
+#else
+	TEST_EQUAL(path, "c/c");
 #endif
 
 	// make sure the time classes have correct semantics
@@ -1498,6 +1565,11 @@ int test_main()
 	TEST_CHECK(!is_any(address::from_string("31.53.21.64", ec)));
 	
 	TEST_CHECK(match_addr_mask(
+		address::from_string("10.0.1.176", ec),
+		address::from_string("10.0.1.176", ec),
+		address::from_string("255.255.255.0", ec)));
+
+	TEST_CHECK(match_addr_mask(
 		address::from_string("10.0.1.3", ec),
 		address::from_string("10.0.3.3", ec),
 		address::from_string("255.255.0.0", ec)));
@@ -1535,9 +1607,9 @@ int test_main()
 	torrent_info ti2(&buf[0], buf.size(), ec);
 	std::cerr << ti2.name() << std::endl;
 #ifdef TORRENT_WINDOWS
-	TEST_CHECK(ti2.name() == "test1\\test2\\test3");
+	TEST_CHECK(ti2.name() == "ctest1test2test3");
 #else
-	TEST_CHECK(ti2.name() == "test1/test2/test3");
+	TEST_CHECK(ti2.name() == "test1test2test3");
 #endif
 
 	info["name.utf-8"] = "test2/../test3/.././../../test4";
@@ -1546,11 +1618,7 @@ int test_main()
 	bencode(std::back_inserter(buf), torrent);
 	torrent_info ti3(&buf[0], buf.size(), ec);
 	std::cerr << ti3.name() << std::endl;
-#ifdef TORRENT_WINDOWS
-	TEST_CHECK(ti3.name() == "test2\\test3\\test4");
-#else
-	TEST_CHECK(ti3.name() == "test2/test3/test4");
-#endif
+	TEST_CHECK(ti3.name() == "test2..test3.......test4");
 
 #ifndef TORRENT_DISABLE_DHT	
 	// test kademlia functions

@@ -1,3 +1,21 @@
+	* extend storage interface to allow deferred flushing and flush the part-file metadata periodically
+	* make statistics propagate instantly rather than on the second tick
+	* support for partfiles, where partial pieces belonging to skipped files are put
+	* support using multiple threads for socket operations (especially useful for high performance SSL connections)
+	* allow setting rate limits for arbitrary peer groups. Generalizes per-torrent rate limits, and local peer limits
+	* improved disk cache complexity O(1) instead of O(log(n))
+	* add feature to allow storing disk cache blocks in an mmapped file (presumably on an SSD)
+	* optimize peer connection distribution logic across torrents to scale better with many torrents
+	* replaced std::map with boost::unordered_map for torrent list, to scale better with many torrents
+	* optimized piece picker
+	* optimized disk cache
+	* optimized .torrent file parsing
+	* optimized initialization of storage when adding a torrent
+	* added support for adding torrents asynchronously (for improved startup performance)
+	* added support for asynchronous disk I/O
+	* almost completely changed the storage interface (for custom storage)
+	* added support for hashing pieces in multiple threads
+
 	* improve support for windows XP and earlier
 	* introduce global connection priority for improved swarm performance
 	* make files deleted alert non-discardable
@@ -8,8 +26,6 @@
 	* optimized the torrent creator optimizer to scale significantly better with more files
 	* fix uTP edge case where udp socket buffer fills up
 	* fix nagle implementation in uTP
-
-0.16.7 release
 
 	* DHT performance improvement
 	* attempt to handle ERROR_CANT_WAIT disk error on windows

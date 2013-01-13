@@ -49,6 +49,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/socket_io.hpp" // print_endpoint
 #include "libtorrent/socket_type.hpp"
 #include "libtorrent/instantiate_connection.hpp"
+#include "libtorrent/ip_filter.hpp"
 
 #ifdef TORRENT_USE_OPENSSL
 #include <boost/asio/ssl/stream.hpp>
@@ -63,13 +64,19 @@ using namespace libtorrent;
 
 bool tests_failure = false;
 
+#if defined TORRENT_WINDOWS
+#include <conio.h>
+#endif
+
 void report_failure(char const* err, char const* file, int line)
 {
-#if defined TORRENT_WINDOWS && defined TORRENT_MINGW
-	HANDLE console = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE, 0, 0, CONSOLE_TEXTMODE_BUFFER, 0);
+#if defined TORRENT_WINDOWS
+	HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
 	SetConsoleTextAttribute(console, FOREGROUND_RED);
-	fprintf(stderr, "\n**** %s:%d \"%s\" ****\n\n", file, line, err);
-	CloseHandle(console);
+	char msg[512];
+	snprintf(msg, sizeof(msg), "\n**** %s:%d \"%s\" ****\n\n", file, line, err);
+	WriteFile(console, msg, strlen(msg), NULL, NULL);
+	SetConsoleTextAttribute(console, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
 #else
 	fprintf(stderr, "\033[31m %s:%d \"%s\"\033[0m\n", file, line, err);
 #endif
@@ -119,6 +126,13 @@ bool print_alerts(libtorrent::session& ses, char const* name
 				|| (allow_disconnects && pea->error.message() == "Connection reset by peer")
 				|| (allow_disconnects && pea->error.message() == "End of file."));
 		}
+
+		invalid_request_alert* ira = alert_cast<invalid_request_alert>(*i);
+		if (ira)
+		{
+			fprintf(stderr, "peer error: %s\n", ira->message().c_str());
+			TEST_CHECK(false);
+		}
 		delete *i;
 	}
 	return ret;
@@ -145,6 +159,27 @@ void wait_for_listen(libtorrent::session& ses, char const* name)
 	} while (a);
 }
 
+bool downloading_done = false;
+bool downloading_alert(libtorrent::alert* a)
+{
+	state_changed_alert* sc = alert_cast<state_changed_alert>(a);
+	if (sc && sc->state == torrent_status::downloading) 
+		downloading_done = true;
+	return true;
+}
+
+void wait_for_downloading(libtorrent::session& ses, char const* name)
+{
+	downloading_done = false;
+	alert const* a = 0;
+	do
+	{
+		print_alerts(ses, name, true, true, true, &listen_alert, false);
+		if (downloading_done) break;
+		a = ses.wait_for_alert(milliseconds(500));
+	} while (a);
+}
+
 void test_sleep(int millisec)
 {
 	libtorrent::sleep(millisec);
@@ -161,6 +196,7 @@ void stop_proxy(int port)
 	}
 }
 
+// returns a port on success and -1 on failure
 int start_proxy(int proxy_type)
 {
 	using namespace libtorrent;
@@ -324,14 +360,23 @@ setup_transfer(session* ses1, session* ses2, session* ses3
 		if (ses3) ses3->stop_lsd();
 	}
 
-	session_settings sess_set = ses1->settings();
-	if (ses3) sess_set.allow_multiple_connections_per_ip = true;
-	sess_set.ignore_limits_on_local_network = false;
-	sess_set.mixed_mode_algorithm = session_settings::prefer_tcp;
-	sess_set.max_failcount = 1;
-	ses1->set_settings(sess_set);
-	ses2->set_settings(sess_set);
-	if (ses3) ses3->set_settings(sess_set);
+	// This has the effect of applying the global
+	// rule to all peers, regardless of if they're local or not
+	ip_filter f;
+	f.add_rule(address_v4::from_string("0.0.0.0")
+		, address_v4::from_string("255.255.255.255")
+		, session::global_peer_class_id);
+	ses1->set_peer_class_filter(f);
+	ses2->set_peer_class_filter(f);
+	if (ses3) ses3->set_peer_class_filter(f);
+
+	settings_pack pack;
+	if (ses3) pack.set_bool(settings_pack::allow_multiple_connections_per_ip, true);
+	pack.set_int(settings_pack::mixed_mode_algorithm, settings_pack::prefer_tcp);
+	pack.set_int(settings_pack::max_failcount, 1);
+	ses1->apply_settings(pack);
+	ses2->apply_settings(pack);
+	if (ses3) ses3->apply_settings(pack);
 	ses1->set_alert_mask(~(alert::progress_notification | alert::stats_notification));
 	ses2->set_alert_mask(~(alert::progress_notification | alert::stats_notification));
 	if (ses3) ses3->set_alert_mask(~(alert::progress_notification | alert::stats_notification));
@@ -384,12 +429,18 @@ setup_transfer(session* ses1, session* ses2, session* ses3
 	param.flags |= add_torrent_params::flag_seed_mode;
 	error_code ec;
 	torrent_handle tor1 = ses1->add_torrent(param, ec);
+	if (ec)
+	{
+		fprintf(stderr, "ses1.add_torrent: %s\n", ec.message().c_str());
+		return boost::make_tuple(torrent_handle(), torrent_handle(), torrent_handle());
+	}
 	tor1.super_seeding(super_seeding);
 
 	// the downloader cannot use seed_mode
 	param.flags &= ~add_torrent_params::flag_seed_mode;
 
 	TEST_CHECK(!ses1->get_torrents().empty());
+
 	torrent_handle tor2;
 	torrent_handle tor3;
 
@@ -825,6 +876,7 @@ void web_server_thread(int* port, bool ssl, bool chunked)
 			if (ec) fprintf(stderr, "close failed: %s\n", ec.message().c_str());
 			connection_close = false;
 		}
+      ec.clear();
 
 		if (!s.is_open())
 		{
@@ -905,6 +957,13 @@ void web_server_thread(int* port, bool ssl, bool chunked)
 
 			while (!p.finished())
 			{
+				if (ec)
+				{
+					fprintf(stderr, "?: %s\n", ec.message().c_str());
+               libtorrent::sleep(500);
+					failed = true;
+					break;
+				}
 				TORRENT_ASSERT(len < int(sizeof(buf)));
 				size_t received = 0;
 				bool done = false;
@@ -938,6 +997,7 @@ void web_server_thread(int* port, bool ssl, bool chunked)
 				{
 					fprintf(stderr, "read failed: \"%s\" (%s) received: %d\n"
 						, ec.message().c_str(), ec.category().name(), int(received));
+               libtorrent::sleep(500);
 					failed = true;
 					break;
 				}

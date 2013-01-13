@@ -36,12 +36,14 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/config.hpp"
 #include <boost/function.hpp>
 #include <string>
+#include <vector>
 
 namespace libtorrent
 {
 	struct storage_interface;
 	class file_storage;
 	struct file_pool;
+	class torrent_info;
 
 	enum storage_mode_t
 	{
@@ -53,18 +55,25 @@ namespace libtorrent
 		storage_mode_compact = internal_storage_mode_compact_deprecated
 #endif
 	};
+
+	struct storage_params
+	{
+		storage_params(): files(NULL), mapped_files(NULL), pool(NULL)
+			, mode(storage_mode_sparse), priorities(NULL), info(NULL) {}
+		file_storage const* files;
+		file_storage const* mapped_files; // optional
+		std::string path;
+		file_pool* pool;
+		storage_mode_t mode;
+		std::vector<boost::uint8_t> const* priorities; // optional
+		torrent_info const* info; // optional
+	};
 	
-	typedef boost::function<storage_interface*(file_storage const&, file_storage const*
-		, std::string const&, file_pool&, std::vector<boost::uint8_t> const&)> storage_constructor_type;
+	typedef boost::function<storage_interface*(storage_params const& params)> storage_constructor_type;
 
-	TORRENT_EXPORT storage_interface* default_storage_constructor(
-		file_storage const&, file_storage const* mapped, std::string const&, file_pool&
-		, std::vector<boost::uint8_t> const&);
-
-	TORRENT_EXPORT storage_interface* disabled_storage_constructor(
-		file_storage const&, file_storage const* mapped, std::string const&, file_pool&
-		, std::vector<boost::uint8_t> const&);
-
+	TORRENT_EXPORT storage_interface* default_storage_constructor(storage_params const&);
+	TORRENT_EXPORT storage_interface* disabled_storage_constructor(storage_params const&);
+	TORRENT_EXPORT storage_interface* zero_storage_constructor(storage_params const&);
 }
 
 #endif

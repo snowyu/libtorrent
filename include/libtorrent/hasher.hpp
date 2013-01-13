@@ -80,7 +80,11 @@ namespace libtorrent
 #else
 			SHA1_init(&m_context);
 #endif
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+			m_finalized = false;
+#endif
 		}
+
 		hasher(const char* data, int len)
 		{
 			TORRENT_ASSERT(data != 0);
@@ -94,6 +98,9 @@ namespace libtorrent
 #else
 			SHA1_init(&m_context);
 			SHA1_update(&m_context, reinterpret_cast<unsigned char const*>(data), len);
+#endif
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+			m_finalized = false;
 #endif
 		}
 
@@ -127,6 +134,10 @@ namespace libtorrent
 
 		sha1_hash final()
 		{
+//			TORRENT_ASSERT(!m_finalized);
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+			m_finalized = true;
+#endif
 			sha1_hash digest;
 #ifdef TORRENT_USE_GCRYPT
 			gcry_md_final(m_context);
@@ -166,7 +177,12 @@ namespace libtorrent
 #else
 		sha_ctx m_context;
 #endif
+
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		bool m_finalized;
+#endif
 	};
+
 }
 
 #endif // TORRENT_HASHER_HPP_INCLUDED

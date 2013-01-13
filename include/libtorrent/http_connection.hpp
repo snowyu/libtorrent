@@ -41,7 +41,6 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <boost/enable_shared_from_this.hpp>
 #include <boost/noncopyable.hpp>
 #include <vector>
-#include <list>
 #include <string>
 
 #include "libtorrent/socket.hpp"
@@ -51,6 +50,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/assert.hpp"
 #include "libtorrent/socket_type.hpp"
 #include "libtorrent/session_settings.hpp"
+#include "libtorrent/connection_interface.hpp"
 
 #include "libtorrent/i2p_stream.hpp"
 
@@ -71,12 +71,13 @@ typedef boost::function<void(error_code const&
 
 typedef boost::function<void(http_connection&)> http_connect_handler;
 
-typedef boost::function<void(http_connection&, std::list<tcp::endpoint>&)> http_filter_handler;
+typedef boost::function<void(http_connection&, std::vector<tcp::endpoint>&)> http_filter_handler;
 
 // when bottled, the last two arguments to the handler
 // will always be 0
 struct TORRENT_EXTRA_EXPORT http_connection
-	: boost::enable_shared_from_this<http_connection>
+	: connection_interface
+	, boost::enable_shared_from_this<http_connection>
 	, boost::noncopyable
 {
 	http_connection(io_service& ios, connection_queue& cc
@@ -89,7 +90,7 @@ struct TORRENT_EXTRA_EXPORT http_connection
 #endif
 		);
 
-	~http_connection();
+	virtual ~http_connection();
 
 	void rate_limit(int limit);
 
@@ -119,7 +120,7 @@ struct TORRENT_EXTRA_EXPORT http_connection
 
 	socket_type const& socket() const { return m_sock; }
 
-	std::list<tcp::endpoint> const& endpoints() const { return m_endpoints; }
+	std::vector<tcp::endpoint> const& endpoints() const { return m_endpoints; }
 	
 private:
 
@@ -130,7 +131,7 @@ private:
 	void on_resolve(error_code const& e
 		, tcp::resolver::iterator i);
 	void queue_connect();
-	void connect(int ticket, tcp::endpoint target_address);
+	void on_allow_connect(int ticket);
 	void on_connect_timeout();
 	void on_connect(error_code const& e);
 	void on_write(error_code const& e);
@@ -174,7 +175,7 @@ private:
 	std::string m_url;
 	std::string m_user_agent;
 
-	std::list<tcp::endpoint> m_endpoints;
+	std::vector<tcp::endpoint> m_endpoints;
 #ifdef TORRENT_USE_OPENSSL
 	asio::ssl::context* m_ssl_ctx;
 	bool m_own_ssl_context;
@@ -200,6 +201,7 @@ private:
 	int m_redirects;
 
 	int m_connection_ticket;
+	bool m_queued_for_connection;
 	connection_queue& m_cc;
 
 	// specifies whether or not the connection is
@@ -218,6 +220,9 @@ private:
 	int m_priority;
 
 	bool m_abort;
+
+	// used to keep us alive when queued in the connection_queue
+	boost::shared_ptr<http_connection> m_self_reference;
 };
 
 }

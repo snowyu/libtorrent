@@ -31,7 +31,7 @@ POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include "libtorrent/piece_picker.hpp"
-#include "libtorrent/policy.hpp"
+#include "libtorrent/torrent_peer.hpp"
 #include "libtorrent/bitfield.hpp"
 #include <boost/shared_ptr.hpp>
 #include <boost/bind.hpp>
@@ -56,7 +56,7 @@ bitfield string2vec(char const* have_str)
 	return have;
 }
 
-policy::peer* tmp_peer = 0;
+ipv4_peer* tmp_peer = 0;
 
 // availability is a string where each character is the
 // availability of that piece, '1', '2' etc.
@@ -70,7 +70,7 @@ boost::shared_ptr<piece_picker> setup_picker(
 	, char const* partial)
 {
 	const int num_pieces = strlen(availability);
-	assert(int(strlen(have_str)) == num_pieces);
+	TORRENT_ASSERT(int(strlen(have_str)) == num_pieces);
 
 	boost::shared_ptr<piece_picker> p(new piece_picker);
 	p->init(blocks_per_piece, blocks_per_piece, num_pieces);
@@ -230,8 +230,9 @@ std::vector<piece_block> pick_pieces(boost::shared_ptr<piece_picker> const& p, c
 	, int options, std::vector<int> const& suggested_pieces)
 {
 	std::vector<piece_block> picked;
+	int loop_counter = 0;
 	p->pick_pieces(string2vec(availability), picked, num_blocks, prefer_whole_pieces, peer_struct
-		, state, options, suggested_pieces, 20);
+		, state, options, suggested_pieces, 20, loop_counter);
 	print_pick(picked);
 	TEST_CHECK(verify_pick(p, picked));
 	return picked;
@@ -250,10 +251,10 @@ int test_main()
 {
 	tcp::endpoint endp;
 	piece_picker::downloading_piece st;
-	policy::ipv4_peer tmp1(endp, false, 0);
-	policy::ipv4_peer tmp2(endp, false, 0);
-	policy::ipv4_peer tmp3(endp, false, 0);
-	policy::ipv4_peer peer_struct(endp, true, 0);
+	ipv4_peer tmp1(endp, false, 0);
+	ipv4_peer tmp2(endp, false, 0);
+	ipv4_peer tmp3(endp, false, 0);
+	ipv4_peer peer_struct(endp, true, 0);
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
 	tmp1.in_use = true;
 	tmp2.in_use = true;
@@ -265,6 +266,7 @@ int test_main()
 	boost::shared_ptr<piece_picker> p;
 	const std::vector<int> empty_vector;
 	int options = piece_picker::rarest_first;
+	std::pair<int, int> dc;
 
 // ========================================================
 
@@ -433,7 +435,7 @@ int test_main()
 	// there are 2 pieces with availability 2 and 5 with availability 3
 	print_title("test distributed copies");
 	p = setup_picker("1233333", "*      ", "", "");
-	std::pair<int, int> dc = p->distributed_copies();
+	dc = p->distributed_copies();
 	TEST_CHECK(dc == std::make_pair(2, 5000 / 7));
 
 // ========================================================
@@ -743,8 +745,10 @@ int test_main()
 	p->mark_as_downloading(piece_block(1,2), &tmp1, piece_picker::slow);
 
 	picked.clear();
+	int loop_counter = 0;
 	p->pick_pieces(string2vec("*******"), picked, 7 * blocks_per_piece, 0, 0
-		, piece_picker::fast, piece_picker::prioritize_partials, empty_vector, 20);
+		, piece_picker::fast, piece_picker::prioritize_partials, empty_vector, 20
+		, loop_counter);
 	TEST_CHECK(verify_pick(p, picked, true));
 	print_pick(picked);
 	// don't pick both busy pieces, just one
@@ -753,14 +757,16 @@ int test_main()
 	picked.clear();
 	p->pick_pieces(string2vec("*******"), picked, 7 * blocks_per_piece, 0, 0
 		, piece_picker::fast, piece_picker::prioritize_partials
-		| piece_picker::rarest_first, empty_vector, 20);
+		| piece_picker::rarest_first, empty_vector, 20
+		, loop_counter);
 	TEST_CHECK(verify_pick(p, picked, true));
 	print_pick(picked);
 	TEST_EQUAL(picked.size(), 7 * blocks_per_piece - 1);
 
 	picked.clear();
 	p->pick_pieces(string2vec("*******"), picked, 7 * blocks_per_piece, 0, 0
-		, piece_picker::fast, piece_picker::rarest_first, empty_vector, 20);
+		, piece_picker::fast, piece_picker::rarest_first, empty_vector, 20
+		, loop_counter);
 	TEST_CHECK(verify_pick(p, picked, true));
 	print_pick(picked);
 	TEST_EQUAL(picked.size(), 7 * blocks_per_piece - 1);
@@ -850,12 +856,9 @@ int test_main()
 	p->dec_refcount(5, 0);
 	p->inc_refcount(5, 0);
 	
-	bitfield bits(7);
-	bits.clear_all();
-	bits.set_bit(0);
+	bitfield bits = string2vec("*      ");
 	p->inc_refcount(bits, 0);
-	bits.clear_all();
-	bits.set_bit(4);
+	bits = string2vec("    *  ");
 	p->dec_refcount(bits, 0);
 	TEST_CHECK(test_pick(p) == 0);
 
@@ -932,6 +935,26 @@ int test_main()
 	TEST_CHECK(picked.size() == 7 * blocks_per_piece - 1);
 	TEST_CHECK(std::find(picked.begin(), picked.end(), piece_block(2,2)) == picked.end());
 
+	// test aligned whole pieces
+	print_title("test prefer aligned whole pieces");
+	p = setup_picker("2222221222222222", "                ", "", "");
+	picked = pick_pieces(p, "****************", 1, 4, 0
+		, piece_picker::fast, options | piece_picker::align_expanded_pieces, empty_vector);
+
+	// the piece picker should pick piece 5, and then align it to even 4 pieces
+	// i.e. it should have picked pieces: 4,5,6,7
+	print_pick(picked);
+	TEST_CHECK(picked.size() == 4 * blocks_per_piece);
+
+	std::set<int> picked_pieces;
+	for (std::vector<piece_block>::iterator i = picked.begin()
+		, end(picked.end()); i != end; ++i)
+		picked_pieces.insert(picked_pieces.begin(), i->piece_index);
+
+	TEST_CHECK(picked_pieces.size() == 4);
+	int expected_pieces[] = {4,5,6,7};
+	TEST_CHECK(std::equal(picked_pieces.begin(), picked_pieces.end(), expected_pieces))
+
 //#error test picking with partial pieces and other peers present so that both backup_pieces and backup_pieces2 are used
 	
 // ========================================================
@@ -982,6 +1005,24 @@ int test_main()
 	for (int i = 1; i < int(picked.size()); ++i)
 		TEST_CHECK(picked[i] == piece_block(5, i));
 	
+// ========================================================
+
+	// test bitfield optimization
+	print_title("test bitfield optimization");
+	// we have less than half of the pieces
+	p = setup_picker("2122222211221222", "                ", "", "");
+	// make sure it's not dirty
+	pick_pieces(p, "****************", 1, 1, 0, piece_picker::fast, options, empty_vector);
+	print_availability(p);
+	p->dec_refcount(string2vec("**  **  **  *   "), (void*)2);
+	print_availability(p);
+	TEST_CHECK(verify_availability(p, "1022112200220222"));
+	// make sure it's not dirty
+	pick_pieces(p, "****************", 1, 1, 0, piece_picker::fast, options, empty_vector);
+	p->inc_refcount(string2vec(" **  **  *   *  "), (void*)3);
+	print_availability(p);
+	TEST_CHECK(verify_availability(p, "1132123201220322"));
+
 // ========================================================
 
 	// test seed optimizaton

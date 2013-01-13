@@ -11,6 +11,7 @@
 #include <libtorrent/storage.hpp>
 #include <libtorrent/ip_filter.hpp>
 #include <libtorrent/disk_io_thread.hpp>
+#include <libtorrent/aux_/session_settings.hpp>
 #include <libtorrent/extensions.hpp>
 
 #include <libtorrent/extensions/lt_trackers.hpp>
@@ -37,9 +38,10 @@ namespace
     void outgoing_ports(session& s, int _min, int _max)
     {
         allow_threading_guard guard;
-        session_settings settings = s.settings();
-        settings.outgoing_ports = std::make_pair(_min, _max);
-        s.set_settings(settings);
+		  settings_pack p;
+		  p.set_int(settings_pack::outgoing_port, _min);
+		  p.set_int(settings_pack::num_outgoing_ports, _max - _min);
+        s.apply_settings(p);
         return;
     }
 #ifndef TORRENT_DISABLE_DHT
@@ -77,82 +79,65 @@ namespace
 
 	void session_set_settings(session& ses, dict const& sett_dict)
 	{
-		bencode_map_entry* map;
-		int len;
-		boost::tie(map, len) = aux::settings_map();
-	 
-		session_settings sett;
-		for (int i = 0; i < len; ++i)
-		{
-			if (!sett_dict.has_key(map[i].name)) continue;
+		allow_threading_guard guard;
 
-			void* dest = ((char*)&sett) + map[i].offset;
-			char const* name = map[i].name;
-			switch (map[i].type)
+		settings_pack p;
+		list iterkeys = (list)sett_dict.iterkeys();
+		for (int i = 0; i < boost::python::len(iterkeys); i++)
+		{
+			std::string key = extract<std::string>(iterkeys[i]);
+
+			int sett = setting_by_name(key);
+			if (sett == 0) continue;
+
+			TORRENT_TRY
 			{
-				case std_string:
-					*((std::string*)dest) = extract<std::string>(sett_dict[name]);
-					break;
-				case character:
-					*((char*)dest) = extract<char>(sett_dict[name]);
-					break;
-				case boolean:
-					*((bool*)dest) = extract<bool>(sett_dict[name]);
-					break;
-				case integer:
-					*((int*)dest) = extract<int>(sett_dict[name]);
-					break;
-				case floating_point:
-					*((float*)dest) = extract<float>(sett_dict[name]);
-					break;
+				object value = sett_dict[key];
+				switch (sett & settings_pack::type_mask)
+				{
+					case settings_pack::string_type_base:
+						p.set_str(sett, extract<std::string>(value));
+						break;
+					case settings_pack::int_type_base:
+						p.set_int(sett, extract<int>(value));
+						break;
+					case settings_pack::bool_type_base:
+						p.set_bool(sett, extract<bool>(value));
+						break;
+				}
 			}
+			TORRENT_CATCH(...) {}
 		}
 
-		if (!sett_dict.has_key("outgoing_port"))
-			sett.outgoing_ports.first = extract<int>(sett_dict["outgoing_port"]);
-		if (!sett_dict.has_key("num_outgoing_ports"))
-			sett.outgoing_ports.second = sett.outgoing_ports.first + extract<int>(sett_dict["num_outgoing_ports"]);
-
-		ses.set_settings(sett);
+		ses.apply_settings(p);
 	}
 
 	dict session_get_settings(session const& ses)
 	{
-		session_settings sett;
+		aux::session_settings sett;
 		{
 			allow_threading_guard guard;
-			sett = ses.settings();
+			sett = ses.get_settings();
 		}
-		dict sett_dict;
-		bencode_map_entry* map;
-		int len;
-		boost::tie(map, len) = aux::settings_map();
-		for (int i = 0; i < len; ++i)
+		dict ret;
+		for (int i = settings_pack::string_type_base;
+			i < settings_pack::max_string_setting_internal; ++i)
 		{
-			void const* dest = ((char const*)&sett) + map[i].offset;
-			char const* name = map[i].name;
-			switch (map[i].type)
-			{
-				case std_string:
-					sett_dict[name] = *((std::string const*)dest);
-					break;
-				case character:
-					sett_dict[name] = *((char const*)dest);
-					break;
-				case boolean:
-					sett_dict[name] = *((bool const*)dest);
-					break;
-				case integer:
-					sett_dict[name] = *((int const*)dest);
-					break;
-				case floating_point:
-					sett_dict[name] = *((float const*)dest);
-					break;
-			}
+			ret[name_for_setting(i)] = sett.get_str(i);
 		}
-		sett_dict["outgoing_port"] = sett.outgoing_ports.first;
-		sett_dict["num_outgoing_ports"] = sett.outgoing_ports.second - sett.outgoing_ports.first + 1;
-		return sett_dict;
+
+		for (int i = settings_pack::int_type_base;
+			i < settings_pack::max_int_setting_internal; ++i)
+		{
+			ret[name_for_setting(i)] = sett.get_int(i);
+		}
+
+		for (int i = settings_pack::bool_type_base;
+			i < settings_pack::max_bool_setting_internal; ++i)
+		{
+			ret[name_for_setting(i)] = sett.get_bool(i);
+		}
+		return ret;
 	}
 
 #ifndef BOOST_NO_EXCEPTIONS
@@ -173,7 +158,7 @@ namespace
     {
         // torrent_info objects are always held by an intrusive_ptr in the python binding
         if (params.has_key("ti") && params.get("ti") != boost::python::object())
-            p.ti = extract<intrusive_ptr<torrent_info> >(params["ti"]);
+            p.ti = extract<boost::intrusive_ptr<torrent_info> >(params["ti"]);
 
         if (params.has_key("info_hash"))
             p.info_hash = extract<sha1_hash>(params["info_hash"]);
@@ -396,6 +381,22 @@ namespace
         return ret;
     }
 
+	 cache_status get_cache_info(session& s, torrent_handle h, int flags)
+	 {
+	 	cache_status ret;
+		s.get_cache_info(&ret, h, flags);
+		return ret;
+	 }
+
+#ifndef TORRENT_NO_DEPRECATE
+	 cache_status get_cache_status(session& s)
+	 {
+	 	cache_status ret;
+		s.get_cache_info(&ret);
+		return ret;
+	 }
+#endif
+
 #ifndef TORRENT_DISABLE_GEO_IP
     void load_asnum_db(session& s, std::string file)
     {
@@ -552,9 +553,35 @@ void bind_session()
         .def_readonly("blocks_read", &cache_status::blocks_read)
         .def_readonly("blocks_read_hit", &cache_status::blocks_read_hit)
         .def_readonly("reads", &cache_status::reads)
+        .def_readonly("queued_bytes", &cache_status::queued_bytes)
+#ifndef TORRENT_NO_DEPRECATE
         .def_readonly("cache_size", &cache_status::cache_size)
+#endif
+        .def_readonly("write_cache_size", &cache_status::write_cache_size)
         .def_readonly("read_cache_size", &cache_status::read_cache_size)
+        .def_readonly("pinned_blocks", &cache_status::pinned_blocks)
         .def_readonly("total_used_buffers", &cache_status::total_used_buffers)
+        .def_readonly("average_read_time", &cache_status::average_read_time)
+        .def_readonly("average_write_time", &cache_status::average_write_time)
+        .def_readonly("average_hash_time", &cache_status::average_hash_time)
+        .def_readonly("average_job_time", &cache_status::average_job_time)
+        .def_readonly("cumulative_job_time", &cache_status::cumulative_job_time)
+        .def_readonly("cumulative_read_time", &cache_status::cumulative_read_time)
+        .def_readonly("cumulative_write_time", &cache_status::cumulative_write_time)
+        .def_readonly("cumulative_hash_time", &cache_status::cumulative_hash_time)
+        .def_readonly("total_read_back", &cache_status::total_read_back)
+        .def_readonly("read_queue_size", &cache_status::read_queue_size)
+        .def_readonly("blocked_jobs", &cache_status::blocked_jobs)
+        .def_readonly("queued_jobs", &cache_status::queued_jobs)
+        .def_readonly("peak_queued", &cache_status::peak_queued)
+        .def_readonly("pending_jobs", &cache_status::pending_jobs)
+        .def_readonly("num_jobs", &cache_status::num_jobs)
+        .def_readonly("num_read_jobs", &cache_status::num_read_jobs)
+        .def_readonly("num_write_jobs", &cache_status::num_write_jobs)
+        .def_readonly("arc_mru_size", &cache_status::arc_mru_size)
+        .def_readonly("arc_mru_ghost_size", &cache_status::arc_mru_ghost_size)
+        .def_readonly("arc_mfu_size", &cache_status::arc_mfu_size)
+        .def_readonly("arc_mfu_ghost_size", &cache_status::arc_mfu_ghost_size)
     ;
 
     class_<session, boost::noncopyable>("session", no_init)
@@ -673,7 +700,10 @@ void bind_session()
         .def("resume", allow_threads(&session::resume))
         .def("is_paused", allow_threads(&session::is_paused))
         .def("id", allow_threads(&session::id))
-        .def("get_cache_status", allow_threads(&session::get_cache_status))
+        .def("get_cache_info", &get_cache_info, (arg("handle") = torrent_handle(), arg("flags") = 0))
+#ifndef TORRENT_NO_DEPRECATE
+        .def("get_cache_status", &get_cache_status)
+#endif
         .def("set_peer_id", allow_threads(&session::set_peer_id))
         ;
 
@@ -716,8 +746,19 @@ void bind_session()
 
     register_ptr_to_python<std::auto_ptr<alert> >();
 
-	 def("high_performance_seed", high_performance_seed);
-	 def("min_memory_usage", min_memory_usage);
+	typedef session_settings (*mem_preset1)();
+	typedef session_settings (*perf_preset1)();
+
+	typedef void (*mem_preset2)(settings_pack& s);
+	typedef void (*perf_preset2)(settings_pack& s);
+
+#ifndef TORRENT_NO_DEPRECATE
+	 def("high_performance_seed", (perf_preset1)high_performance_seed);
+	 def("min_memory_usage", (mem_preset1)min_memory_usage);
+#endif
+
+	 def("high_performance_seed", (perf_preset2)high_performance_seed);
+	 def("min_memory_usage", (mem_preset2)min_memory_usage);
 
 	 scope().attr("create_metadata_plugin") = "metadata_transfer";
 	 scope().attr("create_ut_metadata_plugin") = "ut_metadata";

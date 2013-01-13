@@ -395,6 +395,49 @@ namespace libtorrent
 		mutable char* m_msg;
 	};
 #endif
+
+	// used by storage to return errors
+	// also includes which underlying file the
+	// error happened on
+	struct TORRENT_EXPORT storage_error
+	{
+		storage_error(): file(-1), operation(0) {}
+
+		operator bool() const { return ec.value() != 0; }
+		// the error that occurred
+		error_code ec;
+		// the file the error occurred on
+		boost::int32_t file:24;
+		// the operation that failed
+		boost::uint32_t operation:8;
+
+		enum {
+			none,
+			stat,
+			mkdir,
+			open,
+			rename,
+			remove,
+			copy,
+			read,
+			write,
+			fallocate,
+			alloc_cache_piece,
+			partfile
+		};
+
+		char const* operation_str() const
+		{
+			char const* ops[] =
+			{
+				"", "stat", "mkdir", "open", "rename", "remove", "copy"
+				, "read", "write", "fallocate", "allocate cache piece"
+				, "partfile"
+			};
+			return ops[operation];
+		}
+	};
+
 }
 
 #endif

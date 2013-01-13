@@ -99,7 +99,7 @@ namespace libtorrent
 			return;
 		}
 		
-		session_settings const& settings = m_ses.settings();
+		aux::session_settings const& settings = m_ses.settings();
 
 		if (m_proxy.proxy_hostnames
 			&& (m_proxy.type == proxy_settings::socks5
@@ -126,9 +126,9 @@ namespace libtorrent
 		}
 
 		set_timeout(tracker_req().event == tracker_request::stopped
-			? settings.stop_tracker_timeout
-			: settings.tracker_completion_timeout
-			, settings.tracker_receive_timeout);
+			? settings.get_int(settings_pack::stop_tracker_timeout)
+			: settings.get_int(settings_pack::tracker_completion_timeout)
+			, settings.get_int(settings_pack::tracker_receive_timeout));
 	}
 
 	void udp_tracker_connection::fail(error_code const& ec, int code
@@ -224,8 +224,6 @@ namespace libtorrent
 		}
 		
 		m_target = pick_target_endpoint();
-
-		if (cb) cb->m_tracker_address = tcp::endpoint(m_target.address(), m_target.port());
 
 		start_announce();
 	}
@@ -414,7 +412,7 @@ namespace libtorrent
 		mutex::scoped_lock l(m_cache_mutex);
 		connection_cache_entry& cce = m_connection_cache[m_target.address()];
 		cce.connection_id = connection_id;
-		cce.expires = time_now() + seconds(m_ses.m_settings.udp_tracker_token_expiry);
+		cce.expires = time_now() + seconds(m_ses.m_settings.get_int(settings_pack::udp_tracker_token_expiry));
 
 		if (tracker_req().kind == tracker_request::announce_request)
 			send_udp_announce();
@@ -635,7 +633,7 @@ namespace libtorrent
 
 		tracker_request const& req = tracker_req();
 		const bool stats = req.send_stats;
-		session_settings const& settings = m_ses.settings();
+		aux::session_settings const& settings = m_ses.settings();
 
 		std::map<address, connection_cache_entry>::iterator i
 			= m_connection_cache.find(m_target.address());
@@ -657,11 +655,11 @@ namespace libtorrent
 		// ip address
 		address_v4 announce_ip;
 
-		if (!m_ses.settings().anonymous_mode
-			&& !settings.announce_ip.empty())
+		if (!settings.get_bool(settings_pack::anonymous_mode)
+			&& !settings.get_str(settings_pack::announce_ip).empty())
 		{
 			error_code ec;
-			address ip = address::from_string(settings.announce_ip.c_str(), ec);
+			address ip = address::from_string(settings.get_str(settings_pack::announce_ip).c_str(), ec);
 			if (!ec && ip.is_v4()) announce_ip = ip.to_v4();
 		}
 		detail::write_uint32(announce_ip.to_ulong(), out);

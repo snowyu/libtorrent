@@ -89,9 +89,6 @@ udp_socket::udp_socket(asio::io_service& ios
 	m_outstanding_timeout = 0;
 	m_outstanding_resolve = 0;
 	m_outstanding_socks = 0;
-#if defined BOOST_HAS_PTHREADS
-	m_thread = 0;
-#endif
 #endif
 
 	m_buf_size = 2000;
@@ -820,11 +817,10 @@ void udp_socket::on_name_lookup(error_code const& e, tcp::resolver::iterator i)
 	++m_outstanding_timeout;
 	++m_outstanding_connect_queue;
 #endif
-	m_cc.enqueue(boost::bind(&udp_socket::on_connect, this, _1)
-		, boost::bind(&udp_socket::on_timeout, this), seconds(10));
+	m_cc.enqueue(this, seconds(10));
 }
 
-void udp_socket::on_timeout()
+void udp_socket::on_connect_timeout()
 {
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
 	TORRENT_ASSERT(m_outstanding_timeout > 0);
@@ -846,7 +842,7 @@ void udp_socket::on_timeout()
 	m_connection_ticket = -1;
 }
 
-void udp_socket::on_connect(int ticket)
+void udp_socket::on_allow_connect(int ticket)
 {
 	TORRENT_ASSERT(is_single_thread());
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS

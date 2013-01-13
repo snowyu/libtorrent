@@ -84,6 +84,7 @@ http_connection::http_connection(io_service& ios, connection_queue& cc
 	, m_limiter_timer(ios)
 	, m_redirects(5)
 	, m_connection_ticket(-1)
+	, m_queued_for_connection(false)
 	, m_cc(cc)
 	, m_ssl(false)
 	, m_priority(0)
@@ -126,6 +127,13 @@ void http_connection::get(std::string const& url, time_duration timeout, int pri
 	// deletes this object
 	boost::shared_ptr<http_connection> me(shared_from_this());
 
+	if (ec)
+	{
+		m_resolver.get_io_service().post(boost::bind(&http_connection::callback
+			, me, ec, (char*)0, 0));
+		return;
+	}
+
 	if (protocol != "http"
 #ifdef TORRENT_USE_OPENSSL
 		&& protocol != "https"
@@ -133,13 +141,6 @@ void http_connection::get(std::string const& url, time_duration timeout, int pri
 		)
 	{
 		error_code ec(errors::unsupported_url_protocol);
-		m_resolver.get_io_service().post(boost::bind(&http_connection::callback
-			, me, ec, (char*)0, 0));
-		return;
-	}
-
-	if (ec)
-	{
 		m_resolver.get_io_service().post(boost::bind(&http_connection::callback
 			, me, ec, (char*)0, 0));
 		return;
@@ -368,6 +369,7 @@ void http_connection::start(std::string const& hostname, std::string const& port
 #if defined TORRENT_ASIO_DEBUGGING
 			add_outstanding_async("http_connection::on_resolve");
 #endif
+			TORRENT_ASSERT(!m_self_reference);
 			m_endpoints.clear();
 			tcp::resolver::query query(hostname, port);
 			m_resolver.async_resolve(query, boost::bind(&http_connection::on_resolve
@@ -381,6 +383,7 @@ void http_connection::start(std::string const& hostname, std::string const& port
 void http_connection::on_connect_timeout()
 {
 	TORRENT_ASSERT(m_connection_ticket > -1);
+	TORRENT_ASSERT(!m_queued_for_connection);
 
 	// keep ourselves alive even if the callback function
 	// deletes this object
@@ -388,6 +391,8 @@ void http_connection::on_connect_timeout()
 
 	error_code ec;
 	m_sock.close(ec);
+
+	m_self_reference.reset();
 }
 
 void http_connection::on_timeout(boost::weak_ptr<http_connection> p
@@ -441,12 +446,21 @@ void http_connection::close()
 {
 	if (m_abort) return;
 
+	async_shutdown(m_sock, shared_from_this());
+
+	if (m_queued_for_connection)
+		m_cc.cancel(this);
+
+	if (m_connection_ticket > -1)
+	{
+		m_cc.done(m_connection_ticket);
+		m_connection_ticket = -1;
+	}
+
 	error_code ec;
 	m_timer.cancel(ec);
 	m_resolver.cancel();
 	m_limiter_timer.cancel(ec);
-
-	async_shutdown(m_sock, shared_from_this());
 
 	m_hostname.clear();
 	m_port.clear();
@@ -514,6 +528,8 @@ void http_connection::on_resolve(error_code const& e
 		return;
 	}
 
+	std::random_shuffle(m_endpoints.begin(), m_endpoints.end());
+
 	// The following statement causes msvc to crash (ICE). Since it's not
 	// necessary in the vast majority of cases, just ignore the endpoint
 	// order for windows
@@ -533,21 +549,37 @@ void http_connection::on_resolve(error_code const& e
 void http_connection::queue_connect()
 {
 	TORRENT_ASSERT(!m_endpoints.empty());
-	tcp::endpoint target = m_endpoints.front();
-	m_endpoints.pop_front();
-
-	m_cc.enqueue(boost::bind(&http_connection::connect, shared_from_this(), _1, target)
-		, boost::bind(&http_connection::on_connect_timeout, shared_from_this())
-		, m_read_timeout, m_priority);
+	m_self_reference = shared_from_this();
+	m_cc.enqueue(this, m_read_timeout, m_priority);
+	m_queued_for_connection = true;
 }
 
-void http_connection::connect(int ticket, tcp::endpoint target_address)
+void http_connection::on_allow_connect(int ticket)
 {
+	TORRENT_ASSERT(m_queued_for_connection);
+	m_queued_for_connection = false;
+
+	boost::shared_ptr<http_connection> me(shared_from_this());
+	m_self_reference.reset();
+#if defined TORRENT_ASIO_DEBUGGING
+	TORRENT_ASSERT(has_outstanding_async("connection_queue::on_timeout"));
+#endif
+
 	if (ticket == -1)
 	{
 		close();
 		return;
 	}
+
+	TORRENT_ASSERT(!m_endpoints.empty());
+	if (m_endpoints.empty())
+	{
+		m_cc.done(ticket);
+		return;
+	}
+
+	tcp::endpoint target_address = m_endpoints.front();
+	m_endpoints.erase(m_endpoints.begin());
 
 	m_connection_ticket = ticket;
 	if (m_proxy.proxy_hostnames

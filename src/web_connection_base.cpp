@@ -46,28 +46,26 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/invariant_check.hpp"
 #include "libtorrent/io.hpp"
 #include "libtorrent/version.hpp"
-#include "libtorrent/aux_/session_impl.hpp"
 #include "libtorrent/parse_url.hpp"
 #include "libtorrent/peer_info.hpp"
 
 using boost::shared_ptr;
-using libtorrent::aux::session_impl;
 
 namespace libtorrent
 {
 	web_connection_base::web_connection_base(
-		session_impl& ses
+		aux::session_interface& ses
+		, aux::session_settings const& sett
+		, buffer_allocator_interface& allocator
+		, disk_interface& disk_thread
 		, boost::weak_ptr<torrent> t
 		, boost::shared_ptr<socket_type> s
-		, tcp::endpoint const& remote
-		, std::string const& url
-		, policy::peer* peerinfo
-		, std::string const& auth
-		, web_seed_entry::headers_t const& extra_headers)
-		: peer_connection(ses, t, s, remote, peerinfo)
+		, web_seed_entry& web)
+		: peer_connection(ses, sett, allocator, disk_thread, ses.get_io_service()
+			, t, s, web.endpoint, &web.peer_info)
 		, m_parser(http_parser::dont_parse_chunks)
-		, m_external_auth(auth)
-		, m_extra_headers(extra_headers)
+		, m_external_auth(web.auth)
+		, m_extra_headers(web.extra_headers)
 		, m_first_request(true)
 		, m_ssl(false)
 		, m_body_start(0)
@@ -75,16 +73,16 @@ namespace libtorrent
 		INVARIANT_CHECK;
 
 		// we only want left-over bandwidth
-		set_priority(1);
+		// TODO: introduce a web-seed default class which has a low download priority
 		
 		// since this is a web seed, change the timeout
 		// according to the settings.
-		set_timeout(ses.settings().urlseed_timeout);
+		set_timeout(m_settings.get_int(settings_pack::urlseed_timeout));
 
 		std::string protocol;
 		error_code ec;
 		boost::tie(protocol, m_basic_auth, m_host, m_port, m_path)
-			= parse_url_components(url, ec);
+			= parse_url_components(web.url, ec);
 		TORRENT_ASSERT(!ec);
 
 #ifdef TORRENT_USE_OPENSSL
@@ -127,9 +125,9 @@ namespace libtorrent
 	{
 		request += "Host: ";
 		request += m_host;
-		if (m_first_request || m_ses.settings().always_send_user_agent) {
+		if (m_first_request || m_settings.get_bool(settings_pack::always_send_user_agent)) {
 			request += "\r\nUser-Agent: ";
-			request += m_ses.settings().user_agent;
+			request += m_settings.get_str(settings_pack::user_agent);
 		}
 		if (!m_external_auth.empty()) {
 			request += "\r\nAuthorization: ";
@@ -184,7 +182,7 @@ namespace libtorrent
 		INVARIANT_CHECK;
 
 		if (error) return;
-		m_statistics.sent_bytes(0, bytes_transferred);
+		sent_bytes(0, bytes_transferred);
 	}
 
 

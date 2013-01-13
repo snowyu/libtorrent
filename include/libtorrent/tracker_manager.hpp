@@ -35,6 +35,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include <vector>
 #include <string>
+#include <list>
 #include <utility>
 #include <ctime>
 
@@ -164,8 +165,6 @@ namespace libtorrent
 			, error_code const& ec
 			, const std::string& msg
 			, int retry_interval) = 0;
-
-		union_endpoint m_tracker_address;
 
 #if defined TORRENT_VERBOSE_LOGGING || defined TORRENT_LOGGING || defined TORRENT_ERROR_LOGGING
 		virtual void debug_log(const char* fmt, ...) const = 0;

@@ -41,19 +41,6 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include <iterator>
 #include <algorithm>
-#include <set>
-
-#ifdef _MSC_VER
-#pragma warning(push, 1)
-#endif
-
-#include <boost/bind.hpp>
-#include <boost/assert.hpp>
-
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
-
 #include "libtorrent/config.hpp"
 #include "libtorrent/torrent_info.hpp"
 #include "libtorrent/escape_string.hpp" // is_space
@@ -64,7 +51,24 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/utf8.hpp"
 #include "libtorrent/time.hpp"
 #include "libtorrent/invariant_check.hpp"
-#include "libtorrent/session_settings.hpp"
+#include "libtorrent/aux_/session_settings.hpp"
+
+#ifdef _MSC_VER
+#pragma warning(push, 1)
+#endif
+
+#include <boost/bind.hpp>
+#include <boost/assert.hpp>
+#if TORRENT_HAS_BOOST_UNORDERED
+#include <boost/unordered_set.hpp>
+#else
+#include <set>
+#endif
+
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #if TORRENT_USE_I2P
 #include "libtorrent/parse_url.hpp"
@@ -96,6 +100,7 @@ namespace libtorrent
 	TORRENT_EXTRA_EXPORT bool verify_encoding(std::string& target, bool fix_paths = false)
 	{
 		std::string tmp_path;
+		tmp_path.reserve(target.size()+5);
 		bool valid_encoding = true;
 		for (std::string::iterator i = target.begin()
 			, end(target.end()); i != end; ++i)
@@ -184,72 +189,105 @@ namespace libtorrent
 		return valid_encoding;
 	}
 
-	// TODO: should this take a char const*?
-	bool valid_path_element(std::string const& element)
+	void sanitize_append_path_element(std::string& path, char const* element, int element_len)
 	{
-		if (element.empty()
-			|| element == "." || element == ".."
-			|| element[0] == '/' || element[0] == '\\'
-			|| element[element.size()-1] == ':')
-			return false;
-		return true;
-	}
+		if (element_len == 0) return;
 
-	void trim_path_element(std::string& path_element)
-	{
-		const int max_path_len = TORRENT_MAX_PATH;
-		if (int(path_element.size()) > max_path_len)
-		{
-			// truncate filenames that are too long. But keep extensions!
-			std::string ext = extension(path_element);
-			if (ext.size() > 15)
-			{
-				path_element.resize(max_path_len);
-			}
-			else
-			{
-				path_element.resize(max_path_len - ext.size());
-				path_element += ext;
-			}
-		}
-	}
+		if (element_len == 1 && element[0] == '.') return;
 
-	TORRENT_EXTRA_EXPORT std::string sanitize_path(std::string const& p)
-	{
-		std::string new_path;
-		std::string split = split_path(p);
-		for (char const* e = split.c_str(); e != 0; e = next_path_element(e))
-		{
-			std::string pe = e;
-#if !TORRENT_USE_UNC_PATHS && defined TORRENT_WINDOWS
-			// if we're not using UNC paths on windows, there
-			// are certain filenames we're not allowed to use
-			const static char const* reserved_names[] =
-			{
-				"con", "prn", "aux", "clock$", "nul",
-				"com0", "com1", "com2", "com3", "com4",
-				"com5", "com6", "com7", "com8", "com9",
-				"lpt0", "lpt1", "lpt2", "lpt3", "lpt4",
-				"lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
-			};
-			int num_names = sizeof(reserved_names)/sizeof(reserved_names[0]);
-
-			char const* file_end = strrchr(pe.c_str(), '.');
-			std::string name;
-			if (file_end) name.assign(pe.c_str(), file_end);
-			else name = pe;
-			std::transform(name.begin(), name.end(), name.begin(), &to_lower);
-			char const** str = std::find(reserved_names, reserved_names + num_names, name);
-			if (str != reserved_names + num_names)
-			{
-				pe += "_";
-			}
+#ifdef TORRENT_WINDOWS
+#define TORRENT_SEPARATOR "\\"
+#else
+#define TORRENT_SEPARATOR "/"
 #endif
-			if (!valid_path_element(pe)) continue;
-			trim_path_element(pe);
-			new_path = combine_path(new_path, pe);
+		path.reserve(path.size() + element_len + 2);
+		int added_separator = 0;
+		if (!path.empty())
+		{
+			path += TORRENT_SEPARATOR;
+			added_separator = 1;
 		}
-		return new_path;
+
+#if !TORRENT_USE_UNC_PATHS && defined TORRENT_WINDOWS
+		// if we're not using UNC paths on windows, there
+		// are certain filenames we're not allowed to use
+		const static char const* reserved_names[] =
+		{
+			"con", "prn", "aux", "clock$", "nul",
+			"com0", "com1", "com2", "com3", "com4",
+			"com5", "com6", "com7", "com8", "com9",
+			"lpt0", "lpt1", "lpt2", "lpt3", "lpt4",
+			"lpt5", "lpt6", "lpt7", "lpt8", "lpt9"
+		};
+		int num_names = sizeof(reserved_names)/sizeof(reserved_names[0]);
+
+		// this is not very efficient, but it only affects some specific
+		// windows builds for now anyway (not even the default windows build)
+		std::string pe(element, element_len);
+		char const* file_end = strrchr(pe.c_str(), '.');
+		std::string name;
+		if (file_end) name.assign(pe.c_str(), file_end);
+		else name = pe;
+		std::transform(name.begin(), name.end(), name.begin(), &to_lower);
+		char const* str = std::find(reserved_names, reserved_names + num_names, name);
+		if (str != reserved + num_names)
+		{
+			pe = "_" + pe;
+			element = pe.c_str();
+			element_len = pe.size();
+		}
+#endif
+		int added = 0;
+		// the number of dots we've added
+		char num_dots = 0;
+		for (int i = 0; i < element_len; ++i)
+		{
+			if (element[i] == '/'
+				|| element[i] == '\\'
+#ifdef TORRENT_WINDOWS
+				|| element[i] == ':'
+#endif
+				)
+				continue;
+
+			if (element[i] == '.') ++num_dots;
+		
+			path += element[i];
+			++added;
+
+			// any given path element should not
+			// be more than 255 characters
+			// if we exceed 200, pick up any potential
+			// file extension and add that too
+			// TODO: this may corrupt utf-8 encoding. We should find a
+			// proper breaking point between characters
+			if (added > 200)
+			{
+				i = -1;
+				for (int j = element_len-1; j > element_len - 10; --j)
+				{
+					if (element[j] != '.') continue;
+					i = j;
+					break;
+				}
+				// there is no extension
+				if (i == -1) break;
+			}
+		}
+
+		if (added == num_dots && added <= 2)
+		{
+			// revert everything
+			path.erase(path.end()-added-added_separator, path.end());
+			return;
+		}
+
+		if (added == 0 && added_separator)
+		{
+			// remove the separator added at the beginning
+			path.erase(path.end()-1);
+			return;
+		}
 	}
 
 	bool extract_single_file(lazy_entry const& dict, file_entry& target
@@ -276,16 +314,15 @@ namespace libtorrent
 			return false;
 
 		std::string path = root_dir;
+		std::string path_element;
 		for (int i = 0, end(p->list_size()); i < end; ++i)
 		{
 			if (p->list_at(i)->type() != lazy_entry::string_t)
 				return false;
-			std::string path_element = p->list_at(i)->string_value();
 			if (i == end - 1) *filename = p->list_at(i);
-			trim_path_element(path_element);
-			path = combine_path(path, path_element);
+			sanitize_append_path_element(path
+				, p->list_at(i)->string_ptr(), p->list_at(i)->string_length());
 		}
-		path = sanitize_path(path);
 		verify_encoding(path, true);
 
 		// bitcomet pad file
@@ -319,7 +356,6 @@ namespace libtorrent
 			for (int i = 0, end(s_p->list_size()); i < end; ++i)
 			{
 				std::string path_element = s_p->list_at(i)->string_value();
-				trim_path_element(path_element);
 				target.symlink_path = combine_path(target.symlink_path, path_element);
 			}
 		}
@@ -327,9 +363,46 @@ namespace libtorrent
 		return true;
 	}
 
+#if TORRENT_HAS_BOOST_UNORDERED
+	struct string_hash_no_case
+	{
+		size_t operator()(std::string const& s) const
+		{
+			char const* s1 = s.c_str();
+			size_t ret = 5381;
+			int c;
+
+			while ((c = *s1++))
+				ret = (ret * 33) ^ to_lower(c);
+
+			return ret;
+		}
+	};
+
+	struct string_eq_no_case
+	{
+		bool operator()(std::string const& lhs, std::string const& rhs) const
+		{
+			char c1, c2;
+			char const* s1 = lhs.c_str();
+			char const* s2 = rhs.c_str();
+	
+			while (*s1 != 0 && *s2 != 0)
+			{
+				c1 = to_lower(*s1);
+				c2 = to_lower(*s2);
+				if (c1 != c2) return false;
+				++s1;
+				++s2;
+			}
+			return *s1 == *s2;
+		}
+	};
+
+#else
 	struct string_less_no_case
 	{
-		bool operator()(std::string const& lhs, std::string const& rhs)
+		bool operator()(std::string const& lhs, std::string const& rhs) const
 		{
 			char c1, c2;
 			char const* s1 = lhs.c_str();
@@ -347,6 +420,7 @@ namespace libtorrent
 			return false;
 		}
 	};
+#endif
 
 	bool extract_files(lazy_entry const& list, file_storage& target
 		, std::string const& root_dir, ptrdiff_t info_ptr_diff)
@@ -363,36 +437,17 @@ namespace libtorrent
 				, &file_hash, &fee, &mtime))
 				return false;
 
-			// TODO: this logic should be a separate step
-			// done once the torrent is loaded, and the original
-			// filenames should be preserved!
-			int cnt = 0;
-			std::set<std::string, string_less_no_case> files;
-
-			// as long as this file already exists
-			// increase the counter
-			while (!files.insert(e.path).second)
-			{
-				++cnt;
-				char suffix[50];
-				snprintf(suffix, sizeof(suffix), ".%d%s", cnt, extension(e.path).c_str());
-				replace_extension(e.path, suffix);
-			}
 			target.add_file(e, file_hash ? file_hash->string_ptr() + info_ptr_diff : 0);
 
 			// This is a memory optimization! Instead of having
 			// each entry keep a string for its filename, make it
 			// simply point into the info-section buffer
 			internal_file_entry const& fe = *target.rbegin();
-			// TODO: once the filename renaming is removed from here
-			// this check can be removed as well
-			if (fee && fe.filename() == fee->string_value())
-			{
-				// this string pointer does not necessarily point into
-				// the m_info_section buffer.
-				char const* str_ptr = fee->string_ptr() + info_ptr_diff;
-				const_cast<internal_file_entry&>(fe).set_name(str_ptr, fee->string_length());
-			}
+
+			// this string pointer does not necessarily point into
+			// the m_info_section buffer.
+			char const* str_ptr = fee->string_ptr() + info_ptr_diff;
+			const_cast<internal_file_entry&>(fe).set_name(str_ptr, fee->string_length());
 		}
 		return true;
 	}
@@ -471,14 +526,14 @@ namespace libtorrent
 	int announce_entry::min_announce_in() const
 	{ return total_seconds(min_announce - time_now()); }
 
-	void announce_entry::failed(session_settings const& sett, int retry_interval)
+	void announce_entry::failed(aux::session_settings const& sett, int retry_interval)
 	{
 		++fails;
 		// the exponential back-off ends up being:
 		// 7, 15, 27, 45, 95, 127, 165, ... seconds
 		// with the default tracker_backoff of 250
 		int delay = (std::min)(tracker_retry_delay_min + int(fails) * int(fails)
-			* tracker_retry_delay_min * sett.tracker_backoff / 100
+			* tracker_retry_delay_min * sett.get_int(settings_pack::tracker_backoff) / 100
 			, int(tracker_retry_delay_max));
 		delay = (std::max)(delay, retry_interval);
 		next_announce = time_now() + seconds(delay);
@@ -559,10 +614,58 @@ namespace libtorrent
 		INVARIANT_CHECK;
 	}
 
+	void torrent_info::resolve_duplicate_filenames()
+	{
+		int cnt = 0;
+
+#if TORRENT_HAS_BOOST_UNORDERED
+		boost::unordered_set<std::string, string_hash_no_case, string_eq_no_case> files;
+#else
+		std::set<std::string, string_less_no_case> files;
+#endif
+		std::vector<std::string> const& paths = m_files.paths();
+
+		// insert all directories first, to make sure no files
+		// are allowed to collied with them
+		// TODO: what about directories with the same name?
+		for (std::vector<std::string>::const_iterator i = paths.begin()
+			, end(paths.end()); i != end; ++i)
+		{
+			files.insert(*i);
+		}
+
+		int index = 0;
+		for (file_storage::iterator i = m_files.begin()
+			, end(m_files.end()); i != end; ++i, ++index)
+		{
+			// as long as this file already exists
+			// increase the counter
+			std::string filename = m_files.file_path(index);
+			if (!files.insert(filename).second)
+			{
+				std::string base = remove_extension(filename);
+				std::string ext = extension(filename);
+				do
+				{
+					++cnt;
+					char new_ext[50];
+					snprintf(new_ext, sizeof(new_ext), ".%d%s", cnt, ext.c_str());
+					filename = base + new_ext;
+				}
+				while (!files.insert(filename).second);
+
+				copy_on_write();
+				m_files.rename_file(index, filename);
+			}
+			cnt = 0;
+		}
+	}
+
 	void torrent_info::remap_files(file_storage const& f)
 	{
 		INVARIANT_CHECK;
 
+		TORRENT_ASSERT(is_loaded());
 		// the new specified file storage must have the exact
 		// same size as the current file storage
 		TORRENT_ASSERT(m_files.total_size() == f.total_size());
@@ -793,8 +896,39 @@ namespace libtorrent
 	torrent_info::~torrent_info()
 	{}
 
+	void torrent_info::load(char const* buffer, int size, error_code& ec)
+	{
+		lazy_entry e;
+		if (lazy_bdecode(buffer, buffer + size, e, ec) != 0)
+			return;
+
+		if (!parse_torrent_file(e, ec, 0))
+			return;
+	}
+
+	void torrent_info::unload()
+	{
+		TORRENT_ASSERT(m_info_section.unique());
+		m_info_section.reset();
+		m_info_section_size = 0;
+
+		// if we have orig_files, we have to keep
+		// m_files around, since it means we have
+		// remapped files, and we won't be able to
+		// restore that from just reloading the
+		// torrent file
+		if (m_orig_files) m_orig_files.reset();
+		else m_files.unload();
+
+		m_piece_hashes = 0;
+		std::vector<web_seed_entry>().swap(m_web_seeds);
+
+		TORRENT_ASSERT(!is_loaded());
+	}
+
 	void torrent_info::copy_on_write()
 	{
+		TORRENT_ASSERT(is_loaded());
 		INVARIANT_CHECK;
 
 		if (m_orig_files) return;
@@ -870,7 +1004,8 @@ namespace libtorrent
 			ec = errors::torrent_missing_piece_length;
 			return false;
 		}
-		m_files.set_piece_length(piece_length);
+		file_storage files;
+		files.set_piece_length(piece_length);
 
 		// extract file name (or the directory name if it's a multifile libtorrent)
 		lazy_entry const* name_ent = info.dict_find_string("name.utf-8");
@@ -881,15 +1016,10 @@ namespace libtorrent
 			return false;
 		}
 
-		std::string name = name_ent->string_value();
-		if (name.empty()) name = to_hex(m_info_hash.to_string());
-		name = sanitize_path(name);
+		std::string name;
+		sanitize_append_path_element(name, name_ent->string_ptr(), name_ent->string_length());
 	
-		if (!valid_path_element(name))
-		{
-			ec = errors::torrent_invalid_name;
-			return false;
-		}
+		if (name.empty()) name = to_hex(m_info_hash.to_string());
 
 		// correct utf-8 encoding errors
 		verify_encoding(name, true);
@@ -926,7 +1056,6 @@ namespace libtorrent
 				for (int i = 0, end(s_p->list_size()); i < end; ++i)
 				{
 					std::string path_element = s_p->list_at(i)->string_value();
-					trim_path_element(path_element);
 					e.symlink_path = combine_path(e.symlink_path, path_element);
 				}
 			}
@@ -941,26 +1070,26 @@ namespace libtorrent
 				ec = errors::torrent_invalid_length;
 				return false;
 			}
-			m_files.add_file(e, fh ? fh->string_ptr() + info_ptr_diff : 0);
+			files.add_file(e, fh ? fh->string_ptr() + info_ptr_diff : 0);
 			m_multifile = false;
 		}
 		else
 		{
-			if (!extract_files(*i, m_files, name, info_ptr_diff))
+			if (!extract_files(*i, files, name, info_ptr_diff))
 			{
 				ec = errors::torrent_file_parse_failed;
 				return false;
 			}
 			m_multifile = true;
 		}
-		m_files.set_name(name);
+		files.set_name(name);
 
 		// extract sha-1 hashes for all pieces
 		// we want this division to round upwards, that's why we have the
 		// extra addition
 
-		m_files.set_num_pieces(int((m_files.total_size() + m_files.piece_length() - 1)
-			/ m_files.piece_length()));
+		files.set_num_pieces(int((files.total_size() + files.piece_length() - 1)
+			/ files.piece_length()));
 
 		lazy_entry const* pieces = info.dict_find("pieces");
 		lazy_entry const* root_hash = info.dict_find("root hash");
@@ -973,7 +1102,7 @@ namespace libtorrent
 		
 		if (pieces)
 		{
-			if (pieces->string_length() != m_files.num_pieces() * 20)
+			if (pieces->string_length() != files.num_pieces() * 20)
 			{
 				ec = errors::torrent_invalid_hashes;
 				return false;
@@ -991,7 +1120,7 @@ namespace libtorrent
 				ec = errors::torrent_invalid_hashes;
 				return false;
 			}
-			int num_leafs = merkle_num_leafs(m_files.num_pieces());
+			int num_leafs = merkle_num_leafs(files.num_pieces());
 			int num_nodes = merkle_num_nodes(num_leafs);
 			m_merkle_first_leaf = num_nodes - num_leafs;
 			m_merkle_tree.resize(num_nodes);
@@ -1005,6 +1134,21 @@ namespace libtorrent
 		m_ssl_root_cert = info.dict_find_string_value("ssl-cert");
 #endif
 
+		// now, commit the files structure we just parsed out
+		// into the torrent_info object.
+		// if we already have an m_files that's populated, it
+		// indicates that we unloaded this torrent_info ones
+		// and we had modifications to the files, so we unloaded
+		// the orig_files. In that case, the orig files is what
+		// needs to be restored
+		if (m_files.is_loaded()) {
+			m_orig_files.reset(new file_storage);
+			const_cast<file_storage&>(*m_orig_files).swap(files);
+		}
+		else
+		{
+			m_files.swap(files);
+		}
 		return true;
 	}
 
@@ -1110,6 +1254,7 @@ namespace libtorrent
 			return false;
 		}
 		if (!parse_info_section(*info, ec, flags)) return false;
+		resolve_duplicate_filenames();
 
 		// extract the url of the tracker
 		lazy_entry const* i = torrent_file.dict_find_list("announce-list");
