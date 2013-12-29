@@ -50,6 +50,15 @@ POSSIBILITY OF SUCH DAMAGE.
 
 using boost::uint8_t;
 
+#if BOOST_VERSION <= 104700
+namespace boost {
+size_t hash_value(libtorrent::address_v4::bytes_type ip)
+{
+	return boost::hash_value(*reinterpret_cast<boost::uint32_t*>(&ip[0]));
+}
+}
+#endif
+
 namespace libtorrent { namespace dht
 {
 
@@ -60,12 +69,12 @@ TORRENT_DEFINE_LOG(table)
 routing_table::routing_table(node_id const& id, int bucket_size
 	, dht_settings const& settings)
 	: m_settings(settings)
-	, m_bucket_size(bucket_size)
 	, m_id(id)
 	, m_depth(0)
 	, m_last_bootstrap(min_time())
 	, m_last_refresh(min_time())
 	, m_last_self_refresh(min_time())
+	, m_bucket_size(bucket_size)
 {
 	m_buckets.reserve(30);
 }
@@ -1083,7 +1092,7 @@ void routing_table::find_node(node_id const& target
 #if defined TORRENT_DEBUG && !defined TORRENT_DISABLE_INVARIANT_CHECKS
 void routing_table::check_invariant() const
 {
-	std::set<address_v4::bytes_type> all_ips;
+	boost::unordered_set<address_v4::bytes_type> all_ips;
 
 	for (table_t::const_iterator i = m_buckets.begin()
 		, end(m_buckets.end()); i != end; ++i)

@@ -45,6 +45,9 @@ namespace libtorrent
 #else
 		SHA1_init(&m_context);
 #endif
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		m_finalized = false;
+#endif
 	}
 
 	hasher::hasher(const char* data, int len)
@@ -63,6 +66,9 @@ namespace libtorrent
 #else
 		SHA1_init(&m_context);
 		SHA1_update(&m_context, reinterpret_cast<unsigned char const*>(data), len);
+#endif
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		m_finalized = false;
 #endif
 	}
 
@@ -98,6 +104,10 @@ namespace libtorrent
 
 	sha1_hash hasher::final()
 	{
+//		TORRENT_ASSERT(!m_finalized);
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		m_finalized = true;
+#endif
 		sha1_hash digest;
 #ifdef TORRENT_USE_GCRYPT
 		gcry_md_final(m_context);
@@ -123,14 +133,17 @@ namespace libtorrent
 #else
 		SHA1_init(&m_context);
 #endif
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		m_finalized = false;
+#endif
 	}
 
-#ifdef TORRENT_USE_GCRYPT
 	hasher::~hasher()
 	{
+#ifdef TORRENT_USE_GCRYPT
 		gcry_md_close(m_context);
-	}
 #endif
+	}
 
 }
 

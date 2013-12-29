@@ -100,6 +100,11 @@ feature.compose <launcher>valgrind : <testing.launcher>"valgrind --tool=memcheck
 
 test-suite libtorrent : 	
 	[ run test_bitfield.cpp ]
+	[ run test_connection_queue.cpp ]
+	[ run test_recheck.cpp ]
+	[ run test_stat_cache.cpp ]
+	[ run test_part_file.cpp ]
+	[ run test_policy.cpp ]
 	[ run test_torrent_info.cpp ]
 	[ run test_time.cpp ]
 	[ run test_file_storage.cpp ]
@@ -108,6 +113,7 @@ test-suite libtorrent :
 	[ run test_file.cpp ]
 	[ run test_privacy.cpp ]
 	[ run test_threads.cpp ]
+	[ run test_tailqueue.cpp ]
 	[ run test_rss.cpp ]
 	[ run test_bandwidth_limiter.cpp ]
 	[ run test_buffer.cpp ]
@@ -123,6 +129,10 @@ test-suite libtorrent :
 	[ run test_ip_filter.cpp ]
 	[ run test_hasher.cpp ]
 	[ run test_dht.cpp ]
+	[ run test_block_cache.cpp ]
+	[ run test_peer_classes.cpp ]
+	[ run test_settings_pack.cpp ]
+	[ run test_fence.cpp ]
 	[ run test_storage.cpp ]
 	[ run test_torrent_parse.cpp ]
 	[ run test_session.cpp ]
@@ -142,6 +152,7 @@ test-suite libtorrent :
 	[ run test_web_seed_ban.cpp ]
 	[ run test_bdecode_performance.cpp ]
 	[ run test_pe_crypto.cpp ]
+	[ run test_dos_blocker.cpp ]
 
 	[ run test_utp.cpp ]
 	[ run test_auto_unchoke.cpp ]

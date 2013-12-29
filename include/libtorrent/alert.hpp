@@ -36,6 +36,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <memory>
 #include <deque>
 #include <string>
+#include <vector>
 
 #ifdef _MSC_VER
 #pragma warning(push, 1)
@@ -84,6 +85,12 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #ifndef TORRENT_MAX_ALERT_TYPES
 #define TORRENT_MAX_ALERT_TYPES 15
+#endif
+
+#ifndef TORRENT_NO_DEPRECATE
+#ifndef BOOST_NO_TYPEID
+#include <typeinfo>
+#endif
 #endif
 
 namespace libtorrent {

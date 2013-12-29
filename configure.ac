@@ -5,7 +5,7 @@
 
 AC_PREREQ([2.63])
 
-AC_INIT([libtorrent-rasterbar],[1.0.0],[arvid@rasterbar.com],
+AC_INIT([libtorrent-rasterbar],[1.1.0],[arvid@rasterbar.com],
         [libtorrent-rasterbar],[http://www.libtorrent.org])
 AC_CONFIG_SRCDIR([src/torrent.cpp])
 AC_CONFIG_AUX_DIR([build-aux])
@@ -41,7 +41,7 @@ dnl  increment AGE, Otherwise AGE is reset to 0. If CURRENT has changed,
 dnl  REVISION is set to 0, otherwise REVISION is incremented.
 dnl ---------------------------------------------------------------------------
 
-m4_define([VERSION_INFO_CURRENT],[8])
+m4_define([VERSION_INFO_CURRENT],[9])
 m4_define([VERSION_INFO_REVISION],[0])
 m4_define([VERSION_INFO_AGE],[0])
 INTERFACE_VERSION_INFO=VERSION_INFO_CURRENT:VERSION_INFO_REVISION:VERSION_INFO_AGE
@@ -554,15 +554,6 @@ AS_CASE(["$ARG_ENABLE_PYTHON_BINDING"],
 
 AS_ECHO
 AS_ECHO "Checking for external libraries:"
-
-AC_MSG_CHECKING([for FIEMAP support])
-AC_CHECK_HEADERS([linux/types.h])
-AC_CHECK_HEADERS([linux/fiemap.h], [], [],
-[#ifdef HAVE_LINUX_TYPES_H
-# include <linux/types.h>
-#endif
-])
-
 
 AC_MSG_CHECKING([whether to link against system libgeoip]) #depends: $ac_arg_enable_geoip
 AS_CASE(["$ARG_WITH_LIBGEOIP"],

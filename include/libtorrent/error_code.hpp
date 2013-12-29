@@ -326,6 +326,9 @@ namespace libtorrent
 			// The peer tried to connect to a torrent with a certificate
 			// for a different torrent.
 			invalid_ssl_cert,
+			// peer was banned because its listen port is within a banned port
+			// range, as specified by the port_filter.
+			banned_by_port_filter,
 
 
 
@@ -560,6 +563,56 @@ namespace libtorrent
 		mutable char* m_msg;
 	};
 #endif
+
+	// used by storage to return errors
+	// also includes which underlying file the
+	// error happened on
+	struct TORRENT_EXPORT storage_error
+	{
+		storage_error(): file(-1), operation(0) {}
+		storage_error(error_code e): ec(e), file(-1), operation(0) {}
+
+		operator bool() const { return ec.value() != 0; }
+		// the error that occurred
+		error_code ec;
+
+		// the file the error occurred on
+		boost::int32_t file:24;
+
+		// A code from file_operation_t enum, indicating what
+		// kind of operation failed.
+		boost::uint32_t operation:8;
+
+		enum file_operation_t {
+			none,
+			stat,
+			mkdir,
+			open,
+			rename,
+			remove,
+			copy,
+			read,
+			write,
+			fallocate,
+			alloc_cache_piece,
+			partfile
+		};
+
+		// Returns a string literal representing the file operation
+		// that failed. If there were no failure, it returns
+		// an empty string.
+		char const* operation_str() const
+		{
+			char const* ops[] =
+			{
+				"", "stat", "mkdir", "open", "rename", "remove", "copy"
+				, "read", "write", "fallocate", "allocate cache piece"
+				, "partfile"
+			};
+			return ops[operation];
+		}
+	};
+
 }
 
 #endif

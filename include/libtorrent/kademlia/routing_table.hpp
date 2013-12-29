@@ -49,6 +49,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <libtorrent/size_type.hpp>
 #include <libtorrent/assert.hpp>
 #include <libtorrent/ptime.hpp>
+#include <boost/unordered_set.hpp>
 
 namespace libtorrent
 {
@@ -188,9 +189,6 @@ private:
 
 	dht_settings const& m_settings;
 
-	// constant called k in paper
-	int m_bucket_size;
-	
 	// (k-bucket, replacement cache) pairs
 	// the first entry is the bucket the furthest
 	// away from our own ID. Each time the bucket
@@ -227,7 +225,11 @@ private:
 	// table. It's used to only allow a single entry
 	// per IP in the whole table. Currently only for
 	// IPv4
-	std::set<address_v4::bytes_type> m_ips;
+	boost::unordered_set<address_v4::bytes_type> m_ips;
+
+	// constant called k in paper
+	int m_bucket_size;
+	
 };
 
 } } // namespace libtorrent::dht

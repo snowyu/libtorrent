@@ -588,11 +588,13 @@ int feed::update_feed()
 
 	boost::shared_ptr<http_connection> feed(
 		new http_connection(m_ses.m_io_service, m_ses.m_half_open
+			, m_ses.m_host_resolver
 			, boost::bind(&feed::on_feed, shared_from_this()
 			, _1, _2, _3, _4)));
 
 	m_updating = true;
-	feed->get(m_settings.url, seconds(30), 0, 0, 5, m_ses.m_settings.user_agent);
+	feed->get(m_settings.url, seconds(30), 0, 0, 5
+		, m_ses.m_settings.get_str(settings_pack::user_agent));
 
 	return 60 + m_failures * m_failures * 60;
 }

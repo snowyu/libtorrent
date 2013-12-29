@@ -201,16 +201,6 @@ namespace libtorrent
 #endif
 	}
 
-// TODO: move this to proxy_base and use it in all proxies
-	bool i2p_stream::handle_error(error_code const& e, boost::shared_ptr<handler_type> const& h)
-	{
-		TORRENT_ASSERT(m_magic == 0x1337);
-		if (!e) return false;
-//		fprintf(stderr, "i2p error \"%s\"\n", e.message().c_str());
-		(*h)(e);
-		return true;
-	}
-
 	void i2p_stream::do_connect(error_code const& e, tcp::resolver::iterator i
 		, boost::shared_ptr<handler_type> h)
 	{

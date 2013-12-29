@@ -92,9 +92,6 @@ udp_socket::udp_socket(asio::io_service& ios
 	m_outstanding_timeout = 0;
 	m_outstanding_resolve = 0;
 	m_outstanding_socks = 0;
-#if defined BOOST_HAS_PTHREADS
-	m_thread = 0;
-#endif
 #endif
 
 	m_buf_size = 2000;
@@ -832,11 +829,10 @@ void udp_socket::on_name_lookup(error_code const& e, tcp::resolver::iterator i)
 	++m_outstanding_timeout;
 	++m_outstanding_connect_queue;
 #endif
-	m_cc.enqueue(boost::bind(&udp_socket::on_connect, this, _1)
-		, boost::bind(&udp_socket::on_timeout, this), seconds(10));
+	m_cc.enqueue(this, seconds(10));
 }
 
-void udp_socket::on_timeout()
+void udp_socket::on_connect_timeout()
 {
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
 	TORRENT_ASSERT(m_outstanding_timeout > 0);
@@ -863,7 +859,7 @@ void udp_socket::on_timeout()
 	m_connection_ticket = -1;
 }
 
-void udp_socket::on_connect(int ticket)
+void udp_socket::on_allow_connect(int ticket)
 {
 	TORRENT_ASSERT(is_single_thread());
 #if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
@@ -1388,6 +1384,16 @@ rate_limited_udp_socket::rate_limited_udp_socket(io_service& ios
 {
 }
 
+bool rate_limited_udp_socket::has_quota()
+{
+	ptime now = time_now_hires();
+	time_duration delta = now - m_last_tick;
+	m_last_tick = now;
+	// add any new quota we've accrued since last time
+	m_quota += boost::uint64_t(m_rate_limit) * total_microseconds(delta) / 1000000;
+	return m_quota > 0;
+}
+
 bool rate_limited_udp_socket::send(udp::endpoint const& ep, char const* p
 	, int len, error_code& ec, int flags)
 {
@@ -1403,7 +1409,7 @@ bool rate_limited_udp_socket::send(udp::endpoint const& ep, char const* p
 
 	// if there's no quota, and it's OK to drop, just
 	// drop the packet
-	if (m_quota < len && (flags & dont_drop) == 0) return false;
+	if (m_quota < 0 && (flags & dont_drop) == 0) return false;
 
 	m_quota -= len;
 	if (m_quota < 0) m_quota = 0;

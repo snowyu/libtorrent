@@ -39,6 +39,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #endif
 
 #include <boost/shared_ptr.hpp>
+#include <boost/bind.hpp>
 
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -57,6 +58,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/extensions.hpp"
 #include "libtorrent/extensions/ut_metadata.hpp"
 #include "libtorrent/alert_types.hpp"
+#include "libtorrent/io.hpp"
 #ifdef TORRENT_STATS
 #include "libtorrent/aux_/session_impl.hpp"
 #endif
@@ -197,7 +199,7 @@ namespace libtorrent { namespace
 			int ret = lazy_bdecode(body.begin, body.end, msg, ec);
 			if (ret != 0 || msg.type() != lazy_entry::dict_t)
 			{
-				m_pc.disconnect(errors::invalid_lt_tracker_message, 2);
+				m_pc.disconnect(errors::invalid_lt_tracker_message, peer_connection_interface::op_bittorrent, 2);
 				return true;
 			}
 

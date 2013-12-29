@@ -37,6 +37,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/hasher.hpp"
 #include "libtorrent/extensions/ut_pex.hpp"
 #include "libtorrent/thread.hpp"
+#include "libtorrent/ip_filter.hpp"
 #include <boost/tuple/tuple.hpp>
 
 #include "test.hpp"
@@ -54,9 +55,41 @@ void test_pex()
 	session_proxy p2;
 	session_proxy p3;
 
-	session ses1(fingerprint("LT", 0, 1, 0, 0), std::make_pair(48200, 49000), "0.0.0.0", 0);
-	session ses2(fingerprint("LT", 0, 1, 0, 0), std::make_pair(49200, 50000), "0.0.0.0", 0);
-	session ses3(fingerprint("LT", 0, 1, 0, 0), std::make_pair(50200, 51000), "0.0.0.0", 0);
+	int mask = alert::all_categories
+		& ~(alert::progress_notification
+			| alert::performance_warning
+			| alert::stats_notification);
+
+	// this is to avoid everything finish from a single peer
+	// immediately. To make the swarm actually connect all
+	// three peers before finishing.
+	settings_pack pack;
+	pack.set_int(settings_pack::alert_mask, mask);
+	pack.set_int(settings_pack::download_rate_limit, 2000);
+	pack.set_int(settings_pack::upload_rate_limit, 2000);
+	pack.set_int(settings_pack::max_retry_port_bind, 800);
+	pack.set_str(settings_pack::listen_interfaces, "0.0.0.0:48200");
+
+	session ses1(pack, fingerprint("LT", 0, 1, 0, 0));
+
+	// treat all IPs the same, i.e. enable rate limiting for local peers
+	ip_filter f;
+	f.add_rule(address_v4::from_string("0.0.0.0"), address_v4::from_string("255.255.255.255"), 1 << session::global_peer_class_id);
+	peer_class_info pc = ses1.get_peer_class(session::global_peer_class_id);
+	TEST_EQUAL(pc.upload_limit, 2000);
+	TEST_EQUAL(pc.download_limit, 2000);
+	ses1.set_peer_class(session::local_peer_class_id, pc);
+
+	pack.set_str(settings_pack::listen_interfaces, "0.0.0.0:49200");
+
+	session ses3(pack, fingerprint("LT", 0, 1, 0, 0));
+	ses3.set_peer_class(session::local_peer_class_id, pc);
+
+	// make the peer connecting the two worthless to transfer
+	// data, to force peer 3 to connect directly to peer 1 through pex
+	pack.set_str(settings_pack::listen_interfaces, "0.0.0.0:50200");
+	session ses2(pack, fingerprint("LT", 0, 1, 0, 0));
+	ses2.set_peer_class(session::local_peer_class_id, pc);
 
 	ses1.add_extension(create_ut_pex_plugin);
 	ses2.add_extension(create_ut_pex_plugin);
@@ -67,33 +100,7 @@ void test_pex()
 
 	boost::tie(tor1, tor2, tor3) = setup_transfer(&ses1, &ses2, &ses3, true, false, false, "_pex");
 
-	int mask = alert::all_categories
-		& ~(alert::progress_notification
-			| alert::performance_warning
-			| alert::stats_notification);
-	ses1.set_alert_mask(mask);
-	ses2.set_alert_mask(mask);
-	ses3.set_alert_mask(mask);
-
-	// this is to avoid everything finish from a single peer
-	// immediately. To make the swarm actually connect all
-	// three peers before finishing.
-	session_settings set = ses1.settings();
-	set.download_rate_limit = 2000;
-	set.upload_rate_limit = 2000;
-	ses1.set_settings(set);
-
-	// make the peer connecting the two worthless to transfer
-	// data, to force peer 3 to connect directly to peer 1 through pex
-	set = ses2.settings();
-	set.ignore_limits_on_local_network = false;
-	set.rate_limit_utp = true;
-	ses2.set_settings(set);
-
-	set = ses3.settings();
-	set.download_rate_limit = 0;
-	set.upload_rate_limit = 0;
-	ses3.set_settings(set);
+	ses2.apply_settings(pack);
 
 #ifndef TORRENT_DISABLE_ENCRYPTION
 	pe_settings pes;

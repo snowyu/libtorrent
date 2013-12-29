@@ -42,6 +42,8 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include <boost/function.hpp>
 #include <boost/bind.hpp>
+#include <boost/shared_ptr.hpp>
+#include <boost/enable_shared_from_this.hpp>
 #include <iostream>
 #include <math.h>
 
@@ -56,7 +58,7 @@ const float sample_time = 20.f; // seconds
 
 bandwidth_channel global_bwc;
 
-struct peer_connection: bandwidth_socket
+struct peer_connection: bandwidth_socket, boost::enable_shared_from_this<peer_connection>
 {
 	peer_connection(bandwidth_manager& bwm
 		, bandwidth_channel& torrent_bwc, int prio, bool ignore_limits, std::string name)
@@ -100,14 +102,17 @@ void peer_connection::assign_bandwidth(int channel, int amount)
 
 void peer_connection::start()
 {
-	m_bwm.request_bandwidth(self(), 150000, m_priority
-		, &m_bandwidth_channel
+	bandwidth_channel* channels[] = {
+		&m_bandwidth_channel
 		, &m_torrent_bandwidth_channel
-		, &global_bwc);
+		, &global_bwc
+	};
+
+	m_bwm.request_bandwidth(shared_from_this(), 150000, m_priority, channels, 3);
 }
 
 
-typedef std::vector<boost::intrusive_ptr<peer_connection> > connections_t;
+typedef std::vector<boost::shared_ptr<peer_connection> > connections_t;
 
 void do_change_rate(bandwidth_channel& t1, bandwidth_channel& t2, int limit)
 {
@@ -170,7 +175,7 @@ void spawn_connections(connections_t& v, bandwidth_manager& bwm
 	{
 		char name[200];
 		snprintf(name, sizeof(name), "%s%d", prefix, i);
-		v.push_back(new peer_connection(bwm, bwc, 200, false, name));
+		v.push_back(boost::shared_ptr<peer_connection>(new peer_connection(bwm, bwc, 200, false, name)));
 	}
 }
 
@@ -390,7 +395,7 @@ void test_peer_priority(int limit, bool torrent_limit)
 	spawn_connections(v1, manager, t1, 10, "p");
 	connections_t v;
 	std::copy(v1.begin(), v1.end(), std::back_inserter(v));
-	boost::intrusive_ptr<peer_connection> p(
+	boost::shared_ptr<peer_connection> p(
 		new peer_connection(manager, t1, 1, false, "no-priority"));
 	v.push_back(p);
 	run_test(v, manager);
@@ -426,7 +431,7 @@ void test_no_starvation(int limit)
 	spawn_connections(v1, manager, t1, num_peers, "p");
 	connections_t v;
 	std::copy(v1.begin(), v1.end(), std::back_inserter(v));
-	boost::intrusive_ptr<peer_connection> p(
+	boost::shared_ptr<peer_connection> p(
 		new peer_connection(manager, t2, 1, false, "no-priority"));
 	v.push_back(p);
 	run_test(v, manager);

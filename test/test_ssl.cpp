@@ -113,40 +113,42 @@ void test_ssl(int test_idx, bool use_utp)
 	remove_all("tmp1_ssl", ec);
 	remove_all("tmp2_ssl", ec);
 
-	session ses1(fingerprint("LT", 0, 1, 0, 0), std::make_pair(48075, 49000), "0.0.0.0", 0, alert_mask);
-	session ses2(fingerprint("LT", 0, 1, 0, 0), std::make_pair(49075, 50000), "0.0.0.0", 0, alert_mask);
+	int ssl_port = 1024 + rand() % 50000;
+	settings_pack sett;
+	sett.set_int(settings_pack::alert_mask, alert_mask);
+	sett.set_int(settings_pack::max_retry_port_bind, 100);
+	sett.set_str(settings_pack::listen_interfaces, "0.0.0.0:48075");
+	sett.set_bool(settings_pack::enable_incoming_utp, use_utp);
+	sett.set_bool(settings_pack::enable_outgoing_utp, use_utp);
+	sett.set_bool(settings_pack::enable_incoming_tcp, !use_utp);
+	sett.set_bool(settings_pack::enable_outgoing_tcp, !use_utp);
+	sett.set_int(settings_pack::ssl_listen, ssl_port);
+
+	session ses1(sett, fingerprint("LT", 0, 1, 0, 0));
+
+	if (!test.downloader_has_cert)
+		// this disables outgoing SSL connections
+		sett.set_int(settings_pack::ssl_listen, 0);
+	else
+		sett.set_int(settings_pack::ssl_listen, ssl_port + 20);
+
+	session ses2(sett, fingerprint("LT", 0, 1, 0, 0));
 
 	wait_for_listen(ses1, "ses1");
 	wait_for_listen(ses2, "ses2");
-
-	session_settings sett;
-
-	sett.enable_incoming_utp = use_utp;
-	sett.enable_outgoing_utp = use_utp;
-	sett.enable_incoming_tcp = !use_utp;
-	sett.enable_outgoing_tcp = !use_utp;
-
-	sett.ssl_listen = 1024 + rand() % 50000;
-
-	ses1.set_settings(sett);
-	sett.ssl_listen += 10;
-	ses2.set_settings(sett);
 
 	torrent_handle tor1;
 	torrent_handle tor2;
 
 	create_directory("tmp1_ssl", ec);
 	std::ofstream file("tmp1_ssl/temporary");
-	boost::intrusive_ptr<torrent_info> t = ::create_torrent(&file, 16 * 1024, 13, false, "../ssl/root_ca_cert.pem");
+	boost::shared_ptr<torrent_info> t = ::create_torrent(&file, 16 * 1024, 13, false, "../ssl/root_ca_cert.pem");
 	file.close();
 
 	add_torrent_params addp;
 	addp.save_path = ".";
 	addp.flags &= ~add_torrent_params::flag_paused;
 	addp.flags &= ~add_torrent_params::flag_auto_managed;
-
-	wait_for_listen(ses1, "ses1");
-	wait_for_listen(ses2, "ses2");
 
 	peer_disconnects = 0;
 	ssl_peer_disconnects = 0;

@@ -104,12 +104,9 @@ namespace libtorrent
 		hasher& update(std::string const& data) { update(data.c_str(), data.size()); return *this; }
 		hasher& update(const char* data, int len);
 		sha1_hash final();
-
 		void reset();
 
-#ifdef TORRENT_USE_GCRYPT
 		~hasher();
-#endif
 
 	private:
 
@@ -122,7 +119,12 @@ namespace libtorrent
 #else
 		sha_ctx m_context;
 #endif
+
+#if defined TORRENT_DEBUG || TORRENT_RELEASE_ASSERTS
+		bool m_finalized;
+#endif
 	};
+
 }
 
 #endif // TORRENT_HASHER_HPP_INCLUDED

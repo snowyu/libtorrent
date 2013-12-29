@@ -35,7 +35,7 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include <string>
 #include <vector>
-#include <boost/intrusive_ptr.hpp>
+#include <boost/shared_ptr.hpp>
 
 #include "libtorrent/storage_defs.hpp"
 #include "libtorrent/peer_id.hpp" // sha1_hash
@@ -225,6 +225,11 @@ namespace libtorrent
 			// on the torrent handle immediately after adding it.
 			flag_sequential_download = 0x800,
 
+			// indicates that this torrent should never be unloaded from RAM, even
+			// if unloading torrents are allowed in general. Setting this makes the torrent
+			// exempt from loading/unloading management.
+			flag_pinned = 0x1000,
+
 			// internal
 			default_flags = flag_update_subscribe | flag_auto_managed | flag_paused | flag_apply_ip_filter
 #ifndef TORRENT_NO_DEPRECATE
@@ -235,10 +240,9 @@ namespace libtorrent
 		// filled in by the constructor and should be left untouched. It
 		// is used for forward binary compatibility.
 		int version;
-
 		// torrent_info object with the torrent to add. Unless the url or info_hash
 		// is set, this is required to be initiazlied.
-		boost::intrusive_ptr<torrent_info> ti;
+		boost::shared_ptr<torrent_info> ti;
 
 #ifndef TORRENT_NO_DEPRECATE
 		char const* tracker_url;

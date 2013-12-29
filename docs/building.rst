@@ -3,7 +3,7 @@ libtorrent manual
 =================
 
 :Author: Arvid Norberg, arvid@rasterbar.com
-:Version: 1.0.0
+:Version: 1.1.0
 
 .. contents:: Table of contents
   :depth: 2
@@ -367,7 +367,7 @@ Build features:
 |                          |   awareness except on windows).                    |
 +--------------------------+----------------------------------------------------+
 | ``asserts``              | * ``off`` - disable all asserts                    |
-|                          | * ``peoduction`` - enable asserts in release       |
+|                          | * ``production`` - enable asserts in release       |
 |                          |   builds, but don't abort, just log them to        |
 |                          |   ``extern char const* libtorrent_assert_log``.    |
 |                          | * ``on`` - enable asserts in debug builds (this is |
@@ -391,6 +391,13 @@ Build features:
 |                          |   working directory session_stats<pid>. The log    |
 |                          |   is rotated every hour. It can be parsed by the   |
 |                          |   parse_session_stats.py script (requires gnuplot) |
++--------------------------+----------------------------------------------------+
+| ``profile-calls``        | * ``off`` - default. No additional call profiling. |
+|                          | * ``on`` - Enable logging of stack traces of       |
+|                          |   calls into libtorrent that are blocking. On      |
+|                          |   session shutdown, a file ``blocking_calls.txt``  |
+|                          |   is written with stack traces of blocking calls   |
+|                          |   ordered by the number of them.                   |
 +--------------------------+----------------------------------------------------+
 
 .. _MaxMind: http://www.maxmind.com/app/api

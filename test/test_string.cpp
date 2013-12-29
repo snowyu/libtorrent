@@ -208,6 +208,19 @@ int test_main()
 	TEST_CHECK(url_has_argument("http://127.0.0.1/test?foo=24&bar=23&a=e", "a") == "e");
 	TEST_CHECK(url_has_argument("http://127.0.0.1/test?foo=24&bar=23&a=e", "b") == "");
 
+	// resolve_file_url
+
+#ifdef TORRENT_WINDOWS
+	std::string p = "c:/blah/foo/bar\\";
+	convert_path_to_windows(p);
+	TEST_EQUAL(p, "c:\\blah\\foo\\bar\\");
+	TEST_EQUAL(resolve_file_url("file:///c:/blah/foo/bar"), "c:\\blah\\foo\\bar");
+	TEST_EQUAL(resolve_file_url("file:///c:/b%3fah/foo/bar"), "c:\\b?ah\\foo\\bar");
+	TEST_EQUAL(resolve_file_url("file://\\c:\\b%3fah\\foo\\bar"), "c:\\b?ah\\foo\\bar");
+#else
+	TEST_EQUAL(resolve_file_url("file:///c/blah/foo/bar"), "/c/blah/foo/bar");
+	TEST_EQUAL(resolve_file_url("file:///c/b%3fah/foo/bar"), "/c/b?ah/foo/bar");
+#endif
 	return 0;
 }
 

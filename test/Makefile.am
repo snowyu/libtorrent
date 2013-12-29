@@ -1,5 +1,11 @@
 test_programs = \
   test_bitfield              \
+  test_connection_queue      \
+  test_torrent_info          \
+  test_recheck               \
+  test_stat_cache            \
+  test_policy                \
+  test_part_file             \
   test_file                  \
   test_file_storage          \
   test_privacy               \
@@ -8,6 +14,7 @@ test_programs = \
   test_bdecode_performance   \
   test_bencoding             \
   test_buffer                \
+  test_block_cache           \
   test_checking              \
   test_fast_extension        \
   test_hasher                \
@@ -17,6 +24,7 @@ test_programs = \
   test_lsd                   \
   test_metadata_extension    \
   test_pe_crypto             \
+  test_peer_classes          \
   test_peer_priority         \
   test_pex                   \
   test_piece_picker          \
@@ -26,11 +34,13 @@ test_programs = \
   test_http_parser           \
   test_magnet                \
   test_packet_buffer         \
+  test_settings_pack         \
   test_read_piece            \
   test_rss                   \
   test_ssl                   \
   test_storage               \
   test_swarm                 \
+  test_tailqueue             \
   test_threads               \
   test_torrent               \
   test_torrent_parse         \
@@ -121,6 +131,12 @@ libtest_la_SOURCES = main.cpp \
   ../ed25519/src/verify.c
 
 test_bitfield_SOURCES = test_bitfield.cpp
+test_connection_queue_SOURCES = test_connection_queue.cpp
+test_torrent_info_SOURCES = test_torrent_info.cpp
+test_recheck_SOURCES = test_recheck.cpp
+test_stat_cache_SOURCES = test_stat_cache.cpp
+test_policy_SOURCES = test_policy.cpp
+test_part_file_SOURCES = test_part_file.cpp
 test_file_SOURCES = test_file.cpp
 test_file_storage_SOURCES = test_file_storage.cpp
 test_privacy_SOURCES = test_privacy.cpp
@@ -139,6 +155,7 @@ test_lsd_SOURCES = test_lsd.cpp
 test_metadata_extension_SOURCES = test_metadata_extension.cpp
 test_peer_priority_SOURCES = test_peer_priority.cpp
 test_pe_crypto_SOURCES = test_pe_crypto.cpp
+test_peer_classes_SOURCES = test_peer_classes.cpp
 test_pex_SOURCES = test_pex.cpp
 test_piece_picker_SOURCES = test_piece_picker.cpp
 test_xml_SOURCES = test_xml.cpp
@@ -149,6 +166,7 @@ test_magnet_SOURCES = test_magnet.cpp
 test_packet_buffer_SOURCES = test_packet_buffer.cpp
 test_read_piece_SOURCES = test_read_piece.cpp
 test_storage_SOURCES = test_storage.cpp
+test_settings_pack_SOURCES = test_settings_pack.cpp
 test_swarm_SOURCES = test_swarm.cpp
 test_rss_SOURCES = test_rss.cpp
 test_ssl_SOURCES = test_ssl.cpp

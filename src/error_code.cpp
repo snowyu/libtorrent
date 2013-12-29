@@ -50,7 +50,7 @@ namespace libtorrent
 
 	const char* libtorrent_error_category::name() const BOOST_SYSTEM_NOEXCEPT
 	{
-		return "libtorrent error";
+		return "libtorrent";
 	}
 
 	std::string libtorrent_error_category::message(int ev) const BOOST_SYSTEM_NOEXCEPT
@@ -170,7 +170,7 @@ namespace libtorrent
 			"invalid dont-have message",
 			"SSL connection required",
 			"invalid SSL certificate",
-			"",
+			"banned by port filter",
 			"",
 			"",
 			"",

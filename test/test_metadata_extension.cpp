@@ -157,9 +157,10 @@ int test_main()
 	test_transfer(full_encryption | reverse, &create_ut_metadata_plugin, timeout);
 	test_transfer(reverse, &create_ut_metadata_plugin, timeout);
 
+#ifndef TORRENT_NO_DEPRECATE
 	for (int f = 0; f <= (clear_files | disconnect | full_encryption); ++f)
 		test_transfer(f, &create_metadata_plugin, timeout * 2);
-
+#endif
 
 	for (int f = 0; f <= (clear_files | disconnect | full_encryption); ++f)
 		test_transfer(f, &create_ut_metadata_plugin, timeout);
